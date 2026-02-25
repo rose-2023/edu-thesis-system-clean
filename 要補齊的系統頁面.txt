@@ -1,0 +1,29 @@
+重建的檔案內容:
+老師端:
+subtitle.py(已新增)
+TeacherDashboard(已新增)
+teacher_Records.py(已新增)
+❌ TeacherDashboard.vue（老師看影片狀態/題庫狀態/學生流線）(已新增)
+
+❌ TeacherSubtitle.vue（字幕校正頁：你之前說「前往字幕校正」）(已新增)
+
+❌ TeacherT5AgentLog.vue（老師生成題目頁面，題庫審核/上架/重新生成）(已新增)
+
+學生端:
+❌ StudentLearning.vue（你之前有提過這頁名）
+
+❌ TeacherAnalyze.vue（學習紀錄/完成度/回饋）老師端分析頁面
+
+❌ VideoPlayer.vue（影片播放器含跳回片段功能，可能在 components）
+
+共用:
+✅ frontend/src/router/*（路由）
+
+✅ frontend/src/api.js（你前面也出現過）
+
+✅ frontend/src/App.vue
+
+✅ frontend/src/components/*
+
+✅ frontend/src/assets/*
+

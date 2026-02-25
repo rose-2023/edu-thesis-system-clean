@@ -1,0 +1,23 @@
+:root{
+  --bg: #f6f7fb;
+  --card: #ffffff;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --border: rgba(0,0,0,.08);
+  --shadow: 0 10px 30px rgba(0,0,0,.08);
+  --radius: 14px;
+}
+
+*{ box-sizing: border-box; }
+
+html, body{
+  height: 100%;
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Arial, "Noto Sans TC", sans-serif;
+  color: var(--text);
+  background: radial-gradient(1200px 600px at 15% 15%, #e8eeff 0%, transparent 55%),
+              radial-gradient(900px 500px at 85% 10%, #ffe9f1 0%, transparent 55%),
+              var(--bg);
+}
+
+a{ color: inherit; }

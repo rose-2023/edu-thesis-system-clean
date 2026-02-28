@@ -16,7 +16,11 @@ try:
 except Exception:
     OpenAI = None
 
-
+print("[AI] start generate", {
+  "enabled": os.environ.get("AI_ENABLED"),
+  "model": os.environ.get("OPENAI_MODEL"),
+  "has_key": bool(os.environ.get("OPENAI_API_KEY")),
+})
 # =========================
 # (A) ENV / 開關
 # =========================

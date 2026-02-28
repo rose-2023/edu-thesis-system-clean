@@ -23,6 +23,27 @@
     <main class="main">
       <h1 class="title">AI 代理 Parsons 題目生成紀錄</h1>
 
+      <!-- [新增] 後測開放控制（僅新增按鈕，不影響既有功能） -->
+      <div class="posttest-bar">
+        <div class="posttest-left">
+          <span class="posttest-label">後測狀態：</span>
+          <span class="posttest-status" :class="{ open: postOpen === true, closed: postOpen === false }">
+            {{ postOpen === null ? "未讀取" : (postOpen ? "已開放" : "未開放") }}
+          </span>
+          <span class="posttest-hint">（依單元控制：{{ testCycleId }}）</span>
+        </div>
+
+        <div class="posttest-actions">
+          <button class="btn primary" :disabled="!testCycleId || postOpenLoading" @click="setPostOpen(true)">
+            後測發布
+          </button>
+          <button class="btn warn" :disabled="!testCycleId || postOpenLoading" @click="setPostOpen(false)">
+            後測取消發布
+          </button>
+        </div>
+      </div>
+
+
       <section class="grid">
         <!-- A -->
         <div class="card">
@@ -447,6 +468,47 @@ const selectedVideo = ref("");
 const selectedSubtitleVersion = ref("");
 
 
+// [新增] ===== 後測開放控制（依單元） =====
+const testCycleId = computed(() => (selectedUnit.value || "default").toString().trim());
+const postOpen = ref(null); // null=未讀取, true/false=狀態
+const postOpenLoading = ref(false);
+
+async function fetchPostOpen() {
+  if (!testCycleId.value) return;
+  postOpenLoading.value = true;
+  try {
+    const { data } = await api.get("/api/parsons/test/cycle/get", { params: { test_cycle_id: testCycleId.value } }); // [新增]
+    postOpen.value = !!data?.post_open;
+  } catch (e) {
+    // 若後端尚未加入此 API，不讓頁面壞掉
+    postOpen.value = null;
+  } finally {
+    postOpenLoading.value = false;
+  }
+}
+
+// [新增] 切換單元時重新讀取後測開放狀態
+async function setPostOpen(open) {
+  if (!testCycleId.value) return;
+
+  postOpenLoading.value = true;
+
+  try {
+    await api.post("/api/parsons/test/cycle/toggle", {
+      test_cycle_id: testCycleId.value,
+      post_open: open
+    });
+
+    postOpen.value = open;
+
+  } catch (e) {
+    console.error("toggle error:", e);
+  } finally {
+    postOpenLoading.value = false;
+  }
+}
+
+
 const loading = reactive({ units: false, videos: false, videoInfo: false, questions: false });
 const busy = reactive({ regen: false });
 const err = reactive({ a: "", d: "", e: "" });
@@ -756,34 +818,6 @@ async function regenerate() {
   }
 }
 
-// async function openPreview(row) {
-//   modal.open = true;
-//   modal.loading = true;
-//   modal.err = "";
-//   modal.data = null;
-
-//   try {
-//     const { data } = await t5Get("/question", {
-//       params: { task_id: row.task_id }
-//     });
-//     modal.data = data;
-
-//     // load review state
-//     reviewTags.value = data.review_tags || [];
-//     reviewNote.value = data.review_note || "";
-
-//     // init distractor keep
-//     (data.distractor_blocks || []).forEach((b, idx) => {
-//       const id = String(b.id ?? b._id ?? `d${idx}`);
-//       dKeep[id] = (b.enabled !== false); // default true
-//     });
-//   } catch {
-//     modal.err = "讀取預覽失敗";
-//   } finally {
-//     modal.loading = false;
-//   }
-// }
-
 async function saveReviewOnly() {
   if (!modal.data?.task_id) return;
   const payload = {
@@ -878,6 +912,8 @@ watch([filterStatus, sortOrder], async () => {
 
 // ===== init =====
 onMounted(async () => {
+  // [新增] 讀取後測開放狀態
+  fetchPostOpen();
   await fetchUnits();
 });
 
@@ -943,7 +979,12 @@ function returnNotPublish() {
   alert("（示意）已退回：你下一步要接後端 /return，把題目 status=已退回 並存 review tags/note。");
 }
 
-</script>
+
+
+// [新增] 切換單元時同步讀取後測開放狀態
+watch(selectedUnit, () => {
+  fetchPostOpen();
+});</script>
 
 <style scoped>
 /* ===== Layout ===== */
@@ -1433,5 +1474,38 @@ function returnNotPublish() {
 .pvNote { width:100%; min-height:90px; border-radius:12px; border:1px solid #e0e0e0; padding:12px; outline:none; }
 
 .pvActions { display:flex; justify-content:center; gap:12px; margin-top: 14px; flex-wrap:wrap; }
+
+
+/* [新增] 後測發布/取消發布按鈕區（最小樣式，不影響既有排版） */
+.posttest-bar{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  margin: 8px 0 16px;
+  padding: 10px 12px;
+  border: 1px solid #e6e6e6;
+  border-radius: 10px;
+  background: #fff;
+}
+.posttest-left{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  font-size:14px;
+}
+.posttest-status{
+  font-weight:700;
+}
+.posttest-status.open{ color:#2e7d32; }
+.posttest-status.closed{ color:#c62828; }
+.posttest-hint{ color:#888; font-size:12px; }
+.posttest-actions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
 
 </style>

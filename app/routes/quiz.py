@@ -6,6 +6,44 @@ from ..db import db
 
 quiz_bp = Blueprint("quiz", __name__)
 
+# =========================
+# ✅ V1.8 測驗控制（後測開放/關閉）
+# - 不改既有 schema；新增 test_control collection
+# =========================
+def now_utc():
+    return datetime.now(timezone.utc)
+
+@quiz_bp.get("/admin/post_open")
+def get_post_open():
+    test_cycle_id = (request.args.get("test_cycle_id") or "default").strip()
+    doc = db.test_control.find_one({"_id": f"post_open::{test_cycle_id}"}) or {}
+    return jsonify({
+        "test_cycle_id": test_cycle_id,
+        "post_open": bool(doc.get("post_open", False)),
+        "open_at": doc.get("open_at"),
+        "close_at": doc.get("close_at"),
+        "updated_at": doc.get("updated_at"),
+    })
+
+@quiz_bp.post("/admin/post_open")
+def set_post_open():
+    payload = request.get_json(silent=True) or {}
+    test_cycle_id = str(payload.get("test_cycle_id") or "default").strip()
+    open_flag = bool(payload.get("open"))
+    now = now_utc()
+    update = {"post_open": open_flag, "updated_at": now}
+    if open_flag:
+        update["open_at"] = now
+    else:
+        update["close_at"] = now
+    db.test_control.update_one(
+        {"_id": f"post_open::{test_cycle_id}"},
+        {"$set": update},
+        upsert=True,
+    )
+    return jsonify({"ok": True, "test_cycle_id": test_cycle_id, "post_open": open_flag})
+
+
 PRE_TOTAL = 10  # 你的前測固定 10 題
 
 def oid(s):

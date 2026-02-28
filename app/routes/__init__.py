@@ -9,6 +9,7 @@ from .records import records_bp
 from .events import events_bp
 from .teacher_t5 import teacher_t5_bp
 from .parsons import parsons_bp
+# from .quiz import quiz_bp
 
 def register_blueprints(app):
     app.register_blueprint(auth_bp, url_prefix="/api/auth")

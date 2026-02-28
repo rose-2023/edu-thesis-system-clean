@@ -45,6 +45,38 @@ def normalize_video_id(x) -> str:
     return str(x).strip()
 
 
+
+# =========================
+# ✅ V1.8 Test (Pre/Post) Utils
+# =========================
+_TEST_INDEX_READY = False
+
+def ensure_test_indexes():
+    """Create unique index for test attempts (one per student per cycle per role)."""
+    global _TEST_INDEX_READY
+    if _TEST_INDEX_READY:
+        return
+    try:
+        db.parsons_test_attempts.create_index(
+            [("student_id", 1), ("test_cycle_id", 1), ("test_role", 1)],
+            unique=True,
+            name="uniq_student_cycle_role",
+        )
+    except Exception:
+        pass
+    _TEST_INDEX_READY = True
+
+
+def get_default_test_cycle_id() -> str:
+    """預設測驗批次。v1.8 統一使用 test_control，不再依賴 parsons_test_cycles。"""
+    return "default"
+
+def is_posttest_open(test_cycle_id: str) -> bool:
+    """是否開放後測（統一讀 test_control）。"""
+    test_cycle_id = (test_cycle_id or "default").strip() or "default"
+    doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+    return bool(doc.get("post_open", False))
+
 def log_event(event: str, **kwargs):
     try:
         doc = {"event": event, "created_at": now_utc()}
@@ -223,29 +255,71 @@ def pick_latest_subtitle_path(video_doc: dict, video_id_str: str) -> str:
 # t5doc_to_parsons_task (teacher->student normalize)
 # =========================
 def t5doc_to_parsons_task(doc: dict) -> dict:
+    """
+    將 parsons_tasks / parsons_test_tasks 來源任務（doc）轉成前端 Parsons.vue 期待的格式。
+    - 支援 template_slots 可能是 dict list 或 str list（舊資料/手動匯入）。
+    """
+    question_text = doc.get("question_text") or doc.get("question") or ""
     solution_blocks = doc.get("solution_blocks") or []
     distractor_blocks = doc.get("distractor_blocks") or []
-    pool = doc.get("pool") or []
     template_slots = doc.get("template_slots") or []
-    if not pool:
-        pool = (distractor_blocks or []) + (solution_blocks or [])
+
+    # --- Normalize blocks (防呆：若舊資料是 string list) ---
+    def _norm_blocks(blocks):
+        out = []
+        for i, b in enumerate(blocks or []):
+            if isinstance(b, dict):
+                bid = b.get("id") or b.get("_id") or f"b{i+1}"
+                out.append({
+                    "id": str(bid),
+                    "text": b.get("text") if b.get("text") is not None else b.get("code", ""),
+                    "type": b.get("type") or "solution",
+                })
+            else:
+                out.append({"id": f"b{i+1}", "text": str(b), "type": "solution"})
+        return out
+
+    solution_blocks = _norm_blocks(solution_blocks)
+    distractor_blocks = _norm_blocks(distractor_blocks)
+
+    # --- Normalize template_slots ---
+    # 期望是 list[dict]：{slot, label, expected_id}
+    if template_slots and not isinstance(template_slots[0], dict):
+        # 例如：["s1","s2"...] 或 [0,1,2...] → 轉成 dict list
+        _tmp = []
+        for i, s in enumerate(template_slots):
+            _tmp.append({
+                "slot": str(s),
+                "label": f"第{i+1}格",
+            })
+        template_slots = _tmp
+
+    # 若 template_slots 為空，依 solution_blocks 長度自動生成
     if not template_slots:
-        template_slots = [{"label": f"第{i+1}格", "slot": str(i), "expected_id": b.get("id")} for i, b in enumerate(solution_blocks)]
-    else:
-        for i in range(min(len(template_slots), len(solution_blocks))):
-            if not template_slots[i].get("expected_id"):
-                template_slots[i]["expected_id"] = solution_blocks[i].get("id")
+        template_slots = [{"slot": f"s{i+1}", "label": f"第{i+1}格"} for i in range(len(solution_blocks))]
+
+    # 補 expected_id：若資料本身沒有，就按照 solution_blocks 順序對齊
+    for i in range(min(len(template_slots), len(solution_blocks))):
+        if not template_slots[i].get("expected_id"):
+            template_slots[i]["expected_id"] = solution_blocks[i]["id"]
+
+    pool = doc.get("pool")
+    if not pool:
+        pool = solution_blocks + distractor_blocks
+
+    # 中文語意：測驗不需要，但若有也一起帶給前端（前端可選擇不顯示）
+    ai_slot_hints = doc.get("ai_slot_hints") or doc.get("slot_hints") or {}
 
     return {
-        "question_text": doc.get("question_text") or "",
+        "task_id": str(doc.get("_id", "")),
+        "question_text": question_text,
         "solution_blocks": solution_blocks,
         "distractor_blocks": distractor_blocks,
         "pool": pool,
         "template_slots": template_slots,
-        "ai_feedback": doc.get("ai_feedback") or {},
-        "ai_segment_map": doc.get("ai_segment_map") or {},
-        "ai_slot_hints": doc.get("ai_slot_hints") or {},
-        "ai_segments_compact": doc.get("ai_segments_compact") or "",
+        "ai_slot_hints": ai_slot_hints,
+        "status": doc.get("status") or doc.get("review_status") or "",
+        "enabled": bool(doc.get("enabled", True)),
     }
 
 
@@ -547,7 +621,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 - 只輸出合法 JSON（不要 Markdown、不要多餘文字）
 - 只輸出以下欄位：question_text、solution_lines
 - question_text：繁體中文，描述要做什麼（不要直接透露程式碼）
-- solution_lines：英文 Python code 4~7 行，且必須包含：
+- solution_lines：英文 Python code 4~10 行，且必須包含：
   1) 迴圈
   2) 迴圈內至少一行縮排（4 spaces）
   3) 結束條件（可用 break）
@@ -605,8 +679,8 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         if not q:
             last_error = "missing question_text"
             continue
-        if not isinstance(sol, list) or len(sol) < 4 or len(sol) > 7:
-            last_error = "solution_lines length not 4~7"
+        if not isinstance(sol, list) or len(sol) < 4 or len(sol) > 10:
+            last_error = "solution_lines length not 4~10"
             continue
 
         sol = [str(x) for x in sol]
@@ -1186,6 +1260,330 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
 # =========================
 # (B) POST /submit 送出作答
 # =========================
+
+# =========================
+# ✅ V1.8 Test (Pre/Post) APIs
+#  - collections:
+#    - parsons_test_tasks: {test_cycle_id, test_role, test_task_id, source_task_id}
+#    - parsons_test_cycles: {test_cycle_id, post_open, open_at, close_at}
+#    - parsons_test_attempts: {student_id, test_cycle_id, test_role, test_task_id, is_correct, score, duration_sec, wrong_indices, submitted_at}
+# =========================
+
+@parsons_bp.get("/test/status")
+def test_status():
+    ensure_test_indexes()
+    student_id = (request.args.get("student_id") or "").strip()
+    test_cycle_id = (request.args.get("test_cycle_id") or get_default_test_cycle_id()).strip() or get_default_test_cycle_id()
+
+    if not student_id:
+        return jsonify({"ok": False, "message": "missing student_id"}), 400
+
+    pre_done = bool(db.parsons_test_attempts.find_one({"student_id": student_id, "test_cycle_id": test_cycle_id, "test_role": "pre"}))
+    post_done = bool(db.parsons_test_attempts.find_one({"student_id": student_id, "test_cycle_id": test_cycle_id, "test_role": "post"}))
+
+    return jsonify({
+        "ok": True,
+        "student_id": student_id,
+        "test_cycle_id": test_cycle_id,
+        "pre_done": pre_done,
+        "post_done": post_done,
+        "post_open": is_posttest_open(test_cycle_id),
+    })
+
+
+@parsons_bp.get("/test/task")
+def get_test_task():
+    '''
+    回傳一題 Parsons 測驗題（前測/後測各一題，先跑通流程）
+    query:
+      - student_id
+      - test_role: pre/post
+      - test_cycle_id
+    '''
+    # 從 query string 讀參數，避免 NameError
+    test_role = (request.args.get("test_role") or "").strip().lower()
+    test_cycle_id = (request.args.get("test_cycle_id") or "").strip()
+
+    if test_role not in ("pre", "post"):
+        return jsonify({"ok": False, "message": "invalid test_role"}), 400
+    if not test_cycle_id:
+        return jsonify({"ok": False, "message": "missing test_cycle_id"}), 400
+
+    tt = db.parsons_test_tasks.find_one({"test_cycle_id": test_cycle_id, "test_role": test_role})
+    if not tt:
+        return jsonify({"ok": False, "message": "test task not configured"}), 404
+
+    # 取得原始題目
+    source_task_id = (tt.get("source_task_id") or "").strip()
+    try:
+        task_doc = db.parsons_tasks.find_one({"_id": ObjectId(source_task_id)})
+    except:
+        task_doc = None
+
+    if not task_doc:
+        return jsonify({"ok": False, "message": "source task not found"}), 404
+
+    # 使用現有的 normalize 函式
+    parsed = t5doc_to_parsons_task(task_doc)
+
+    return jsonify({
+        "ok": True,
+        "test_task_id": str(tt.get("_id")),
+         # ✅【新增】一定要回傳 parsons_tasks 的 _id，給前端 submit 用
+        "source_task_id": str(task_doc.get("_id")),  # <= 最重要
+        "task_id": str(task_doc.get("_id")),         # <= 可選：給前端相容用（你後端 submit 也吃 task_id）
+        "question_text": task_doc.get("question_text") or "",
+        "template_slots": parsed.get("template_slots") or [],
+        "pool": parsed.get("pool") or [],
+        "total": 1, # 目前設計為一人一題
+        "current_index": 1
+    })
+
+
+@parsons_bp.post("/test/submit")
+def submit_test_answer():
+    '''
+    payload:
+      - student_id
+      - test_cycle_id
+      - test_role: pre/post
+      - test_task_id
+      - source_task_id / task_id
+      - answer_ids: [block_id,...]
+      - duration_sec
+    '''
+    ensure_test_indexes()
+    data = request.get_json(silent=True) or {}
+
+    student_id = (data.get("student_id") or "").strip()
+    test_cycle_id = (data.get("test_cycle_id") or get_default_test_cycle_id()).strip() or get_default_test_cycle_id()
+    test_role = (data.get("test_role") or "").strip().lower()
+    test_task_id = (data.get("test_task_id") or "").strip()
+    source_task_id = (data.get("source_task_id") or data.get("task_id") or "").strip()
+    answer_ids = data.get("answer_ids") or []
+    duration_sec = int(data.get("duration_sec") or 0)
+
+    if not student_id:
+        return jsonify({"ok": False, "message": "missing student_id"}), 400
+    if test_role not in ("pre", "post"):
+        return jsonify({"ok": False, "message": "invalid test_role"}), 400
+
+    if test_role == "post" and not is_posttest_open(test_cycle_id):
+        return jsonify({"ok": False, "message": "posttest not open"}), 403
+
+    # 取得題目
+    try:
+        task = db.parsons_tasks.find_one({"_id": ObjectId(source_task_id)})
+    except Exception:
+        task = None
+    if not task:
+        return jsonify({"ok": False, "message": "task not found"}), 404
+
+    parsed = t5doc_to_parsons_task(task)
+    expected_ids = [str(s.get("expected_id")) for s in (parsed.get("template_slots") or [])]
+
+    aligned = list(answer_ids)
+    if len(aligned) < len(expected_ids):
+        aligned = aligned + [None] * (len(expected_ids) - len(aligned))
+
+    wrong_indices = []
+    for i in range(len(expected_ids)):
+        if str(aligned[i]) != str(expected_ids[i]):
+            wrong_indices.append(i)
+
+    extra_wrong = max(0, len(answer_ids) - len(expected_ids))
+    is_correct = (len(wrong_indices) == 0 and extra_wrong == 0)
+
+    total_slots = max(1, len(expected_ids))
+    score = (total_slots - len(wrong_indices)) / total_slots
+
+    attempt_doc = {
+        "student_id": student_id,
+        "test_cycle_id": test_cycle_id,
+        "test_role": test_role,
+        "test_task_id": test_task_id or str(task.get("_id")),
+        "source_task_id": str(task.get("_id")),
+        "answer_ids": answer_ids,
+        "is_correct": is_correct,
+        "score": score,
+        "duration_sec": duration_sec,
+        "wrong_indices": wrong_indices,
+        "submitted_at": now_utc(),
+    }
+
+    try:
+        ins = db.parsons_test_attempts.insert_one(attempt_doc)
+        attempt_id = str(ins.inserted_id)
+        return jsonify({
+            "ok": True,
+            "already_submitted": False,
+            "attempt_id": attempt_id,
+            "is_correct": is_correct,
+            "score": score,
+            "wrong_indices": wrong_indices,
+        })
+    except Exception:
+        # duplicate key => already submitted
+        return jsonify({
+            "ok": True,
+            "already_submitted": True,
+            "is_correct": is_correct,
+            "score": score,
+            "wrong_indices": wrong_indices,
+        })
+
+
+@parsons_bp.post("/test/cycle/toggle")
+def toggle_test_cycle():
+    """
+    老師端控制後測開放/關閉（v1.8 統一使用 test_control）
+    支援：
+      1) JSON body: { test_cycle_id, post_open } 或 { test_cycle_id, open }
+      2) Query string: ?test_cycle_id=default&post_open=true
+      3) 若未提供 post_open/open，則直接「反轉」目前狀態
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        # test_cycle_id：body 優先，其次 query，最後 default
+        test_cycle_id = (
+            data.get("test_cycle_id")
+            or request.args.get("test_cycle_id")
+            or get_default_test_cycle_id()
+            or "default"
+        )
+        test_cycle_id = str(test_cycle_id).strip() or "default"
+
+        # 允許 post_open / open 兩種欄位
+        raw_open = data.get("post_open", None)
+        if raw_open is None:
+            raw_open = data.get("open", None)
+        if raw_open is None:
+            raw_open = request.args.get("post_open", None)
+        if raw_open is None:
+            raw_open = request.args.get("open", None)
+
+        # 目前狀態
+        doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+        cur_open = bool(doc.get("post_open", False))
+
+        # 若沒提供 open 值 → toggle
+        if raw_open is None:
+            post_open = (not cur_open)
+        else:
+            # 將字串/布林都轉成 bool
+            if isinstance(raw_open, bool):
+                post_open = raw_open
+            else:
+                s = str(raw_open).strip().lower()
+                post_open = s in ("1", "true", "t", "yes", "y", "open", "on")
+
+        now = now_utc()
+
+        update = {
+            "test_cycle_id": test_cycle_id,
+            "post_open": bool(post_open),
+            "updated_at": now,
+        }
+
+        # 開啟：補 open_at（僅當目前沒有 open_at 時）
+        if post_open:
+            if not doc.get("open_at"):
+                update["open_at"] = now
+            update["close_at"] = None
+        else:
+            update["close_at"] = now
+
+        db.test_control.update_one(
+            {"_id": f"post_open:{test_cycle_id}"},
+            {"$set": update},
+            upsert=True
+        )
+
+        # 回傳最新狀態
+        new_doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+        return jsonify({
+            "ok": True,
+            "test_cycle_id": test_cycle_id,
+            "post_open": bool(new_doc.get("post_open", False)),
+            "open_at": new_doc.get("open_at"),
+            "close_at": new_doc.get("close_at"),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# =========================
+# v1.8 後測開關（統一只用 test_control）
+# 新增：GET /test/cycle/get
+# =========================
+@parsons_bp.get("/test/cycle/get")
+def get_test_cycle_control():
+    test_cycle_id = (request.args.get("test_cycle_id") or "default").strip()
+
+    doc_id = f"post_open:{test_cycle_id}"
+    doc = db.test_control.find_one({"_id": doc_id}) or {}
+
+    # 統一輸出給前端判斷顯示/隱藏「後測區塊」
+    return jsonify({
+        "ok": True,
+        "test_cycle_id": test_cycle_id,
+        "post_open": bool(doc.get("post_open", False)),
+        "open_at": doc.get("open_at"),
+        "close_at": doc.get("close_at"),
+        "updated_at": doc.get("updated_at"),
+        "_id": doc_id,
+    })    
+
+@parsons_bp.get("/test/export_csv")
+def export_test_csv():
+    ensure_test_indexes()
+    test_cycle_id = (request.args.get("test_cycle_id") or get_default_test_cycle_id()).strip() or get_default_test_cycle_id()
+
+    cur = db.parsons_test_attempts.find({"test_cycle_id": test_cycle_id}).sort("submitted_at", 1)
+
+    headers = [
+        "student_id",
+        "test_cycle_id",
+        "test_role",
+        "test_task_id",
+        "is_correct",
+        "score",
+        "duration_sec",
+        "wrong_indices",
+        "submitted_at",
+    ]
+
+    import io, csv
+    output = io.StringIO()
+    w = csv.DictWriter(output, fieldnames=headers)
+    w.writeheader()
+
+    for d in cur:
+        row = {
+            "student_id": d.get("student_id", ""),
+            "test_cycle_id": d.get("test_cycle_id", ""),
+            "test_role": d.get("test_role", ""),
+            "test_task_id": d.get("test_task_id", ""),
+            "is_correct": d.get("is_correct", False),
+            "score": d.get("score", ""),
+            "duration_sec": d.get("duration_sec", ""),
+            "wrong_indices": json.dumps(d.get("wrong_indices", []), ensure_ascii=False),
+            "submitted_at": (d.get("submitted_at").isoformat() if isinstance(d.get("submitted_at"), datetime) else str(d.get("submitted_at") or "")),
+        }
+        w.writerow(row)
+
+    csv_text = output.getvalue()
+    output.close()
+
+    from flask import Response
+    filename = f"parsons_test_attempts_{test_cycle_id}.csv"
+    return Response(
+        csv_text,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @parsons_bp.post("/submit")
 def submit_answer():
     data = request.get_json(silent=True) or {}
@@ -1212,6 +1610,132 @@ def submit_answer():
         solution_blocks = task.get("solution_blocks", []) or []
         solution_ids = [b.get("id") for b in solution_blocks if b.get("type") in ("core", "solution", None)]
         solution_ids = [sid for sid in solution_ids if sid]
+
+    # [新增] V1.3：Submit 端 fallback 解析 SRT（把 [行-行] 轉成秒數）
+    def _parse_srt_time_to_seconds(t: str) -> float:
+        # 格式：HH:MM:SS,mmm
+        try:
+            t = (t or "").strip()
+            hh, mm, rest = t.split(":")
+            ss, ms = rest.split(",")
+            return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+        except Exception:
+            return 0.0
+
+    def _read_srt_segments(abs_or_rel_path: str):
+        """
+        回傳 list[dict]: [{start:float, end:float, text:str}, ...]
+        若讀不到就回 []
+        """
+        try:
+            import os
+            import re
+
+            p = (abs_or_rel_path or "").strip()
+            if not p:
+                return []
+
+            # 允許 DB 存 uploads/... 的相對路徑
+            if not os.path.isabs(p):
+                # 專案根目錄下的 uploads
+                # 你原本 DB 例子：uploads/subtitles/xxx.srt
+                root = os.getcwd()
+                p = os.path.join(root, p)
+
+            if not os.path.exists(p):
+                return []
+
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+
+            # 以空行分段
+            blocks = re.split(r"\n\s*\n", raw.strip(), flags=re.M)
+            out = []
+            for b in blocks:
+                lines = [x.strip("\ufeff").strip() for x in b.splitlines() if x.strip()]
+                if len(lines) < 2:
+                    continue
+                # lines[0] 可能是序號
+                time_line = lines[1] if "-->" in lines[1] else (lines[0] if "-->" in lines[0] else "")
+                if "-->" not in time_line:
+                    continue
+                a, b2 = [x.strip() for x in time_line.split("-->")[:2]]
+                start = _parse_srt_time_to_seconds(a)
+                end = _parse_srt_time_to_seconds(b2)
+                text = "\n".join(lines[2:]) if "-->" in lines[1] else "\n".join(lines[1:])
+                out.append({"start": float(start), "end": float(end), "text": text})
+            return out
+        except Exception:
+            return []
+
+    def _pick_segment_from_compact(compact_text: str, slot_idx: int):
+        """
+        compact 格式像：
+        [0-5] ...
+        [5-11] ...
+        回傳 (line_start:int, line_end:int) 或 (None,None)
+        """
+        try:
+            import re
+            pairs = re.findall(r"\[(\d+)\s*-\s*(\d+)\]", compact_text or "")
+            if not pairs:
+                return (None, None)
+            # 簡單穩定策略：用 slot_idx 映射到第 k 段
+            k = slot_idx if slot_idx is not None else 0
+            if k < 0:
+                k = 0
+            if k >= len(pairs):
+                k = len(pairs) - 1
+            a, b = pairs[k]
+            return (int(a), int(b))
+        except Exception:
+            return (None, None)
+
+    def _fallback_segment_from_task(task_doc, slot_idx: int):
+        """
+        依 task 裡的 ai_segment_map / ai_segments_compact + subtitle_path 推算秒數
+        回傳 (t_start, t_end, subtitle_context)
+        """
+        try:
+            # ① 優先用 ai_segment_map（A 電腦通常有）
+            seg_map = task_doc.get("ai_segment_map") or {}
+            key1 = str(slot_idx) if slot_idx is not None else "0"
+            key2 = f"第{(slot_idx + 1)}格" if slot_idx is not None else "第1格"
+
+            seg = None
+            if key1 in seg_map:
+                seg = seg_map.get(key1)
+            elif key2 in seg_map:
+                seg = seg_map.get(key2)
+
+            if isinstance(seg, dict):
+                ts = seg.get("start")
+                te = seg.get("end")
+                if ts is not None and te is not None and float(te) > float(ts):
+                    ctx = seg.get("evidence") or ""
+                    return (float(ts), float(te), ctx)
+
+            # ② 沒有 map，就用 compact + subtitle_path 做推算（B 電腦常見）
+            compact = task_doc.get("ai_segments_compact") or ""
+            subtitle_path = (((task_doc.get("prompt_source") or {}).get("subtitle_path")) or "").strip()
+            if compact and subtitle_path:
+                line_a, line_b = _pick_segment_from_compact(compact, slot_idx or 0)
+                if line_a is not None and line_b is not None and line_b > line_a:
+                    segs = _read_srt_segments(subtitle_path)
+                    if segs:
+                        a = max(0, min(line_a, len(segs) - 1))
+                        b = max(0, min(line_b - 1, len(segs) - 1))
+                        ts = float(segs[a]["start"])
+                        te = float(segs[b]["end"])
+                        # context：取範圍內前幾句
+                        ctx_lines = [segs[i]["text"] for i in range(a, min(b + 1, a + 6))]
+                        ctx = "\n".join([x for x in ctx_lines if x]).strip()
+                        if te > ts:
+                            return (ts, te, ctx)
+
+            return (None, None, "")
+        except Exception:
+            return (None, None, "")
 
     # [新增] V1.4：用「template_slots 的順序」做一格一格比對，避免 idx 錯位（第3格變第4格）
     parsed = t5doc_to_parsons_task(task)
@@ -1314,6 +1838,16 @@ def submit_answer():
             level=(level or task.get("level") or "L1"),
             slot_label=(slot_label or f"第{(wrong_index + 1)}格" if wrong_index is not None else "第1格"),
         )
+        print("DEBUG_SEGMENT:", t_start, t_end)
+
+        # [新增] V1.3：若 AI 沒回出有效秒數，嘗試從 task 的 ai_segment_map / ai_segments_compact 推算
+        if t_start is None or t_end is None or t_end <= t_start:
+            fb_start, fb_end, fb_ctx = _fallback_segment_from_task(task, wrong_index if wrong_index is not None else 0)
+            if fb_start is not None and fb_end is not None and fb_end > fb_start:
+                t_start = fb_start
+                t_end = fb_end
+                if not subtitle_context:
+                    subtitle_context = fb_ctx
 
         # fallback（維持你原本行為：一定會有 jump 秒數，不讓學生卡住）
         if t_start is None or t_end is None or t_end <= t_start:
@@ -1339,6 +1873,300 @@ def submit_answer():
         }
 
     return jsonify(resp)
+
+# =========================
+# (C) POST /review  學生選擇是否回看影片（V1.7-A）
+# =========================
+# @parsons_bp.post("/review")
+# def review_choice():
+#     data = request.get_json(silent=True) or {}
+
+#     attempt_id = (data.get("attempt_id") or "").strip()
+#     student_id = (data.get("student_id") or "").strip()
+#     task_id = (data.get("task_id") or "").strip()
+#     video_id = (data.get("video_id") or "").strip()
+#     student_choice = (data.get("student_choice") or "").strip().lower()  # yes / no
+
+#     if not attempt_id:
+#         return jsonify({"ok": False, "message": "missing attempt_id"}), 400
+
+#     if student_choice not in ("yes", "no"):
+#         return jsonify({"ok": False, "message": "student_choice must be 'yes' or 'no'"}), 400
+
+#     # 允許前端沒傳 task_id/video_id：我們嘗試從 attempts 裡補
+#     task_id_f = task_id or None
+#     video_id_f = video_id or None
+#     student_id_f = student_id or None
+
+#     try:
+#         att = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
+#         if att:
+#             if not task_id_f:
+#                 task_id_f = att.get("task_id") or None
+#             if not video_id_f:
+#                 video_id_f = att.get("video_id") or None
+#             if not student_id_f:
+#                 student_id_f = att.get("student_id") or None
+#     except Exception:
+#         # attempt_id 不是 ObjectId 也沒關係（你目前 attempts 的 _id 是 ObjectId）
+#         pass
+
+#     doc = {
+#         "attempt_id": attempt_id,
+#         "task_id": task_id_f,
+#         "video_id": video_id_f,
+#         "student_id": student_id_f,
+#         "student_choice": student_choice,  # yes/no
+#         "created_at": now_utc(),
+#     }
+
+#     # ✅ 安全策略：同一個 attempt_id 只留一筆（避免重複點擊產生多筆）
+#     # - 若已存在：更新 choice + updated_at
+#     # - 若不存在：插入
+#     existed = db.parsons_review_logs.find_one({"attempt_id": attempt_id})
+#     if existed:
+#         db.parsons_review_logs.update_one(
+#             {"_id": existed["_id"]},
+#             {"$set": {
+#                 "student_choice": student_choice,
+#                 "student_id": student_id_f,
+#                 "task_id": task_id_f,
+#                 "video_id": video_id_f,
+#                 "updated_at": now_utc(),
+#             }}
+#         )
+#         return jsonify({"ok": True, "mode": "update"})
+#     else:
+#         db.parsons_review_logs.insert_one(doc)
+#         return jsonify({"ok": True, "mode": "insert"})
+
+# =========================
+# (C) POST /review_choice  記錄學生是否選擇回看（yes/no）
+# =========================
+@parsons_bp.route("/review_choice", methods=["POST", "OPTIONS"], endpoint="parsons_review_choice_v17")
+def review_choice():
+    # CORS preflight
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+
+    attempt_id = (data.get("attempt_id") or "").strip()
+    student_choice = (data.get("student_choice") or "").strip().lower()  # yes/no
+
+    # ✅ A 方案：後端盡量補齊 student_id
+    student_id = (data.get("student_id") or "").strip()  # 若前端未來願意送，直接吃
+    participant_id = (data.get("participant_id") or data.get("token") or "").strip()  # 兼容你登入的 uid
+
+    if not attempt_id:
+        return jsonify({"ok": False, "message": "missing attempt_id"}), 400
+    if student_choice not in ("yes", "no"):
+        return jsonify({"ok": False, "message": "student_choice must be yes/no"}), 400
+
+    # 先從 attempts 補 task_id / video_id（不改 schema）
+    task_id_f = None
+    video_id_f = None
+
+    try:
+        att = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
+        if att:
+            task_id_f = att.get("task_id") or None
+            video_id_f = att.get("video_id") or None
+            # 若 attempts 裡本來就有 student_id，也可以吃（目前你多半是 null）
+            if not student_id:
+                student_id = (att.get("student_id") or "").strip()
+    except Exception:
+        pass
+
+    # 若仍沒有 student_id，但有 participant_id → 去 users 查 student_id
+    if (not student_id) and participant_id:
+        try:
+            u = db.users.find_one({"_id": ObjectId(participant_id)})
+            if u:
+                student_id = (u.get("student_id") or "").strip()
+        except Exception:
+            pass
+
+    if not student_id:
+        student_id = "unknown"  # 至少不要空，方便你統計
+
+    db.parsons_review_logs.update_one(
+        {"attempt_id": attempt_id},
+        {
+            "$set": {
+                "attempt_id": attempt_id,
+                "task_id": task_id_f,
+                "video_id": video_id_f,
+                "student_id": student_id,
+                "participant_id": participant_id or None,
+                "student_choice": student_choice,
+                "updated_at": now_utc(),
+            },
+            "$setOnInsert": {"created_at": now_utc()},
+        },
+        upsert=True,
+    )
+
+    return jsonify({"ok": True, "student_id": student_id})
+
+
+# =========================
+# (D) POST/OPTIONS /review_watch  (V1.7-C 完整實現：記錄回看詳情)
+# 前端正在呼叫：/api/parsons/review_watch
+# 記錄學生回看視頻的所有互動數據
+# =========================
+@parsons_bp.route("/review_watch", methods=["POST", "OPTIONS"])
+def review_watch():
+    """
+    V1.7 完整實現：記錄視頻回看與互動詳情
+    
+    Expected Payload:
+    {
+        "attempt_id": "xxx",                    # 關聯的練習嘗試
+        "video_id": "xxx",
+        "task_id": "xxx",
+        "student_id": "xxx",                     # 學號
+        "start_sec": 120,                        # 指定回看片段開始時間
+        "end_sec": 180,                          # 指定回看片段結束時間
+        "watch_seconds": 3600,                   # 本次回看觀看秒數
+        "reached_end": true,                     # 是否播放到結束
+        "watch_start_at": "2026-02-26T...",     # 開始觀看時間
+        "watch_end_at": "2026-02-26T...",       # 停止觀看時間
+        "seek_events": [{"from": 10, "to": 50, "timestamp": "..."}, ...],  # V1.7 NEW
+        "is_complete_playback": true              # V1.7: 是否完整播放（無中斷）
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    
+    attempt_id = (data.get("attempt_id") or "").strip()
+    video_id = (data.get("video_id") or "").strip()
+    student_id = (data.get("student_id") or "").strip()
+    task_id = (data.get("task_id") or "").strip()
+    
+    watch_seconds = int(data.get("watch_seconds") or 0)
+    reached_end = bool(data.get("reached_end"))
+    watch_start_at = data.get("watch_start_at")
+    watch_end_at = data.get("watch_end_at")
+    start_sec = data.get("start_sec")
+    end_sec = data.get("end_sec")
+    seek_events = data.get("seek_events") or []  # V1.7: seek 事件列表
+    
+    # 基本檢驗
+    if not attempt_id or not video_id:
+        return jsonify({"ok": False, "message": "missing attempt_id or video_id"}), 400
+    
+    try:
+        # 從 parsons_attempts 中找到原始嘗試記錄
+        original_attempt = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
+        if not original_attempt:
+            return jsonify({"ok": False, "message": "attempt not found"}), 404
+        
+        # 若前端沒傳 student_id，從原始 attempt 取得
+        if not student_id:
+            student_id = original_attempt.get("student_id")
+        
+        # 取得用戶 participant_id（用于研究分析）
+        participant_id = None
+        user = db.users.find_one({"student_id": student_id}) if student_id else None
+        if user:
+            participant_id = user.get("participant_id")
+        
+        # 計算 seek 統計
+        seek_count = len(seek_events)
+        total_seek_distance = sum(abs(e.get("to", 0) - e.get("from", 0)) for e in seek_events)
+        avg_seek_distance = total_seek_distance / seek_count if seek_count > 0 else 0
+        
+        # 創建回看日誌記錄
+        rewatch_log = {
+            "attempt_id": attempt_id,
+            "video_id": video_id,
+            "task_id": task_id,
+            "student_id": student_id,
+            "participant_id": participant_id,
+            
+            # === 觀看行為 ===
+            "watch_seconds": watch_seconds,
+            "reached_end": reached_end,
+            "watch_start_at": watch_start_at,
+            "watch_end_at": watch_end_at,
+            "duration_minutes": round(watch_seconds / 60, 2),
+            
+            # === 回看片段信息 ===
+            "segment_start_sec": start_sec,
+            "segment_end_sec": end_sec,
+            "segment_duration_sec": (end_sec - start_sec) if end_sec and start_sec else None,
+            
+            # === V1.7 Seek 統計 ===
+            "seek_count": seek_count,
+            "total_seek_distance": total_seek_distance,
+            "avg_seek_distance": round(avg_seek_distance, 2),
+            "is_frequent_seeker": seek_count > 5,  # 5次以上視為頻繁 seek（可調整閾值）
+            "seek_events": seek_events,  # 保留原始事件供詳細分析
+            
+            # === 播放完整性 ===
+            "completed_fully": reached_end and seek_count <= 2,  # V1.7: 判定為完整播放
+            
+            # === 後續回答 ===
+            "has_followup": bool(original_attempt.get("followup_is_correct") is not None),
+            "followup_is_correct": original_attempt.get("followup_is_correct"),
+            "followup_attempt_id": original_attempt.get("followup_attempt_id"),
+            
+            # === 時間戳 ===
+            "recorded_at": now_utc(),
+        }
+        
+        # 插入回看日誌
+        log_result = db.video_rewatch_logs.insert_one(rewatch_log)
+        rewatch_log_id = str(log_result.inserted_id)
+        
+        # V1.7: 更新用戶的回看統計
+        if student_id:
+            db.users.update_one(
+                {"student_id": student_id},
+                {
+                    "$inc": {"rewatch_stats.total_rewatch_count": 1},
+                    "$push": {
+                        "rewatch_stats.rewatch_sessions": {
+                            "video_id": video_id,
+                            "attempt_id": attempt_id,
+                            "watched_at": watch_start_at,
+                            "watch_duration_sec": watch_seconds,
+                            "reached_end": reached_end,
+                            "is_frequent_seeker": seek_count > 5,
+                        }
+                    },
+                    "$set": {"last_login_at": now_utc()}
+                }
+            )
+        
+        # V1.7: 更新原始 attempt，記錄回看日誌 ID
+        db.parsons_attempts.update_one(
+            {"_id": ObjectId(attempt_id)},
+            {
+                "$set": {
+                    "review_log_id": rewatch_log_id,
+                    "review_log_recorded_at": now_utc()
+                }
+            }
+        )
+        
+        return jsonify({
+            "ok": True,
+            "rewatch_log_id": rewatch_log_id,
+            "message": f"✅ 回看記錄已保存 (seek_count={seek_count})",
+            "stats": {
+                "watch_duration": watch_seconds,
+                "reached_end": reached_end,
+                "seek_count": seek_count,
+                "is_frequent_seeker": seek_count > 5,
+            }
+        })
+    
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
 
 
 # =========================

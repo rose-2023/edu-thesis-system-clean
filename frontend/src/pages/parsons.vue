@@ -110,6 +110,34 @@ const API_BASE = "http://127.0.0.1:5000";
 const route = useRoute();
 const router = useRouter();
 
+// ==============================
+// 新增：測驗計數器（不影響既有練習模式）
+
+const testStartedAt = ref(Date.now()); // 開始時間（毫秒）
+const durationSec = ref(0);            // 耗時（秒）
+
+onMounted(() => {
+  testStartedAt.value = Date.now();
+});
+
+// ==============================
+// ✅ [新增] V1.8：前/後測模式參數（不影響既有練習模式）
+// ==============================
+const isTestMode = computed(() => String(route.query.mode || "") === "test"); // [新增]
+const testRole = computed(() => String(route.query.test_role || "pre").toLowerCase()); // [新增]
+const testCycleId = computed(() => String(route.query.test_cycle_id || "default")); // [新增]
+const studentId = computed(() => String(localStorage.getItem("student_id") || "").trim()); // [新增]
+
+const testMeta = reactive({ // [新增]
+  test_task_id: "",
+  source_task_id: "",
+  started_at_ms: 0,
+  total: 1, // [新增]
+  current_index: 1, // [新增]
+  request_index: 1, // [新增]
+});
+
+
 /** ✅【新增】兼容不同 router param 命名，避免 videoId 取不到導致白畫面 */
 const videoId = computed(() => {
   return String(route.params.videoId || route.params.id || route.params.video_id || "");
@@ -344,6 +372,119 @@ const answer_ids = computed(() => {
 });
 
 // ====== 秒數轉 mm:ss ======
+
+// ==============================
+// ✅ [新增] V1.8：測驗模式 - 送出後自動跳下一題（或結束）
+// ==============================
+// [新增] V1.8：測驗模式 - 送出後自動跳下一題（或結束）
+//      請確保全檔只有一個 advanceTestAfterSubmit 的實作
+async function advanceTestAfterSubmit() { // // [新增]
+  try {
+    // 如果後端有提供 total / current_index，則自動跳下一題
+    const total = Number(testMeta.total || 1);
+    const cur = Number(testMeta.current_index || 1);
+
+    // 如果只有一題或已經是最後一題 -> 結束測驗（導回 home 或完成頁）
+    if (total <= 1 || cur >= total) {
+      // 結束行為：導回 home（或改成你要的完成頁 route）
+      // router.push("/home");
+      // [新增] 若你想導到 PreCheck 完成頁，請改成 router.push("/precheck_done")
+      try { // [新增]
+        if (window?.history?.length > 1) router.back(); // [新增]
+        else router.push("/home"); // [新增]
+      } catch (_) { // [新增]
+        try { // [新增]
+          if (window?.history?.length > 1) router.back(); // [新增]
+          else router.push("/home"); // [新增]
+        } catch (_) { // [新增]
+          try { // [新增]
+      if (window?.history?.length > 1) router.back(); // [新增]
+      else router.push("/home"); // [新增]
+    } catch (_) { // [新增]
+      router.push("/home"); // [新增]
+    } // [新增] // [新增]
+        } // [新增] // [新增]
+      } // [新增]
+      return;
+    }
+
+    // 若還有下一題，嘗試從後端取得下一題資訊（若後端支援）
+    // 範例：呼叫 test/task 並更新 testMeta、task/pool/templateSlots
+    try {
+      const url = `${API_BASE}/api/parsons/test/task?student_id=${encodeURIComponent(studentId.value)}&test_role=${encodeURIComponent(testRole.value)}&test_cycle_id=${encodeURIComponent(testCycleId.value)}&next_index=${cur + 1}`;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const j = await resp.json();
+        // 若後端回新的 test_task，更新 meta 與畫面
+        testMeta.test_task_id = String(j?.test_task_id || testMeta.test_task_id || "");
+        testMeta.source_task_id = String(j?.source_task_id || testMeta.source_task_id || "");
+        testMeta.total = j?.total || total;
+        testMeta.current_index = j?.current_index || (cur + 1);
+
+        const norm = normalizeTaskPayload(j);
+        task.value = norm.taskObj;
+        poolBlocks.value = norm.pool;
+        templateSlots.value = norm.slots;
+
+        // reset state for next question
+        resetFilled();
+        wrongIndices.value = [];
+        result.value = null;
+        state.err = "";
+        await bindBlankFocusHandlers();
+        return;
+      } else {
+        // 後端不支援直接拉下一題 → 轉為結束流程
+        try { // [新增]
+        if (window?.history?.length > 1) router.back(); // [新增]
+        else router.push("/home"); // [新增]
+      } catch (_) { // [新增]
+        try { // [新增]
+          if (window?.history?.length > 1) router.back(); // [新增]
+          else router.push("/home"); // [新增]
+        } catch (_) { // [新增]
+          try { // [新增]
+      if (window?.history?.length > 1) router.back(); // [新增]
+      else router.push("/home"); // [新增]
+    } catch (_) { // [新增]
+      router.push("/home"); // [新增]
+    } // [新增] // [新增]
+        } // [新增] // [新增]
+      } // [新增]
+        return;
+      }
+    } catch (innerErr) {
+      // 取下一題失敗 → 安全回 home
+      console.warn("advanceTestAfterSubmit: fetch next failed", innerErr);
+      try { // [新增]
+        if (window?.history?.length > 1) router.back(); // [新增]
+        else router.push("/home"); // [新增]
+      } catch (_) { // [新增]
+        try { // [新增]
+          if (window?.history?.length > 1) router.back(); // [新增]
+          else router.push("/home"); // [新增]
+        } catch (_) { // [新增]
+          try { // [新增]
+      if (window?.history?.length > 1) router.back(); // [新增]
+      else router.push("/home"); // [新增]
+    } catch (_) { // [新增]
+      router.push("/home"); // [新增]
+    } // [新增] // [新增]
+        } // [新增] // [新增]
+      } // [新增]
+      return;
+    }
+  } catch (e) {
+    console.error("advanceTestAfterSubmit error", e);
+    try { // [新增]
+      if (window?.history?.length > 1) router.back(); // [新增]
+      else router.push("/home"); // [新增]
+    } catch (_) { // [新增]
+      router.push("/home"); // [新增]
+    } // [新增]
+  }
+} // end advanceTestAfterSubmit
+
 function fmtTime(sec) {
   const s = Math.max(0, Math.floor(Number(sec) || 0));
   const mm = String(Math.floor(s / 60)).padStart(2, "0");
@@ -376,9 +517,12 @@ function buildWrongFeedback(r) {
   // hint（提示）
   // review（建議回看時間）
   return (
-    `❌ 你錯在：${slotLabel}\n` + 
-    `你原先放的是：${actual}\n` +
-    `建議提示：${hint}\n` +
+    `❌ 你錯在：${slotLabel}
+` + 
+    `你原先放的是：${actual}
+` +
+    `建議提示：${hint}
+` +
     `建議回看時間軸：${review}`
   );
 }
@@ -391,7 +535,11 @@ async function sendChoice(attempt_id, choice) {
     await fetch(`${API_BASE}/api/parsons/review_choice`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ attempt_id, student_choice: choice }),
+      body: JSON.stringify({
+        attempt_id,
+        student_id: (localStorage.getItem("student_id") || ""), // 或你目前存的 key
+        student_choice: choice
+      }),
     });
   } catch (_) {}
 }
@@ -456,6 +604,96 @@ async function submit() {
   wrongIndices.value = [];
 
   try {
+    // ==============================
+    // ✅ [新增] V1.8：測驗模式（前測/後測）送出
+    // - 前測不要顯示中文提示 / 不要顯示「答案不完全正確」訊息
+    // - 只要按送出就跳下一題（或結束）
+    // ==============================
+    if (isTestMode.value) { // [新增]
+      if (!studentId.value) { // [新增]
+        // 測驗模式：不顯示黃條，直接回上一頁/首頁
+        state.err = ""; // [新增]
+        result.value = null; // [新增]
+        try { // [新增]
+          if (window?.history?.length > 1) router.back(); // [新增]
+          else router.push("/home"); // [新增]
+        } catch (_) { // [新增]
+          router.push("/home"); // [新增]
+        } // [新增]
+        return; // [新增]
+      } // [新增]
+
+        const duration_sec = testMeta.started_at_ms
+          ? Math.max(0, Math.round((Date.now() - Number(testMeta.started_at_ms)) / 1000))
+          : 0;
+
+        // ✅【修正】組送出 body（source_task_id 一定要有值）
+      const body = {
+        student_id: String(studentId.value || ""),
+        test_cycle_id: String(testCycleId.value || ""),
+        test_role: String(testRole.value || ""),
+        test_task_id: String(testMeta.test_task_id || ""),
+        source_task_id: String(testMeta.source_task_id || ""), // ✅ 必須是 parsons_tasks 的 _id
+
+        // ✅【修正】answer_ids 不能是 null
+        answer_ids: Array.isArray(answer_ids.value)
+          ? answer_ids.value.filter(Boolean)
+          : [],
+
+        // ✅【修正】duration_sec 直接用上面算好的數字（不要 durationSec.value）
+        duration_sec,
+      };
+
+      console.log("poolBlocks sample =", poolBlocks.value?.slice?.(0, 3));
+      console.log("answer_ids raw =", answer_ids.value);
+      console.log("SUBMIT BODY =", body);
+      console.log("API_BASE =", API_BASE);
+      const res = await fetch(`${API_BASE}/api/parsons/test/submit`, { // [新增]
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      
+
+      if (res.status === 403) { // [新增]
+        window.alert("後測尚未開放，請等待老師開放後再作答。"); // [新增]
+        router.push("/home"); // [新增]
+        return; // [新增]
+      } // [新增]
+
+      const r = await res.json();
+
+      // 已做過就導回（不顯示 ❌ 訊息）
+      if (r?.ok && r?.already_submitted) { // [新增]
+        window.alert("你已經完成本次測驗，無法重複作答。"); // [新增]
+        router.push("/home"); // [新增]
+        return; // [新增]
+      } // [新增]
+
+      // 測驗模式：不顯示回饋、不高亮錯誤，直接跳下一題
+      result.value = null; // [新增]
+      wrongIndices.value = []; // [新增]
+
+      if (r?.ok) { // [新增]
+        // 測驗模式：不顯示任何黃條訊息，直接前進
+        state.err = ""; // [新增]
+        result.value = null; // [新增]
+        wrongIndices.value = []; // [新增]
+        await advanceTestAfterSubmit(); // [新增]
+      } else { // [新增]
+        // 測驗模式：送出失敗也不顯示黃條，直接回上一頁/首頁
+        state.err = ""; // [新增]
+        result.value = null; // [新增]
+        wrongIndices.value = []; // [新增]
+        try { // [新增]
+          if (window?.history?.length > 1) router.back(); // [新增]
+          else router.push("/home"); // [新增]
+        } catch (_) { // [新增]
+          router.push("/home"); // [新增]
+        } // [新增]
+      } // [新增]
+      return; // [新增]
+    }
     const task_id = task.value?.task_id || task.value?._id;
     if (!task_id) {
       state.err = "尚未載入題目，無法送出。";
@@ -501,7 +739,9 @@ async function submit() {
 
       window.alert(
         (r?.feedback || buildWrongFeedback(r)) +
-        `\n\n即將帶你回到 learning 複習影片片段：${fmtTime(start)}–${fmtTime(end)}`
+        `
+
+即將帶你回到 learning 複習影片片段：${fmtTime(start)}–${fmtTime(end)}`
       );
 
       await sendChoice(r?.attempt_id, "yes");
@@ -602,6 +842,71 @@ async function loadTask() {
   resetFilled();
 
   try {
+    // ==============================
+    // ✅ [新增] V1.8：測驗模式（前測/後測）載入題目
+    // ==============================
+    if (isTestMode.value) { // [新增]
+      if (!studentId.value) { // [新增]
+        // 測驗模式：不顯示黃條，直接回上一頁/首頁
+        state.noTask = true; // [新增]
+        state.err = ""; // [新增]
+        task.value = null; // [新增]
+        poolBlocks.value = []; // [新增]
+        templateSlots.value = []; // [新增]
+        try { // [新增]
+          if (window?.history?.length > 1) router.back(); // [新增]
+          else router.push("/home"); // [新增]
+        } catch (_) { // [新增]
+          router.push("/home"); // [新增]
+        } // [新增]
+        return; // [新增]
+      } // [新增]
+
+      // [新增] 測驗計時起點（每題進來重置）
+      testMeta.started_at_ms = Date.now(); // [新增]
+
+      // [新增] 支援多題：從 query.test_index 讀取想要的題號（後端可忽略）
+      const idxQ = route.query.test_index ? Number(route.query.test_index) : null; // [新增]
+      testMeta.request_index = Number.isFinite(idxQ) && idxQ > 0 ? idxQ : Number(testMeta.request_index || 1); // [新增]
+
+      const url = `${API_BASE}/api/parsons/test/task?student_id=${encodeURIComponent(studentId.value)}&test_role=${encodeURIComponent(testRole.value)}&test_cycle_id=${encodeURIComponent(testCycleId.value)}&index=${encodeURIComponent(String(testMeta.request_index))}`; // [新增]
+      const res = await fetch(url); // [新增]
+
+      if (!res.ok) { // [新增]
+        state.noTask = true; // [新增]
+        task.value = null; // [新增]
+        poolBlocks.value = []; // [新增]
+        templateSlots.value = []; // [新增]
+        try { // [新增]
+          const rr = await res.json(); // [新增]
+          state.err = rr?.message || "測驗題目載入失敗"; // [新增]
+        } catch (_) { // [新增]
+          state.err = "測驗題目載入失敗"; // [新增]
+        } // [新增]
+        return; // [新增]
+      } // [新增]
+
+      const r = await res.json(); // [新增]
+
+      // [新增] 讀取題序資訊（後端若提供）
+      testMeta.total = Number(r?.total || 1); // [新增]
+      testMeta.current_index = Number(r?.current_index || testMeta.request_index || 1); // [新增]
+
+      // [新增] 記錄 test_task_id / source_task_id
+      testMeta.test_task_id = String(r?.test_task_id || "");     // ✅ 只吃 test_task_id
+      testMeta.source_task_id = String(r?.source_task_id || ""); // ✅ 只吃 source_task_id
+
+      const norm = normalizeTaskPayload(r); // [新增]
+      task.value = norm.taskObj; // [新增]
+      poolBlocks.value = norm.pool; // [新增]
+
+      // [新增] ✅前測不顯示中文提示：清空每格 label（template 不改）
+      templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" })); // [新增]
+
+      // ✅【新增】讓 blank 可 focus + 套用縮排（沿用既有機制）
+      await bindBlankFocusHandlers(); // [新增]
+      return; // [新增]
+    }
     const level = route.query.level ? String(route.query.level) : "L1";
     const url = `${API_BASE}/api/parsons/task?video_id=${encodeURIComponent(String(videoId.value || ""))}&level=${encodeURIComponent(level)}`;
     const res = await fetch(url);
@@ -700,7 +1005,7 @@ onBeforeUnmount(() => { // [新增]
 });
 
 watch(
-  () => [videoId.value, route.query.level],
+  () => [videoId.value, route.query.level, route.query.mode, route.query.test_role, route.query.test_cycle_id, route.query.test_index], // [新增]
   () => loadTask()
 );
 </script>

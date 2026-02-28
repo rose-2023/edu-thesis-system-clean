@@ -2,41 +2,71 @@
   <div class="page">
     <div class="card">
       <div class="header">
-        <div class="logo">🧪</div>
+        <div class="logo" aria-hidden="true">🧪</div>
         <div>
           <h1>論文系統登入</h1>
           <p>請使用學號與密碼登入</p>
         </div>
       </div>
 
-      <div class="field">
-        <label>學號</label>
-        <div class="inputWrap">
-          <span class="icon">👤</span>
-          <input v-model="studentId" placeholder="例如：A123456789" autocomplete="username" />
+      <!-- ✅ 教學重點：用 form 統一處理 Enter / Submit -->
+      <form @submit.prevent="login" novalidate>
+        <div class="field">
+          <label for="studentId">學號</label>
+          <div class="inputWrap">
+            <span class="icon" aria-hidden="true">👤</span>
+            <input
+              id="studentId"
+              ref="studentIdInput"
+              v-model="studentId"
+              placeholder="例如：A123456789"
+              autocomplete="username"
+              inputmode="text"
+              :disabled="loading"
+              aria-label="學號"
+            />
+          </div>
+          <p class="hint">提示：可輸入測試帳號或你的學號</p>
         </div>
-      </div>
 
-      <div class="field">
-        <label>密碼</label>
-        <div class="inputWrap">
-          <span class="icon">🔒</span>
-          <input
-            v-model="password"
-            type="password"
-            placeholder="請輸入密碼"
-            autocomplete="current-password"
-            @keyup.enter="login"
-          />
+        <div class="field">
+          <label for="password">密碼</label>
+          <div class="inputWrap">
+            <span class="icon" aria-hidden="true">🔒</span>
+
+            <input
+              id="password"
+              v-model="password"
+              :type="showPwd ? 'text' : 'password'"
+              placeholder="請輸入密碼"
+              autocomplete="current-password"
+              :disabled="loading"
+              aria-label="密碼"
+            />
+
+            <!-- ✅ 教學重點：可視化密碼（減少打錯） -->
+            <button
+              class="iconBtn"
+              type="button"
+              @click="showPwd = !showPwd"
+              :disabled="loading"
+              :aria-label="showPwd ? '隱藏密碼' : '顯示密碼'"
+              :title="showPwd ? '隱藏密碼' : '顯示密碼'"
+            >
+              {{ showPwd ? "🙈" : "👁️" }}
+            </button>
+          </div>
         </div>
-      </div>
 
-      <button class="btn" @click="login" :disabled="loading">
-        <span v-if="!loading">登入</span>
-        <span v-else>登入中…</span>
-      </button>
+        <!-- ✅ 教學重點：提交按鈕 disabled 條件要包含 loading + 欄位檢查 -->
+        <button class="btn" type="submit" :disabled="loading || !canSubmit">
+          <span v-if="!loading">登入</span>
+          <span v-else>登入中…</span>
+        </button>
 
-      <p class="error" v-if="error">{{ error }}</p>
+        <!-- ✅ 教學重點：錯誤訊息用 role=alert（無障礙、也更顯眼） -->
+        <p class="error" v-if="error" role="alert">{{ error }}</p>
+      </form>
     </div>
 
     <p class="copyright">
@@ -46,7 +76,7 @@
 </template>
 
 <script setup>
-import { ref } from "vue";
+import { ref, computed, onMounted, nextTick } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "../api";
 
@@ -56,15 +86,32 @@ const studentId = ref("");
 const password = ref("");
 const loading = ref(false);
 const error = ref("");
+const showPwd = ref(false);
 
-async function login() {
-  error.value = "";
+const studentIdInput = ref(null);
+
+// ✅ 教學重點：可提交條件集中管理
+const canSubmit = computed(() => {
   const sid = (studentId.value || "").trim();
   const pwd = password.value || "";
+  return sid.length > 0 && pwd.length > 0;
+});
+
+function setError(msg) {
+  error.value = msg || "";
+}
+
+async function login() {
+  setError("");
+
+  const sid = (studentId.value || "").trim();
+  const pwd = password.value || "";
+
   if (!sid || !pwd) {
-    error.value = "請輸入學號與密碼";
+    setError("請輸入學號與密碼");
     return;
   }
+
   loading.value = true;
 
   try {
@@ -73,6 +120,12 @@ async function login() {
       password: pwd,
     });
 
+    // ✅ 教學重點：記住學號（開發測試很省時間）
+    localStorage.setItem("last_student_id", sid);
+
+    // ✅【重要】V1.7: 直接存學號（用於後續記錄回看和答題）
+    localStorage.setItem("student_id", sid);
+
     // ✅ 存 token / role / participant_id
     if (res.data?.token) localStorage.setItem("token", res.data.token);
     if (res.data?.role) localStorage.setItem("role", res.data.role);
@@ -80,22 +133,40 @@ async function login() {
 
     const role = res.data?.role || "student";
 
-    // ✅ 只導一次：老師→admin dashboard；學生→quiz/home
+    // ✅ 只導一次：老師→admin dashboard；學生→precheck/home
     if (role === "teacher" || role === "admin") {
       router.replace("/admin/dashboard");
     } else {
-      const pretestDone = localStorage.getItem("pretest_done") === "true";
-      router.replace(pretestDone ? "/home" : "/quiz");
+      router.replace("/precheck");
     }
   } catch (e) {
-    error.value = e?.response?.data?.message || e.message || "連線失敗（請確認 Flask 有跑）";
+    // ✅ 教學重點：把常見錯誤變成「人看得懂」的訊息
+    const status = e?.response?.status;
+    const msgFromServer = e?.response?.data?.message || e?.response?.data?.error;
+
+    if (status === 401 || status === 403) {
+      setError("學號或密碼錯誤，請再試一次。");
+    } else if (status >= 500) {
+      setError("後端伺服器錯誤（500）。請確認 Flask 有啟動，或稍後再試。");
+    } else {
+      setError(msgFromServer || e?.message || "連線失敗（請確認 Flask 有跑）");
+    }
   } finally {
     loading.value = false;
   }
 }
 
-</script>
+onMounted(async () => {
+  // ✅ 自動帶入上次登入的學號
+  const last = localStorage.getItem("last_student_id") || "";
+  if (last) studentId.value = last;
 
+  await nextTick();
+  try {
+    studentIdInput.value?.focus?.();
+  } catch (_) {}
+});
+</script>
 
 <style scoped>
 .page{
@@ -155,6 +226,12 @@ label{
   margin-bottom: 6px;
 }
 
+.hint{
+  margin: 6px 2px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .inputWrap{
   display: flex;
   align-items: center;
@@ -180,6 +257,21 @@ input{
   background: transparent;
   font-size: 14px;
   color: var(--text);
+}
+
+.iconBtn{
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  opacity: .85;
+  padding: 2px 6px;
+  border-radius: 10px;
+}
+.iconBtn:hover{ background: rgba(0,0,0,.05); }
+.iconBtn:disabled{
+  cursor: not-allowed;
+  opacity: .5;
 }
 
 .btn{
@@ -211,26 +303,6 @@ input{
   border: 1px solid rgba(185,28,28,.18);
   padding: 10px 12px;
   border-radius: 12px;
-}
-
-.footer{
-  margin-top: 14px;
-  display: flex;
-  justify-content: center;
-  gap: 8px;
-  font-size: 13px;
-}
-
-.muted{ color: var(--muted); }
-
-.link{
-  text-decoration: none;
-  font-weight: 600;
-}
-.link:hover{ text-decoration: underline; }
-
-copyright{
-  margin-top: 14px;
 }
 
 .copyright{

@@ -1,4 +1,4 @@
-<template> 
+<template>
   <div class="t5-layout">
     <!-- ===== Sidebar ===== -->
     <aside class="sidebar">
@@ -446,6 +446,7 @@ const selectedUnit = ref("");
 const selectedVideo = ref("");
 const selectedSubtitleVersion = ref("");
 
+
 const loading = reactive({ units: false, videos: false, videoInfo: false, questions: false });
 const busy = reactive({ regen: false });
 const err = reactive({ a: "", d: "", e: "" });
@@ -473,104 +474,6 @@ const modal = reactive({
   data: null
 });
 
-// ==============================
-// ✅ [新增] 通用正規化：支援 /question 回傳「頂層」或「data.task」兩種格式
-// 目的：確保 previewData 一定會被組成 { ok:true, meta:{...}, prompt, parsons_blocks, distractor_blocks, solution_order_text }
-// ==============================
-function _normBlock(b = {}, idx = 0) { // [新增]
-  const id = String(b.id ?? b._id ?? `b${idx}`);
-  const text = b.text || b.code || b.line || "";
-  const meaning =
-    b.meaning_zh ||
-    b.semantic_zh ||
-    b.semantic ||
-    b.zh ||
-    "";
-  return { id, text, meaning_zh: meaning };
-}
-
-function _pick(obj, keys = []) { // [新增]
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
-  }
-  return "";
-}
-
-function normalizeQuestionResponse(data, row) { // [新增]
-  // 有些後端會回：{ ok:true, task:{...}, ... }
-  const task = data?.task && typeof data.task === "object" ? data.task : null;
-
-  const root = task || data || {};
-
-  const questionObj = root.question && typeof root.question === "object" ? root.question : (data?.question || {});
-
-  const prompt =
-    _pick(root, ["question_desc", "question_text", "prompt"]) ||
-    _pick(questionObj, ["prompt", "title", "text"]) ||
-    "";
-
-  // blocks 來源：task.solution_blocks / solution_blocks / blocks
-  const solRaw =
-    Array.isArray(root.solution_blocks) ? root.solution_blocks :
-    Array.isArray(data?.solution_blocks) ? data.solution_blocks :
-    Array.isArray(root.blocks) ? root.blocks :
-    [];
-
-  const disRaw =
-    Array.isArray(root.distractor_blocks) ? root.distractor_blocks :
-    Array.isArray(data?.distractor_blocks) ? data.distractor_blocks :
-    Array.isArray(root.distractors) ? root.distractors :
-    [];
-
-  const parsons_blocks = (solRaw || []).map(_normBlock);
-  const distractor_blocks = (disRaw || []).map(_normBlock);
-
-  // order 來源：solution_order (array/string)；若沒有就用 solution_blocks 的 id 順序
-  let orderArr = [];
-  const so =
-    root.solution_order ??
-    data?.solution_order ??
-    root.solution_ids ??
-    data?.solution_ids ??
-    "";
-
-  if (Array.isArray(so)) {
-    orderArr = so.map(x => String(x));
-  } else if (typeof so === "string" && so.trim()) {
-    orderArr = so.split(/→|->/g).map(x => x.trim()).filter(Boolean);
-  }
-
-  if (!orderArr.length && parsons_blocks.length) {
-    orderArr = parsons_blocks.map(b => String(b.id));
-  }
-
-  const solution_order_text = orderArr.length ? orderArr.join(" → ") : "";
-
-  const meta = {
-    task_id: String(root.task_id ?? root._id ?? data?.task_id ?? data?.id ?? row?.task_id ?? ""),
-    version: root.version || data?.version || row?.version || "—",
-    unit: root.unit || data?.unit || selectedUnit.value || "—",
-    title: root.video_title || data?.video_title || selectedVideoTitle.value || "—",
-    segment_label: root.segment_label || data?.segment_label || "—",
-    subtitle_version: root.subtitle_version || data?.subtitle_version || selectedSubtitleVersion.value || "—",
-    status: root.status_zh || data?.status_zh || root.status || data?.status || "—",
-    enabled: !!(root.enabled ?? data?.enabled ?? data?.student_visible ?? root.student_visible),
-    created_at: root.created_at || data?.created_at || "—",
-    created_by: "AI Agent"
-  };
-
-  return {
-    ok: true,
-    meta,
-    prompt,
-    parsons_blocks,
-    distractor_blocks,
-    solution_order_text,
-    // [新增] 保留 order array 給 solutionDetailList 用（即使模板沒直接用也不破壞）
-    solution_order: orderArr,
-  };
-}
 
 async function openPreview(row = null) {
   console.log("[openPreview] row =", row);
@@ -598,18 +501,44 @@ async function openPreview(row = null) {
       throw new Error(data?.error || "讀取題目失敗");
     }
 
-    // ==============================
-    // ✅ [新增] 核心修正：統一正規化（支援 data.task 格式）
-    // ==============================
-    const normalized = normalizeQuestionResponse(data, row); // [新增]
-    previewData.value = normalized; // [修改]
+    const question = data.question || {};
+    const prompt = question.prompt || question.title || question.text || "";
+    initDistractorKeep(previewData.value?.distractor_blocks || []);
 
-    // ✅ [新增] 預覽載入後再初始化 distractorKeep（避免你原本先 init 但 previewData 還是 null）
-    initDistractorKeep(previewData.value?.distractor_blocks || []); // [修改]
 
-    // 老師審核欄位（兩種回傳可能：頂層或 task 裡）
-    reviewForm.tags = data.review_tags || data?.task?.review_tags || [];
-    reviewForm.note = data.review_note || data?.task?.review_note || "";
+    const mapBlocks = (arr = []) =>
+      (arr || []).map((b, idx) => ({
+        id: String(b.id ?? b._id ?? `b${idx}`),
+        text: b.text || b.code || b.line || "",
+        meaning_zh: b.semantic_zh || b.semantic || b.zh || ""
+      }));
+
+    const solutionOrderText = Array.isArray(data.solution_order)
+      ? data.solution_order.join(" → ")
+      : (data.solution_order || "");
+
+    previewData.value = {
+      ok: true,
+      meta: {
+        task_id: data.task_id,
+        version: data.version || row.version || "—",
+        unit: selectedUnit.value || "—",
+        title: selectedVideoTitle.value || "—",
+        segment_label: data.segment_label || "—",
+        subtitle_version: selectedSubtitleVersion.value || "—",
+        status: data.status_zh || data.status || "—",
+        enabled: !!data.student_visible,
+        created_at: data.created_at || "—",
+        created_by: "AI Agent"
+      },
+      prompt,
+      parsons_blocks: mapBlocks(data.solution_blocks),
+      distractor_blocks: mapBlocks(data.distractor_blocks),
+      solution_order_text: solutionOrderText
+    };
+
+    reviewForm.tags = data.review_tags || [];
+    reviewForm.note = data.review_note || "";
 
   } catch (e) {
     console.error("[openPreview] error =", e);
@@ -621,18 +550,23 @@ async function openPreview(row = null) {
 
 // 老師審核用：從 previewData 計算出正確答案區塊的詳細資訊（包含中文語意）
 const solutionDetailList = computed(() => {
+  // blocks 來源：你目前預覽用的是 parsons_blocks（保底也支援 solution_blocks）
   const blocks =
     previewData.value?.parsons_blocks ||
     previewData.value?.solution_blocks ||
     [];
 
+  // order 來源 1：如果後端有給 solution_order（array）
   let order =
     previewData.value?.solution_order ||
     previewData.value?.solution_ids ||
     [];
 
+  // order 來源 2：如果只有 solution_order_text（像 "b1 → b2 → b3 → b4"）
   if (!Array.isArray(order) || order.length === 0) {
     const s = String(previewData.value?.solution_order_text || "").trim();
+
+    // 同時支援 "→" 或 "->"
     order = s
       .split(/→|->/g)
       .map(x => x.trim())
@@ -651,6 +585,7 @@ const solutionDetailList = computed(() => {
     };
   });
 });
+
 
 // review in modal
 const reviewTagOptions = [
@@ -699,6 +634,7 @@ const answerText = computed(() => {
   const so = modal.data?.solution_order;
   if (Array.isArray(so)) return so.join(" → ");
   if (typeof so === "string") return so;
+  // fallback: 用區塊 code 拼成一行
   return solutionBlocks.value.map(b => b.code).join(" → ");
 });
 
@@ -713,6 +649,7 @@ function goSubtitleCheck() {
 // ===== helpers =====
 function fmtTime(iso) {
   if (!iso) return "—";
+  // 簡單顯示，避免時區問題
   return iso.replace("T", " ").slice(0, 16);
 }
 function dotClass(status) {
@@ -731,8 +668,6 @@ function closeModal() {
   reviewTags.value = [];
   reviewNote.value = "";
   Object.keys(dKeep).forEach(k => delete dKeep[k]);
-  // [新增] 關閉時清掉 previewData，避免下次殘留
-  previewData.value = null; // [新增]
 }
 
 // ===== API =====
@@ -821,6 +756,34 @@ async function regenerate() {
   }
 }
 
+// async function openPreview(row) {
+//   modal.open = true;
+//   modal.loading = true;
+//   modal.err = "";
+//   modal.data = null;
+
+//   try {
+//     const { data } = await t5Get("/question", {
+//       params: { task_id: row.task_id }
+//     });
+//     modal.data = data;
+
+//     // load review state
+//     reviewTags.value = data.review_tags || [];
+//     reviewNote.value = data.review_note || "";
+
+//     // init distractor keep
+//     (data.distractor_blocks || []).forEach((b, idx) => {
+//       const id = String(b.id ?? b._id ?? `d${idx}`);
+//       dKeep[id] = (b.enabled !== false); // default true
+//     });
+//   } catch {
+//     modal.err = "讀取預覽失敗";
+//   } finally {
+//     modal.loading = false;
+//   }
+// }
+
 async function saveReviewOnly() {
   if (!modal.data?.task_id) return;
   const payload = {
@@ -842,8 +805,35 @@ async function unpublish(row) {
   await fetchQuestions();
 }
 
+async function publishFromModal() {
+  if (!modal.data?.task_id) return;
+  await saveReviewOnly();
+  await t5Post("/question/publish", { task_id: modal.data.task_id });
+  await fetchQuestions();
+  closeModal();
+}
+
+async function regenFromModal() {
+  await saveReviewOnly();
+  await regenerate();
+  closeModal();
+}
+
+async function rejectFromModal() {
+  if (!modal.data?.task_id) return;
+  await t5Post("/question/reject", {
+    task_id: modal.data.task_id,
+    review_tags: reviewTags.value,
+    review_note: reviewNote.value
+  });
+  await fetchQuestions();
+  closeModal();
+}
+
+// 干擾區塊切換移除/保留
 /** 初始化：預覽載入成功後，把所有 distractor 預設設為 true */
 function initDistractorKeep(distractors = []) {
+  // 只初始化「尚未存在」的，避免老師切過後又被覆蓋
   for (const b of distractors) {
     const id = String(b.id ?? b._id ?? "");
     if (!id) continue;
@@ -901,19 +891,22 @@ async function publishFromPreview() {
     const taskId = previewData.value?.meta?.task_id;
     if (!taskId) throw new Error("缺少 task_id，無法發布");
 
+    // 1) 先存老師審核（tags/note + 干擾保留移除）
     await t5Post("/question/review_save", {
       task_id: taskId,
       review_tags: reviewForm.tags || [],
       review_note: reviewForm.note || "",
-      distractor_keep: { ...distractorKeep },
+      distractor_keep: { ...distractorKeep }, // ✅ 把 ✅/❌ 狀態送到後端
     });
 
+    // 2) 再發布（學生端可見）
     await t5Post("/question/publish", {
       task_id: taskId,
     });
 
+    // 3) UI 更新：重抓列表 + 重新讀取預覽狀態
     await fetchQuestions();
-    await openPreview({ task_id: taskId, version: previewData.value?.meta?.version }); // [修改]
+    await openPreview({ task_id: taskId }); // 重新載入（可選）
     alert("✅ 已發布：學生端現在看得到這題了");
   } catch (e) {
     alert("⚠️ 發布失敗：" + (e?.message || "unknown"));
@@ -923,8 +916,11 @@ async function publishFromPreview() {
 // ai中文語意提示
 function enhanceMeaning(codeText, rawMeaning) {
   const t = (codeText || "").trim();
+
+  // 先用你原本的 rawMeaning 當 fallback
   const base = rawMeaning || "（未提供）";
 
+  // 針對常見模式做教學版補強
   if (/^total\s*=\s*0$/.test(t)) {
     return "建立變數 total，用來累積加總結果，先把初始值設為 0。";
   }
@@ -937,12 +933,16 @@ function enhanceMeaning(codeText, rawMeaning) {
   if (/^print\(\s*total\s*\)$/.test(t)) {
     return "迴圈結束後，輸出最後計算完成的總和結果。";
   }
+
+  // 其他行：維持原本語意
   return base;
 }
+
 
 function returnNotPublish() {
   alert("（示意）已退回：你下一步要接後端 /return，把題目 status=已退回 並存 review tags/note。");
 }
+
 </script>
 
 <style scoped>

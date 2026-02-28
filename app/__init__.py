@@ -3,6 +3,9 @@ from flask_cors import CORS
 from .routes import register_blueprints
 import os
 
+print("[ENV] AI_ENABLED =", os.environ.get("AI_ENABLED"))
+print("[ENV] OPENAI_MODEL =", os.environ.get("OPENAI_MODEL"))
+print("[ENV] OPENAI_API_KEY exists =", bool(os.environ.get("OPENAI_API_KEY")))
 def create_app():
     app = Flask(__name__)
     PROJECT_ROOT = os.getcwd()

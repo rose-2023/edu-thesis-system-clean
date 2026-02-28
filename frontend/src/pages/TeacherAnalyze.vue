@@ -5,858 +5,593 @@
       <div class="profile">
         <div class="avatar">👩‍🏫</div>
         <div class="hello">
-          <div class="hello-title">您好，老師</div>
+          <div class="hi">您好，老師</div>
+          <div class="sub">分析儀表板</div>
         </div>
       </div>
 
-      <nav class="nav">
-        <button class="nav-item"><span class="icon">📋</span><span>總覽</span></button>
-        <button class="nav-item"><span class="icon">🎞️</span><span>影片管理</span></button>
-        <button class="nav-item"><span class="icon">🤖</span><span>AI管理生成紀錄檢視</span></button>
-        <button class="nav-item active"><span class="icon">📊</span><span>分析</span></button>
+      <nav class="menu">
+        <a class="item" href="/admin/dashboard">總覽</a>
+        <a class="item" href="/admin/videos">影片管理</a>
+        <a class="item" href="/admin/t5">AI管理生成紀錄檢視</a>
+        <a class="item active" href="/admin/analyze">分析</a>
       </nav>
-
-      <div class="sidebar-footer">
-        <button class="logout">登出</button>
-      </div>
     </aside>
 
     <!-- ===== 右側內容 ===== -->
-    <main class="main">
-      <header class="header">
-        <h1 class="title">學習分析(學生錯誤類型、等級變動、前後測)</h1>
-
-        <!-- 篩選列 -->
-        <section class="filters">
-          <div class="filter">
-            <label>單元：</label>
-            <select v-model="filters.unit">
-              <option value="U1">U1</option>
-              <option value="U2">U2</option>
-              <option value="U3">U3</option>
-            </select>
-          </div>
-
-          <div class="filter">
-            <label>影片標題：</label>
-            <select v-model="filters.video_id">
-              <option value="">全部</option>
-              <option v-for="v in videos" :key="v.video_id" :value="v.video_id">
-                {{ v.title }}
-              </option>
-            </select>
-          </div>
-
-          <div class="filter">
-            <label>班級：</label>
-            <select v-model="filters.class_id">
-              <option value="">全部</option>
-              <option v-for="c in classOptions" :key="c.value" :value="c.value">
-                {{ c.label }}
-              </option>
-            </select>
-          </div>
-
-          <div class="filter date">
-            <input type="date" v-model="filters.from" />
-            <span class="date-sep">-</span>
-            <input type="date" v-model="filters.to" />
-          </div>
-        </section>
-      </header>
-
-      <!-- ===== 狀態列 ===== -->
-      <div class="status-row" v-if="loading || errorMsg">
-        <div v-if="loading" class="status loading">讀取分析資料中…</div>
-        <div v-if="errorMsg" class="status error">⚠️ {{ errorMsg }}</div>
+    <main class="content">
+      <div class="pageTitleRow">
+        <h1 class="pageTitle">分析儀表板</h1>
+        <button class="btn" @click="refreshAll" :disabled="loading">重新整理</button>
       </div>
 
-      <!-- 卡片區 -->
-      <section class="grid">
-        <!-- 1. 前測 VS 後測（目前先顯示「前測平均答對/答錯」，後測之後再補） -->
-        <div class="card">
-          <div class="card-title">1. 學習成效：前測VS後測</div>
-          <div class="card-body">
-            <div class="chart-placeholder">
-              <div class="bar-group">
-                <div class="bar-label">答對</div>
-                <div class="bar" :style="{ width: correctPct + '%' }"></div>
-              </div>
-              <div class="bar-group">
-                <div class="bar-label">答錯</div>
-                <div class="bar post" :style="{ width: wrongPct + '%' }"></div>
-              </div>
-            </div>
+      <!-- ===== 測驗資料 ===== -->
+      <section class="panel">
+        <div class="panelTitle">測驗資料（parsons_test_attempts）</div>
 
-            <div class="legend">
-              <span class="dot dot-pre"></span> 前測平均答對：{{ card1.avg_correct }}
-              <span class="dot dot-post"></span> 前測平均答錯：{{ card1.avg_wrong }}
-              <span class="muted">（樣本數 n={{ card1.n }}）</span>
-            </div>
+        <div class="controls">
+          <div class="field">
+            <div class="label">test_cycle_id</div>
+            <input class="input" v-model="testCycleId" placeholder="default" />
+          </div>
 
-            <div class="hint">
-              目前資料是「前測」；後測、前後測比較之後你新增 post session / post responses 就能加上。
-            </div>
+          <div class="field">
+            <div class="label">班級（class_name）</div>
+            <input class="input" v-model="className" placeholder="例如：資工系 A班" />
+          </div>
+
+          <div class="field">
+            <div class="label">顯示</div>
+            <select class="input" v-model="viewMode">
+              <option value="attempts">作答明細</option>
+              <option value="summary">每位學生彙總</option>
+            </select>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary" @click="downloadAttemptsCsv">下載作答 CSV</button>
           </div>
         </div>
 
-        <!-- 2. 等級變動（先保留雛型，不接 API） -->
-        <div class="card">
-          <div class="card-title">2. 學生難易度變動：L1-&gt;L2-&gt;L3</div>
-          <div class="card-body">
-            <div class="flow">
-              <div class="level">
-                <div class="pill l1">L1</div>
-                <div class="count">L1 → L2（16 人）</div>
-              </div>
-
-              <div class="arrow">➡️</div>
-
-              <div class="level">
-                <div class="pill l2">L2</div>
-                <div class="count">L2 → L3（6 人）</div>
-                <div class="sub">L2 → L1（4 人）</div>
-              </div>
-
-              <div class="arrow">➡️</div>
-
-              <div class="level">
-                <div class="pill l3">L3</div>
-              </div>
-            </div>
-            <div class="note">（雛型：之後等你有 L1/L2/L3 的 session 或 attempts，再接 API）</div>
-          </div>
-        </div>
-
-        <!-- 3. 常見錯誤（接 API） -->
-        <div class="card">
-          <div class="card-title">3. 學生常見錯誤單元與題目</div>
-          <div class="card-body">
-            <div class="hbar">
-              <div class="hbar-row" v-for="(x, i) in card3.by_category" :key="i">
-                <div class="hbar-label">{{ x.category }}</div>
-                <div class="hbar-track">
-                  <div class="hbar-fill" :style="{ width: pctFromWrongCount(x.wrong_count) + '%' }"></div>
-                </div>
-                <div class="hbar-value">{{ x.wrong_count }}</div>
-              </div>
-
-              <div v-if="card3.by_category.length === 0" class="empty">
-                （目前沒有答錯資料，或你篩選條件下沒有 responses）
-              </div>
-            </div>
-
-            <div class="mini-table">
-              <div class="mini-title">錯最多的題目（Top）</div>
-              <ul>
-                <li v-for="q in card3.top_wrong_questions" :key="q.question_id">
-                  <span class="qid">#{{ q.question_id.slice(-6) }}</span>
-                  <span class="stem">{{ q.stem }}</span>
-                  <span class="badge">錯 {{ q.wrong_count }} 次</span>
-                </li>
-              </ul>
-
-              <div v-if="card3.top_wrong_questions.length === 0" class="empty">
-                （目前沒有 Top 錯題）
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- 4. 認知負荷（保留雛型） -->
-        <div class="card">
-          <div class="card-title">4. 認知負荷問卷</div>
-          <div class="card-body">
-            <div class="line-placeholder">
-              <div class="line-hint">（雛型：之後接 surveys 畫折線圖）</div>
-              <div class="line-grid"></div>
-            </div>
-            <div class="subnote">1-7分（分數越高表示負荷越高）</div>
-          </div>
-        </div>
-
-        <!-- 6. 學習行為（接 API） -->
-        <div class="card">
-          <div class="card-title">6. 學生學習行為指標</div>
-          <div class="card-body">
-            <div class="metrics">
-              <div class="metric">
-                <div class="m-label">平均學習秒數</div>
-                <div class="m-value">{{ round1(card6.learning_logs.avg_duration_sec) }}</div>
-              </div>
-              <div class="metric">
-                <div class="m-label">平均重新生成次數</div>
-                <div class="m-value">{{ round2(card6.learning_logs.avg_regen_clicks) }}</div>
-              </div>
-              <div class="metric">
-                <div class="m-label">作答總數</div>
-                <div class="m-value">{{ card6.responses.total }}</div>
-              </div>
-              <div class="metric">
-                <div class="m-label">正確率</div>
-                <div class="m-value">{{ accuracyRate }}%</div>
-              </div>
-              <div class="metric">
-                <div class="m-label">平均作答秒數</div>
-                <div class="m-value">{{ round2(card6.responses.avg_time_spent) }}</div>
-              </div>
-              <div class="metric">
-                <div class="m-label">提示使用率</div>
-                <div class="m-value">{{ round1(card6.responses.hint_rate * 100) }}%</div>
-              </div>
-            </div>
-
-            <div class="mini">
-              <div>learning_logs 筆數：<b>{{ card6.learning_logs.n }}</b></div>
-              <div>答對/答錯：<b>{{ card6.responses.correct }}</b> / <b>{{ card6.responses.wrong }}</b></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- 5. 自我效能（保留雛型） -->
-        <div class="card">
-          <div class="card-title">5. 自我效能問卷</div>
-          <div class="card-body">
-            <div class="line-placeholder">
-              <div class="line-hint">（雛型：之後接 surveys 畫折線圖）</div>
-              <div class="line-grid"></div>
-            </div>
-            <div class="subnote">1-7分（分數越高表示自我效能越高）</div>
-          </div>
-        </div>
+        <div class="hint" v-if="errorMsg">{{ errorMsg }}</div>
       </section>
 
-      <footer class="actions">
-        <button class="btn secondary" @click="onExportCSV">匯出CSV檔</button>
-        <button class="btn primary" @click="onExportPDF">匯出PDF檔</button>
-      </footer>
+      <!-- ===== 學生帳號匯入/匯出 ===== -->
+      <section class="panel">
+        <div class="panelTitle">學生帳號（thesis_system.users）</div>
+
+        <div class="controls">
+          <div class="field">
+            <div class="label">匯入 CSV</div>
+            <input class="input" type="file" accept=".csv" @change="onPickStudentCsv" />
+            <div class="subhint">欄位：student_id,name,class_name,password(optional)</div>
+          </div>
+
+          <div class="field">
+            <div class="label">預設密碼（CSV 沒有 password 時）</div>
+            <input class="input" v-model="defaultPassword" />
+          </div>
+
+          <div class="actions">
+            <button class="btn" @click="uploadStudentsCsv" :disabled="!studentCsvFile || loading">上傳匯入</button>
+            <button class="btn primary" @click="downloadStudentsCsv">下載學生 CSV</button>
+          </div>
+        </div>
+
+        <div class="hint ok" v-if="importMsg">{{ importMsg }}</div>
+      </section>
+
+      <!-- ===== 表格 ===== -->
+      <section class="panel">
+        <div class="panelTitle">
+          <span v-if="viewMode==='attempts'">作答明細</span>
+          <span v-else>每位學生彙總</span>
+        </div>
+
+        <div class="tableWrap" v-if="viewMode==='attempts'">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>student_id</th>
+                <th>class_name</th>
+                <th>name</th>
+                <th>test_role</th>
+                <th>is_correct</th>
+                <th>score</th>
+                <th>duration_sec</th>
+                <th>wrong_indices</th>
+                <th>submitted_at</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(r, idx) in attemptRows" :key="idx">
+                <td>{{ r.student_id }}</td>
+                <td>{{ r.class_name }}</td>
+                <td>{{ r.name }}</td>
+                <td>{{ r.test_role }}</td>
+                <td>{{ r.is_correct }}</td>
+                <td>{{ r.score }}</td>
+                <td>{{ r.duration_sec }}</td>
+                <td>{{ r.wrong_indices }}</td>
+                <td>{{ r.submitted_at }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tableWrap" v-else>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>student_id</th>
+                <th>class_name</th>
+                <th>name</th>
+                <th>pre_done</th>
+                <th>pre_score</th>
+                <th>pre_duration</th>
+                <th>post_done</th>
+                <th>post_score</th>
+                <th>post_duration</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(r, idx) in summaryRows" :key="idx">
+                <td>{{ r.student_id }}</td>
+                <td>{{ r.class_name }}</td>
+                <td>{{ r.name }}</td>
+                <td>{{ r.pre_done }}</td>
+                <td>{{ r.pre_score }}</td>
+                <td>{{ r.pre_duration }}</td>
+                <td>{{ r.post_done }}</td>
+                <td>{{ r.post_score }}</td>
+                <td>{{ r.post_duration }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </main>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from "vue";
-import axios from "axios";
+import { ref, computed, onMounted } from "vue";
 
-/** ✅ 如果你有共用的 axios instance（你之前有 api），可以換成：
- * import { api } from "../api";
- * 然後把 axios.get(...) 改成 api.get(...)
- */
-const BACKEND = "http://127.0.0.1:5000";
-
-const filters = reactive({
-  unit: "U1",
-  video_id: "", // 全部
-  class_id: "", // 全部
-  from: "2026-01-01",
-  to: "2026-02-01",
-});
+// [新增] 統一後端 API Base（避免打到 Vite 5173 回傳 index.html 造成 JSON/CSV 解析錯誤）
+const API_BASE = (import.meta?.env?.VITE_API_BASE || "http://127.0.0.1:5000").replace(/\/$/, ""); // [新增]
 
 const loading = ref(false);
 const errorMsg = ref("");
+const importMsg = ref("");
 
-/** 影片下拉：先用「依 unit 撈 videos」的 API
- *  你目前有 /api/admin_upload/videos?status=active&unit=U1
- */
-const videos = ref([]);
+// [刪除] const testCycleId = ref("default");
+const testCycleId = ref(""); // [新增] 允許留空（留空=不以 test_cycle_id 過濾）
 
-/** 班級：你目前 DB 可能還沒做 class，因此先用假選項
- *  之後你有 users.class_id / sessions.class_id 再接真 API
- */
-const classOptions = ref([
-  { value: "A", label: "甲班" },
-  { value: "B", label: "乙班" },
-]);
+// [刪除] const className = ref("");
+const className = ref("資工系A"); // [新增] 預設班級（模板不改，用值做預設）
 
-/** Analytics 回傳資料容器 */
-const data = reactive({
-  cards: {
-    card1_pre: { avg_correct: 0, avg_wrong: 0, n: 0 },
-    card3_errors: { by_category: [], top_wrong_questions: [] },
-    card6_behavior: {
-      learning_logs: { avg_duration_sec: 0, avg_regen_clicks: 0, n: 0, understood_false: 0, understood_true: 0 },
-      responses: { avg_hint_count: 0, avg_time_spent: 0, correct: 0, hint_rate: 0, total: 0, wrong: 0 },
-    },
-  },
-});
+const viewMode = ref("attempts");
 
-/** ====== computed 對應卡片 ====== */
-const card1 = computed(() => data.cards.card1_pre || { avg_correct: 0, avg_wrong: 0, n: 0 });
-const card3 = computed(() => data.cards.card3_errors || { by_category: [], top_wrong_questions: [] });
-const card6 = computed(() => data.cards.card6_behavior || { learning_logs: {}, responses: {} });
+const defaultPassword = ref("");
+const studentCsvFile = ref(null);
 
-/** 卡 1 bar 比例：用 (答對/答錯) 在 (答對+答錯) 的比例 */
-const correctPct = computed(() => {
-  const c = Number(card1.value.avg_correct || 0);
-  const w = Number(card1.value.avg_wrong || 0);
-  const total = c + w;
-  if (total <= 0) return 0;
-  return Math.round((c / total) * 100);
-});
-const wrongPct = computed(() => {
-  const c = Number(card1.value.avg_correct || 0);
-  const w = Number(card1.value.avg_wrong || 0);
-  const total = c + w;
-  if (total <= 0) return 0;
-  return Math.round((w / total) * 100);
-});
+// 資料
+const users = ref([]); // {student_id,name,class_name}
+const attempts = ref([]); // raw csv rows
 
-const accuracyRate = computed(() => {
-  const total = Number(card6.value.responses?.total || 0);
-  const correct = Number(card6.value.responses?.correct || 0);
-  if (total <= 0) return 0;
-  return Math.round((correct / total) * 100);
-});
-
-/** 卡 3 bar：用最大 wrong_count 當 100% */
-function pctFromWrongCount(wrongCount) {
-  const arr = card3.value.by_category || [];
-  const max = arr.reduce((m, x) => Math.max(m, Number(x.wrong_count || 0)), 0);
-  if (!max) return 0;
-  return Math.round((Number(wrongCount || 0) / max) * 100);
+function parseCsv(text) {
+  // 簡易 CSV 解析：因為 wrong_indices 可能是 JSON 字串（含逗號）
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return [];
+  const headers = lines[0].split(",");
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = splitCsvLine(lines[i]);
+    const row = {};
+    headers.forEach((h, idx) => (row[h] = cols[idx] ?? ""));
+    rows.push(row);
+  }
+  return rows;
 }
 
-/** 取整 */
-function round1(x) {
-  const n = Number(x || 0);
-  return Math.round(n * 10) / 10;
-}
-function round2(x) {
-  const n = Number(x || 0);
-  return Math.round(n * 100) / 100;
+// 支援 wrong_indices 內含逗號的情況（JSON 字串會含逗號）
+function splitCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === "," && !inQuotes) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
 }
 
-/** ====== API 呼叫 ====== */
-async function fetchVideos() {
-  try {
-    // 你之前截圖有成功：/api/admin_upload/videos?status=active&unit=U1&title=&page=1&per_page=9999
-    const url = `${BACKEND}/api/admin_upload/videos`;
-    const res = await axios.get(url, {
-      params: {
-        status: "active",
-        unit: filters.unit,
-        title: "",
-        page: 1,
-        per_page: 9999,
-      },
+async function fetchUsers() {
+  // 取全部學生（分析頁需要）
+  const qs = new URLSearchParams();
+  if (className.value) qs.set("class_name", className.value);
+  qs.set("page", "1");
+  qs.set("page_size", "500");
+
+  // [修改] 使用 API_BASE，避免打到 5173
+  const res = await fetch(`${API_BASE}/api/records/students?${qs.toString()}`); // [新增]
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.message || "fetch students failed");
+  users.value = data.students || [];
+}
+
+async function fetchAttemptsCsv() {
+  const qs = new URLSearchParams();
+
+  // [新增] test_cycle_id 可留空：留空=不過濾
+  if ((testCycleId.value || "").trim()) qs.set("test_cycle_id", (testCycleId.value || "").trim()); // [新增]
+
+  // [新增] 班級也可在後端先過濾（前端仍會再過濾一次）
+  if ((className.value || "").trim()) qs.set("class_name", (className.value || "").trim()); // [新增]
+
+  // [刪除] const res = await fetch(`/api/parsons/test/export_csv?${qs.toString()}`);
+  // [新增] 正確 CSV 來源：records.py 匯出 parsons_test_attempts
+  const res = await fetch(`${API_BASE}/api/records/test_attempts.csv?${qs.toString()}`); // [新增]
+
+  if (!res.ok) throw new Error(`test_attempts.csv failed: ${res.status}`);
+  const text = await res.text();
+  attempts.value = parseCsv(text);
+}
+
+const userMap = computed(() => {
+  const m = new Map();
+  for (const u of users.value) m.set(String(u.student_id), u);
+  return m;
+});
+
+const attemptRows = computed(() => {
+  const rows = [];
+  for (const a of attempts.value) {
+    const sid = String(a.student_id || "");
+    const u = userMap.value.get(sid);
+    if (className.value && u && u.class_name !== className.value) continue;
+
+    rows.push({
+      ...a,
+      class_name: u?.class_name || a.class_name || "",
+      name: u?.name || a.name || "",
     });
-    // 這裡不確定你回傳格式，先做容錯：
-    const items = res.data?.items || res.data?.videos || res.data || [];
-    videos.value = (Array.isArray(items) ? items : []).map((v) => ({
-      video_id: v._id || v.video_id || v.id || "",
-      title: v.title || v.original_name || v.filename || "未命名影片",
-    }));
+  }
+  return rows;
+});
+
+const summaryRows = computed(() => {
+  // 將 attempts 依 student_id + role 彙總
+  const byStudent = new Map();
+  for (const a of attempts.value) {
+    const sid = String(a.student_id || "");
+    if (!sid) continue;
+
+    const u = userMap.value.get(sid);
+    if (className.value && u && u.class_name !== className.value) continue;
+
+    if (!byStudent.has(sid)) {
+      byStudent.set(sid, {
+        student_id: sid,
+        class_name: u?.class_name || a.class_name || "",
+        name: u?.name || a.name || "",
+        pre_done: false,
+        pre_score: "",
+        pre_duration: "",
+        post_done: false,
+        post_score: "",
+        post_duration: "",
+      });
+    }
+    const r = byStudent.get(sid);
+    if (a.test_role === "pre") {
+      r.pre_done = true;
+      r.pre_score = a.score ?? "";
+      r.pre_duration = a.duration_sec ?? "";
+    }
+    if (a.test_role === "post") {
+      r.post_done = true;
+      r.post_score = a.score ?? "";
+      r.post_duration = a.duration_sec ?? "";
+    }
+  }
+
+  // 若 users 有但 attempts 沒資料，也要顯示（方便看誰未作答）
+  for (const u of users.value) {
+    const sid = String(u.student_id || "");
+    if (!sid) continue;
+    if (className.value && u.class_name !== className.value) continue;
+    if (!byStudent.has(sid)) {
+      byStudent.set(sid, {
+        student_id: sid,
+        class_name: u.class_name || "",
+        name: u.name || "",
+        pre_done: false,
+        pre_score: "",
+        pre_duration: "",
+        post_done: false,
+        post_score: "",
+        post_duration: "",
+      });
+    }
+  }
+
+  return Array.from(byStudent.values()).sort((a, b) => a.student_id.localeCompare(b.student_id));
+});
+
+function downloadFile(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadAttemptsCsv() {
+  try {
+    errorMsg.value = "";
+    const qs = new URLSearchParams();
+
+    // [新增] test_cycle_id 可留空
+    if ((testCycleId.value || "").trim()) qs.set("test_cycle_id", (testCycleId.value || "").trim()); // [新增]
+    if ((className.value || "").trim()) qs.set("class_name", (className.value || "").trim()); // [新增]
+
+    // [刪除] const res = await fetch(`/api/parsons/test/export_csv?${qs.toString()}`);
+    const res = await fetch(`${API_BASE}/api/records/test_attempts.csv?${qs.toString()}`); // [新增]
+
+    if (!res.ok) throw new Error(`下載失敗：${res.status}`);
+    const blob = await res.blob();
+
+    const suffix = (testCycleId.value || "").trim() ? (testCycleId.value || "").trim() : "all"; // [新增]
+    downloadFile(blob, `parsons_test_attempts_${suffix}.csv`); // [新增]
   } catch (e) {
-    // 影片下拉失敗不擋分析頁
-    videos.value = [];
+    errorMsg.value = e?.message || String(e);
   }
 }
 
-async function fetchAnalytics() {
-  loading.value = true;
-  errorMsg.value = "";
+function onPickStudentCsv(e) {
+  const f = e?.target?.files?.[0];
+  studentCsvFile.value = f || null;
+}
+
+async function uploadStudentsCsv() {
   try {
-    const url = `${BACKEND}/api/analytics/analytics`;
-    const res = await axios.get(url, {
-      params: {
-        unit: filters.unit || undefined,
-        from: filters.from || undefined,
-        to: filters.to || undefined,
-        video_id: filters.video_id || undefined,
-        class_id: filters.class_id || undefined,
-      },
+    importMsg.value = "";
+    errorMsg.value = "";
+    if (!studentCsvFile.value) return;
+
+    loading.value = true;
+    const fd = new FormData();
+    fd.append("file", studentCsvFile.value);
+
+    // [刪除] fd.append("default_password", defaultPassword.value || "123456");
+    // [新增] 不用預設密碼：只有在你手動填了才送；否則後端可用 student_id 當密碼
+    if ((defaultPassword.value || "").trim()) fd.append("default_password", (defaultPassword.value || "").trim()); // [新增]
+
+    // [新增] 班級預設：CSV 若沒有 class_name，後端用這個
+    fd.append("default_class_name", (className.value || "").trim() || "資工系A"); // [新增]
+
+    // [修改] 使用 API_BASE
+    const res = await fetch(`${API_BASE}/api/records/students/import_csv`, { // [新增]
+      method: "POST",
+      body: fd,
     });
-
-    // 你的回傳目前長這樣：{ cards: { card1_pre:..., card3_errors:..., card6_behavior:... }, filters_used:... }
-    if (!res.data || !res.data.cards) {
-      throw new Error("API 回傳格式不含 cards");
-    }
-
-    // 安全塞入
-    data.cards = {
-      ...data.cards,
-      ...res.data.cards,
-    };
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || "匯入失敗");
+    importMsg.value =
+      `匯入完成：新增 ${data.inserted} 筆、更新 ${data.updated} 筆` +
+      (data.errors?.length ? `（有 ${data.errors.length} 筆錯誤）` : "");
+    await refreshAll();
   } catch (e) {
-    errorMsg.value =
-      e?.response?.data?.message ||
-      e?.message ||
-      "讀取分析資料失敗（請確認後端 /api/analytics/analytics 有啟動）";
+    errorMsg.value = e?.message || String(e);
   } finally {
     loading.value = false;
   }
 }
 
-/** 篩選變動就重新抓 */
-watch(
-  () => ({ ...filters }),
-  async () => {
-    // unit 變更時，影片清單也要更新
-    await fetchVideos();
-    await fetchAnalytics();
-  },
-  { deep: true }
-);
+async function downloadStudentsCsv() {
+  try {
+    errorMsg.value = "";
+    const qs = new URLSearchParams(); // [新增]
+    if ((className.value || "").trim()) qs.set("class_name", (className.value || "").trim()); // [新增]
 
-onMounted(async () => {
-  await fetchVideos();
-  await fetchAnalytics();
+    // [修改] 使用 API_BASE
+    const res = await fetch(`${API_BASE}/api/records/students/export_csv?${qs.toString()}`); // [新增]
+    if (!res.ok) throw new Error(`下載失敗：${res.status}`);
+    const blob = await res.blob();
+    downloadFile(blob, "students.csv");
+  } catch (e) {
+    errorMsg.value = e?.message || String(e);
+  }
+}
+
+async function refreshAll() {
+  try {
+    loading.value = true;
+    errorMsg.value = "";
+    await Promise.all([fetchUsers(), fetchAttemptsCsv()]);
+  } catch (e) {
+    errorMsg.value = e?.message || String(e);
+  } finally {
+    loading.value = false;
+  }
+}
+
+onMounted(() => {
+  refreshAll();
 });
-
-function onExportCSV() {
-  alert("下一步：我會幫你做 /api/analytics/export/csv，並把 filters 帶過去");
-}
-function onExportPDF() {
-  alert("下一步：我會幫你做 /api/analytics/export/pdf 或前端列印成 PDF");
-}
 </script>
 
 <style scoped>
-/* ===== Layout ===== */
 .layout {
-  display: grid;
-  grid-template-columns: 240px 1fr;
-  min-height: 100vh;
-  background: #f6f6f6;
-  font-family: "Microsoft JhengHei", system-ui, sans-serif;
-}
-
-/* ===== Sidebar ===== */
-.sidebar {
-  background: #d7b15e;
-  padding: 18px 14px;
   display: flex;
-  flex-direction: column;
-  gap: 16px;
+  min-height: 100vh;
+  background: #f5f5f5;
+}
+.sidebar {
+  width: 260px;
+  background: #caa74a;
+  color: #1b1b1b;
+  padding: 18px 14px;
+  box-sizing: border-box;
 }
 .profile {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px;
-  background: rgba(255, 255, 255, 0.25);
-  border-radius: 14px;
+  gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.15);
+  margin-bottom: 14px;
 }
 .avatar {
-  width: 44px;
-  height: 44px;
+  width: 46px;
+  height: 46px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.55);
   display: grid;
   place-items: center;
-  font-size: 22px;
-}
-.hello-title {
-  font-weight: 900;
-  font-size: 18px;
-}
-.nav {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 6px;
-}
-.nav-item {
-  border: 0;
-  border-radius: 14px;
-  padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.25);
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-  text-align: left;
-}
-.nav-item.active {
-  background: rgba(255, 255, 255, 0.5);
-  font-weight: 900;
-}
-.icon {
-  width: 24px;
-  text-align: center;
-}
-.sidebar-footer {
-  margin-top: auto;
-}
-.logout {
-  width: 100%;
-  border: 2px solid rgba(0, 0, 0, 0.2);
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 14px;
-  padding: 10px 12px;
-  cursor: pointer;
-}
-
-/* ===== Main ===== */
-.main {
-  padding: 18px 18px 26px;
-}
-.header {
-  background: #fff;
-  border-radius: 18px;
-  padding: 16px 18px;
-  border: 2px solid rgba(0, 0, 0, 0.08);
-}
-.title {
-  margin: 0 0 12px;
+  background: rgba(255, 255, 255, 0.35);
   font-size: 20px;
-  font-weight: 900;
-  text-align: center;
 }
-
-/* ===== Filters ===== */
-.filters {
-  display: grid;
-  grid-template-columns: repeat(4, max-content) 1fr;
-  gap: 12px;
-  align-items: center;
-  justify-content: center;
-}
-.filter {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-}
-.filter label {
-  font-weight: 900;
-}
-select,
-input[type="date"] {
-  height: 34px;
-  border-radius: 10px;
-  border: 2px solid rgba(0, 0, 0, 0.15);
-  padding: 0 10px;
-  background: #fff;
-}
-.filter.date {
-  justify-content: flex-end;
-  gap: 8px;
-}
-.date-sep {
-  color: rgba(0, 0, 0, 0.45);
-}
-
-/* ===== status ===== */
-.status-row {
-  margin-top: 10px;
-  display: grid;
-  gap: 10px;
-}
-.status {
-  border-radius: 14px;
-  padding: 10px 12px;
-  border: 2px solid rgba(0, 0, 0, 0.08);
-  background: #fff;
+.hello .hi {
   font-weight: 800;
+  font-size: 16px;
 }
-.status.loading {
-  opacity: 0.8;
+.hello .sub {
+  font-size: 12px;
+  opacity: 0.9;
+  margin-top: 2px;
 }
-.status.error {
-  border-color: rgba(255, 0, 0, 0.18);
-}
-
-/* ===== Grid Cards ===== */
-.grid {
-  margin-top: 16px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-}
-.card {
-  background: #fff;
-  border-radius: 18px;
-  border: 3px solid rgba(0, 0, 0, 0.22);
-  padding: 14px 14px 12px;
-}
-.card-title {
-  font-weight: 900;
-  margin-bottom: 10px;
-  text-align: center;
-}
-.card-body {
-  min-height: 220px;
-}
-
-/* ===== Card 1 placeholder ===== */
-.chart-placeholder {
+.menu {
   display: grid;
   gap: 10px;
-  padding: 10px;
-  border-radius: 14px;
-  background: #fafafa;
-  border: 2px dashed rgba(0, 0, 0, 0.15);
 }
-.bar-group {
-  display: grid;
-  grid-template-columns: 50px 1fr;
-  align-items: center;
-  gap: 10px;
-}
-.bar-label {
-  font-weight: 900;
-  color: rgba(0, 0, 0, 0.6);
-}
-.bar {
-  height: 18px;
-  border-radius: 999px;
-  background: #2b7bbb;
-}
-.bar.post {
-  background: #2aa84a;
-}
-.legend {
-  margin-top: 10px;
-  display: flex;
-  gap: 12px;
-  justify-content: center;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  display: inline-block;
-}
-.dot-pre {
-  background: #2b7bbb;
-}
-.dot-post {
-  background: #2aa84a;
-}
-.muted {
-  color: rgba(0, 0, 0, 0.55);
+.item {
+  display: block;
+  text-decoration: none;
+  color: #1b1b1b;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.15);
   font-weight: 700;
 }
-.hint {
-  margin-top: 10px;
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.55);
-  text-align: center;
+.item:hover {
+  background: rgba(255, 255, 255, 0.25);
 }
-
-/* ===== Flow (card 2 prototype) ===== */
-.flow {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr auto 1fr;
-  gap: 10px;
+.item.active {
+  background: rgba(255, 255, 255, 0.35);
+}
+.content {
+  flex: 1;
+  padding: 18px 18px 26px;
+  box-sizing: border-box;
+}
+.pageTitleRow {
+  display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
 }
-.level {
-  display: grid;
-  gap: 6px;
-  justify-items: center;
+.pageTitle {
+  margin: 0;
+  font-size: 24px;
 }
-.pill {
-  width: 64px;
-  height: 140px;
-  border-radius: 18px;
-  display: grid;
-  place-items: center;
+.panel {
+  background: #fff;
+  border-radius: 14px;
+  padding: 14px;
+  border: 2px solid #000;
+  margin-bottom: 14px;
+}
+.panelTitle {
+  font-size: 16px;
   font-weight: 900;
-  color: #fff;
+  margin-bottom: 10px;
 }
-.l1 {
-  background: #1f3d7a;
+.controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr auto;
+  gap: 12px;
+  align-items: end;
 }
-.l2 {
-  background: #1aa0a0;
-}
-.l3 {
-  background: #d7a04c;
-}
-.arrow {
-  font-size: 22px;
-  opacity: 0.75;
-}
-.count {
-  font-weight: 900;
-}
-.sub {
+.field .label {
   font-size: 12px;
-  color: rgba(0, 0, 0, 0.55);
-}
-.note {
-  margin-top: 10px;
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.55);
-  text-align: center;
-}
-
-/* ===== Card 3 ===== */
-.hbar {
-  display: grid;
-  gap: 10px;
-}
-.hbar-row {
-  display: grid;
-  grid-template-columns: 90px 1fr 38px;
-  gap: 10px;
-  align-items: center;
-}
-.hbar-label {
-  font-weight: 900;
-}
-.hbar-track {
-  height: 18px;
-  background: #eee;
-  border-radius: 999px;
-  overflow: hidden;
-}
-.hbar-fill {
-  height: 100%;
-  background: #21b5c0;
-  border-radius: 999px;
-}
-.hbar-value {
-  text-align: right;
-  font-weight: 900;
-}
-.mini-table {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px dashed rgba(0, 0, 0, 0.15);
-}
-.mini-title {
   font-weight: 900;
   margin-bottom: 6px;
 }
-.mini-table ul {
-  margin: 0;
-  padding-left: 18px;
+.input {
+  width: 100%;
+  padding: 10px 10px;
+  border: 2px solid #000;
+  border-radius: 10px;
+  box-sizing: border-box;
+  outline: none;
+  background: #fff;
 }
-.mini-table li {
-  margin: 6px 0;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.qid {
-  font-weight: 900;
-}
-.stem {
-  flex: 1;
-  color: rgba(0, 0, 0, 0.75);
-}
-.badge {
-  background: rgba(0, 0, 0, 0.06);
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  padding: 2px 8px;
-  border-radius: 999px;
+.subhint {
   font-size: 12px;
-}
-.empty {
-  margin-top: 8px;
-  color: rgba(0, 0, 0, 0.55);
-  font-weight: 700;
-  text-align: center;
-}
-
-/* ===== Card 4/5 placeholder ===== */
-.line-placeholder {
-  height: 170px;
-  border-radius: 14px;
-  background: #fafafa;
-  border: 2px dashed rgba(0, 0, 0, 0.15);
-  display: grid;
-  place-items: center;
-  position: relative;
-  overflow: hidden;
-}
-.line-grid {
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(to right, rgba(0, 0, 0, 0.06) 1px, transparent 1px) 0
-      0 / 40px 40px,
-    linear-gradient(to bottom, rgba(0, 0, 0, 0.06) 1px, transparent 1px) 0 0 / 40px
-      40px;
-  opacity: 0.5;
-}
-.line-hint {
-  position: relative;
-  z-index: 1;
-  font-weight: 900;
-  color: rgba(0, 0, 0, 0.55);
-}
-.subnote {
-  margin-top: 10px;
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.55);
-  text-align: center;
-}
-
-/* ===== Card 6 ===== */
-.metrics {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.metric {
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  border-radius: 14px;
-  padding: 10px;
-  background: rgba(0, 0, 0, 0.02);
-}
-.m-label {
-  font-weight: 900;
-  color: rgba(0, 0, 0, 0.6);
-  font-size: 13px;
-}
-.m-value {
-  font-weight: 900;
-  font-size: 22px;
+  opacity: 0.7;
   margin-top: 6px;
 }
-.mini {
-  margin-top: 10px;
-  font-size: 13px;
-  color: rgba(0, 0, 0, 0.7);
-}
-
-/* ===== Actions ===== */
 .actions {
-  margin-top: 14px;
   display: flex;
-  justify-content: flex-end;
-  gap: 12px;
+  gap: 10px;
 }
 .btn {
-  border-radius: 12px;
   padding: 10px 14px;
-  border: 2px solid rgba(0, 0, 0, 0.18);
-  cursor: pointer;
+  border-radius: 10px;
+  border: 2px solid #000;
+  background: #fff;
   font-weight: 900;
+  cursor: pointer;
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .btn.primary {
-  background: #f0c15f;
+  background: #111;
+  color: #fff;
 }
-.btn.secondary {
-  background: #f6f6f6;
+.hint {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 2px dashed #000;
+  background: #fff9db;
+  font-weight: 800;
 }
-
-/* ===== Responsive ===== */
-@media (max-width: 1100px) {
-  .filters {
-    grid-template-columns: 1fr 1fr;
-    justify-content: stretch;
-  }
-  .filter.date {
-    justify-content: flex-start;
-  }
+.hint.ok {
+  background: #eaffea;
 }
-@media (max-width: 900px) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
-  .sidebar {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-  }
-  .grid {
-    grid-template-columns: 1fr;
-  }
+.tableWrap {
+  overflow: auto;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.table th,
+.table td {
+  border: 2px solid #000;
+  padding: 8px 10px;
+  white-space: nowrap;
 }
 </style>

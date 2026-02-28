@@ -391,12 +391,18 @@ async function sendChoice(attempt_id, choice) {
     await fetch(`${API_BASE}/api/parsons/review_choice`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ attempt_id, student_choice: choice }),
+      body: JSON.stringify({
+        attempt_id,
+        student_id: (localStorage.getItem("student_id") || ""), // 或你目前存的 key
+        student_choice: choice
+      }),
     });
   } catch (_) {}
 }
 // 儲存學生的作答狀態到 localStorage，extra 可額外帶入 attempt_id 或其他資訊，讓回來後能繼續做或顯示提示訊息
 // filled 記錄作答內容
+// wrong_indices 記錄錯誤位置（讓回來後能高亮錯誤格子）
+
 function savePracticeState(extra = {}) {
   try {
     const stateObj = {
@@ -461,12 +467,16 @@ async function submit() {
       return;
     }
 
+    // ✅【重要】V1.7: 從 localStorage 取得 student_id
+    const student_id = localStorage.getItem("student_id") || "";
+
     const body = {
       task_id,
       answer_ids: answer_ids.value,
       video_id: String(videoId.value || ""),
       level: route.query.level ? String(route.query.level) : "L1",
       review_attempt_id: review_attempt_id.value,
+      student_id: student_id,  // ✅ 新增：發送學號
     };
 
     const res = await fetch(`${API_BASE}/api/parsons/submit`, {

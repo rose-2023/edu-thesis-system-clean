@@ -14,7 +14,8 @@
         </div>
 
         <div class="profileText">
-          <div class="hello">你好，{{ studentName }}同學</div>
+          <div class="hello">你好，{{ studentName }}</div>
+          <div class="level">等級：{{ level }}</div>
         </div>
       </div>
 
@@ -29,21 +30,6 @@
             class="dot"
             :class="{ on: i <= doneDots }"
           ></span>
-        </div>
-
-        <!-- ✅【新增】後測進度點點：與老師端「後測發布/取消發布」連動（同一份 test_control） -->
-        <div class="postProgress">
-          <div class="progressTitle">
-            後測：<span>{{ postOpen ? (postDone ? "已完成" : "進行中") : "未開放" }}</span>
-          </div>
-          <div class="dots postDots" v-if="postOpen">
-            <span
-              v-for="i in postTotalDots"
-              :key="'post-dot-' + i"
-              class="dot"
-              :class="{ on: i <= postDoneDots }"
-            ></span>
-          </div>
         </div>
       </div>
     </header>
@@ -65,16 +51,6 @@
           <div class="unitFooter">
             <div class="progressText">
               {{ postDone ? "已完成" : "已開啟" }}
-            </div>
-
-            <!-- ✅【新增】後測卡片內的進度點點（與上方 header 的後測點點同一套資料） -->
-            <div class="dots postDotsInline">
-              <span
-                v-for="i in postTotalDots"
-                :key="'post-card-dot-' + i"
-                class="dot"
-                :class="{ on: i <= postDoneDots }"
-              ></span>
             </div>
 
             <button
@@ -123,144 +99,104 @@
 
 
 <script setup>
-import { ref, computed, onMounted } from "vue";
+import { ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import axios from "axios";
 
+const studentName = ref("許同學");
+const level = ref("L2");
+const avatarUrl = ref("");
 
-// ✅ 固定打後端（避免相對路徑打到 Vite 5173 回傳 index.html => <!doctype html>）
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
+const ongoingUnit = ref("U1-2");
+
+const totalDots = 12;
+const doneDots = ref(8);
+
+const units = ref([
+  { unit: "U1", name: "迴圈基礎", progress: 80, theme: "blue" },
+  { unit: "U2", name: "串列與字串", progress: 20, theme: "green" },
+]);
+
+// ✅【新增】後測狀態（統一讀取 test_control）
+const testCycleId = ref("default");
+const postOpen = ref(false);
+const postDone = ref(false);
 
 const router = useRouter();
 
-// ==============================
-// 基本資訊（維持原本畫面用）
-// ==============================
-const avatarUrl = ref("");
-const studentName = ref("")
-// ==============================
-// 單元列表（動態）
-// ==============================
-const units = ref([]);
+function goUnit(unit) {
+  // ✅ 先用你要的單元導向（之後再依 unit 變化）
+  router.push(`/learn/${unit}`);
+}
 
-// 右上角「進度點點」
-const totalDots = ref(12);
-const doneDots = ref(0);
-
-// 顯示未完成課程（沿用舊 UI 字串）
-// 若你想更精準，可由後端回 current_unit / current_video 再組字
-const ongoingUnit = ref("U1-2 Parsons");
-
-// ==============================
-// 後測卡片（test_control）
-// ==============================
-const postOpen = ref(false);
-const postDoneCount = ref(0);
-const postTotalCount = ref(0);
-
-const postTotalDots = computed(() => {
-  // 若後端有回 total，就用 total；否則保持 12
-  const t = Number(postTotalCount.value || 0);
-  return t > 0 ? t : 12;
-});
-
-const postDoneDots = computed(() => {
-  const t = postTotalDots.value;
-  const d = Math.max(0, Math.min(Number(postDoneCount.value || 0), t));
-  return d;
-});
-
-// ==============================
-// API：載入首頁資料（單元進度 + 後測狀態）
-// ==============================
-async function loadHomeData() {
+// ✅【新增】讀取後測狀態（後端已統一走 test_control）
+async function fetchPostTestStatus() {
   try {
-    const student_id =
+    const studentId =
       localStorage.getItem("student_id") ||
-      localStorage.getItem("studentId") ||
+      localStorage.getItem("user_id") ||
       "";
 
-    const { data } = await axios.get(`${API_BASE}/api/student/units_progress`, {
+    const { data } = await axios.get("/api/parsons/test/status", {
       params: {
-        student_id,
-        test_cycle_id: "default",
+        test_cycle_id: testCycleId.value,
+        student_id: studentId,
       },
     });
 
-    if (!data?.ok) {
-      console.error("units_progress not ok:", data);
+    postOpen.value = !!data?.post_open;
+    postDone.value = !!data?.post_done;
+  } catch (e) {
+    // 讀不到就視為未開啟，避免影響原本單元列表
+    postOpen.value = false;
+    postDone.value = false;
+  }
+}
+
+// ✅【新增】進入後測：先取一題以取得 video_id，再導向 /parsons/:videoId?mode=test...
+async function goPostTest() {
+  try {
+    const studentId =
+      localStorage.getItem("student_id") ||
+      localStorage.getItem("user_id") ||
+      "";
+
+    const { data } = await axios.get("/api/parsons/test/task", {
+      params: {
+        test_cycle_id: testCycleId.value,
+        test_role: "post",
+        student_id: studentId,
+        index: 0,
+      },
+    });
+
+    const videoId =
+      data?.task?.video_id ||
+      data?.video_id ||
+      data?.task?.videoId ||
+      "";
+
+    if (!videoId) {
+      alert("找不到後測題目的影片資訊（video_id）。請先確認後端 test_task 是否有寫入 video_id。");
       return;
     }
 
-    // 1) units
-    // 後端會回：[{unit, progress, total_videos, done_videos}]
-    const nameMap = {
-      U1: "迴圈基礎",
-      U2: "串列與字串",
-      U3: "函式",
-      U4: "檔案處理",
-    };
-    const themePool = ["blue", "green", "purple", "orange"];
-
-    units.value = (data.units || []).map((u, idx) => ({
-      unit: u.unit,
-      name: nameMap[u.unit] || u.unit,
-      progress: Number(u.progress || 0),
-      theme: themePool[idx % themePool.length],
-    }));
-
-    // 2) 點點（用平均 progress 估算）
-    if (units.value.length > 0) {
-      const avg =
-        units.value.reduce((sum, u) => sum + Number(u.progress || 0), 0) /
-        units.value.length;
-      doneDots.value = Math.round((avg / 100) * totalDots.value);
-    } else {
-      doneDots.value = 0;
-    }
-
-    // 3) posttest 狀態（同一份 test_control）
-    postOpen.value = !!data.posttest?.post_open;
-    postDoneCount.value = Number(data.posttest?.done || 0);
-    postTotalCount.value = Number(data.posttest?.total || 0);
+    router.push(
+      `/parsons/${videoId}?mode=test&test_role=post&test_cycle_id=${encodeURIComponent(
+        testCycleId.value
+      )}`
+    );
   } catch (e) {
-    console.error("loadHomeData error:", e);
+    alert("後測載入失敗，請稍後再試。");
   }
 }
 
-// ==============================
-// 互動：進入單元 / 後測
-// ==============================
-function goUnit(unit) {
-  // 保留你原本的進入單元邏輯（這裡只示範：導到 /unit/:unit）
-  // 如果你原本是點「進入」就進到該單元第一支影片 / learning，請把這段改回你的舊邏輯。
-  router.push({ name: "StudentLearning", params: { unit } });
-}
-
-function goPostTest() {
-  // [修改] 後測 Parsons 走專用路由(B)，不再導到選擇題 Quiz
-  router.push({
-    path: "/posttest/parsons",
-    query: { mode: "test", test_role: "post", test_cycle_id: "default" },
-  });
-}
-
-onMounted(async () => {
-  const id = localStorage.getItem("student_id")
-  if (!id) return
-
-  const res = await fetch(`http://127.0.0.1:5000/api/records/students?page=1&page_size=100`)
-  const data = await res.json()
-
-  if (data.ok) {
-    const found = data.students.find(s => s.student_id === id)
-    if (found) {
-      studentName.value = found.name
-    }
-  }
-  loadHomeData();
-})
+onMounted(() => {
+  fetchPostTestStatus(); // [新增]
+});
 </script>
+
+
 <style scoped>
 .homePage {
   min-height: 100vh;
@@ -307,7 +243,7 @@ onMounted(async () => {
 
 .profileText .hello {
   font-weight: 900;
-  font-size: 20px;
+  font-size: 18px;
 }
 
 .profileText .level {
@@ -447,33 +383,6 @@ onMounted(async () => {
   }
 }
 
-
-/* ✅【新增】後測卡片/後測進度點點 */
-.postProgress {
-  margin-top: 10px;
-}
-
-.postDotsInline {
-  flex: 1;
-  display: flex;
-  justify-content: center;
-  gap: 6px;
-}
-
-.postDotsInline .dot {
-  width: 10px;
-  height: 10px;
-}
-
-.postDotsInline .dot.on {
-  background: #111;
-}
-
-.postDots .dot {
-  width: 10px;
-  height: 10px;
-}
-
 /* ✅【新增】後測卡片樣式（沿用單元卡片結構，只改主色系） */
 .unitCard.post {
   background: #f7f7f7;
@@ -490,7 +399,7 @@ onMounted(async () => {
 .unitCard.post .progressFill {
   background: #333;
 }
-</style>
 
+</style>
 
 

@@ -84,12 +84,14 @@ import { onBeforeUnmount } from "vue";
 
 const router = useRouter();
 const route = useRoute();
+// const unit = route.params.unit;
 
 // 如果是從測驗頁過來的，會帶 query ?start=xx&end=xx&attempt_id=xxx
 // 這時候顯示回看條（return bar），並在影片上標示正在回看的片段區間
 const watchStartAt = ref(null);
 const reachedEnd = ref(false);
 const watchSeconds = ref(0);
+const seekEvents = ref([]);  // V1.7: 記錄 seek 事件
       
   
 let lastCurrentTime = 0;
@@ -135,9 +137,29 @@ function _bindPlayerWatchEvents() {
   }
 });
 
-  // 使用者拖曳進度條（seek）時，不計入「連續觀看」秒數，直接重設起點
+  // V1.7: 使用者拖曳進度條（seek）時，記錄 seek 事件
+  let seekStartTime = null;
   el.addEventListener("seeking", () => {
+    seekStartTime = el.currentTime;
     _lastVideoTime = el.currentTime;
+  });
+
+  el.addEventListener("seeked", () => {
+    // 記錄 seek 距離
+    if (seekStartTime !== null) {
+      const seekEndTime = el.currentTime;
+      const seekDistance = Math.abs(seekEndTime - seekStartTime);
+      
+      if (seekDistance > 0.5) {  // 只記錄大於 0.5 秒的 seek
+        seekEvents.value.push({
+          from: Math.round(seekStartTime * 100) / 100,
+          to: Math.round(seekEndTime * 100) / 100,
+          distance: Math.round(seekDistance * 100) / 100,
+          timestamp: new Date().toISOString()
+        });
+      }
+      seekStartTime = null;
+    }
   });
 
   el.addEventListener("ended", () => {
@@ -375,17 +397,28 @@ async function sendWatchLog() {
     reached_end: Boolean(reachedEnd.value),
     watch_start_at: watchStartAt.value,
     watch_end_at: new Date().toISOString(),
+    
+    // V1.7: 新增 seek 事件追蹤
+    seek_events: seekEvents.value,
+    seek_count: seekEvents.value.length,
   };
 
   try {
-    await fetch(`${API_BASE}/api/parsons/review_watch`, {
+    const resp = await fetch(`${API_BASE}/api/parsons/review_watch`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       keepalive: true,
     });
-  } catch (_) {}
+    const data = await resp.json();
+    if (data.ok && data.stats) {
+      console.log("✅ 回看記錄已保存:", data.stats);
+    }
+  } catch (e) {
+    console.warn("failed to save watch log:", e);
+  }
 }
+
 
 
 onBeforeUnmount(() => {

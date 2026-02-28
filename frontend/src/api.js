@@ -4,6 +4,7 @@ export const api = axios.create({
   baseURL: "http://127.0.0.1:5000",
   timeout: 15000
 });
+export default api;
 
 // 攔截器：只為 JSON 請求設定 Content-Type，FormData 請求則跳過
 api.interceptors.request.use(

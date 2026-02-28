@@ -11,6 +11,8 @@ from bson.errors import InvalidId
 
 from ..db import db
 
+from . import parsons_ai  # [新增] 統一管理 OpenAI 呼叫（方案1）
+
 # OpenAI SDK
 try:
     from openai import OpenAI
@@ -28,14 +30,38 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def get_project_root() -> str:
-    return os.getcwd()
+def maybe_oid(s: str) -> Optional[ObjectId]:
+    try:
+        return ObjectId(str(s))
+    except Exception:
+        return None
 
 
-def read_subtitle_text(subtitle_path: str) -> str:
-    if not subtitle_path:
+def normalize_video_id(x) -> str:
+    if x is None:
         return ""
-    full = os.path.join(get_project_root(), subtitle_path.replace("/", os.sep))
+    if isinstance(x, ObjectId):
+        return str(x)
+    return str(x).strip()
+
+
+def log_event(event: str, **kwargs):
+    try:
+        doc = {"event": event, "created_at": now_utc()}
+        doc.update(kwargs)
+        db.events.insert_one(doc)
+    except Exception:
+        pass
+
+
+def read_subtitle_text(path: str) -> str:
+    if not path:
+        return ""
+    path = path.strip()
+    full = path
+    if not os.path.isabs(path):
+        full = os.path.join(os.getcwd(), path)
+
     if not os.path.exists(full):
         return ""
     try:
@@ -78,163 +104,100 @@ def safe_json_loads(s: str) -> Optional[dict]:
         return None
 
 
-def strip_srt_noise(text: str) -> str:
-    if not text:
+# =========================
+# subtitles / parsing helpers
+# =========================
+SRT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
+
+
+def srt_time_to_seconds(t: str) -> float:
+    m = SRT_TIME_RE.search(t or "")
+    if not m:
+        return 0.0
+    hh, mm, ss, ms = m.groups()
+    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
+
+def strip_srt_noise(srt_text: str) -> str:
+    if not srt_text:
         return ""
     lines = []
-    for ln in text.splitlines():
+    for ln in srt_text.splitlines():
         t = ln.strip()
         if not t:
             continue
-        if re.fullmatch(r"\d+", t):
+        if t.isdigit():
             continue
         if "-->" in t:
             continue
-        if re.search(r"\d{2}:\d{2}:\d{2}", t):
-            continue
         lines.append(t)
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
 
 
-# =========================
-# SRT parser (for AI time axis)
-# =========================
-# [新增] 解析 SRT，保留時間戳，讓 AI 能回傳 start/end 秒數
-_SRT_TIME_RE = re.compile(
-    r"(?P<h1>\d{2}):(?P<m1>\d{2}):(?P<s1>\d{2})[,.](?P<ms1>\d{1,3})\s*-->\s*"
-    r"(?P<h2>\d{2}):(?P<m2>\d{2}):(?P<s2>\d{2})[,.](?P<ms2>\d{1,3})"
-)
-
-def _to_sec(h: str, m: str, s: str, ms: str) -> float:
-    ms_i = int(ms)
-    # ms 可能是 1~3 位
-    if len(ms) == 1:
-        ms_i *= 100
-    elif len(ms) == 2:
-        ms_i *= 10
-    return int(h) * 3600 + int(m) * 60 + int(s) + ms_i / 1000.0
-
-def parse_srt_segments(srt_text: str):
-    """回傳 [{start,end,text}]，start/end 為秒數（float）"""
+def parse_srt_segments(srt_text: str) -> list:
     if not srt_text:
         return []
+    lines = [ln.rstrip("\n") for ln in srt_text.splitlines()]
     segs = []
-    cur = None
-    buf = []
-    for raw in srt_text.splitlines():
-        line = raw.strip("\ufeff").rstrip()
-        m = _SRT_TIME_RE.search(line)
-        if m:
-            # flush previous
-            if cur and buf:
-                cur["text"] = " ".join([t.strip() for t in buf if t.strip()]).strip()
-                segs.append(cur)
-            cur = {
-                "start": _to_sec(m.group("h1"), m.group("m1"), m.group("s1"), m.group("ms1")),
-                "end": _to_sec(m.group("h2"), m.group("m2"), m.group("s2"), m.group("ms2")),
-                "text": ""
-            }
-            buf = []
-            continue
-
-        # index line
-        if re.fullmatch(r"\d+", line or ""):
-            continue
-
-        # blank line => flush
-        if not line:
-            if cur and buf:
-                cur["text"] = " ".join([t.strip() for t in buf if t.strip()]).strip()
-                segs.append(cur)
-            cur = None
-            buf = []
-            continue
-
-        if cur is not None:
-            buf.append(line)
-
-    if cur and buf:
-        cur["text"] = " ".join([t.strip() for t in buf if t.strip()]).strip()
-        segs.append(cur)
-
-    # 去掉空白 text
-    segs = [s for s in segs if (s.get("text") or "").strip()]
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.isdigit():
+            i += 1
+            if i >= len(lines):
+                break
+            time_line = lines[i].strip()
+            if "-->" not in time_line:
+                continue
+            parts = [p.strip() for p in time_line.split("-->")]
+            start = srt_time_to_seconds(parts[0])
+            end = srt_time_to_seconds(parts[1]) if len(parts) > 1 else start
+            i += 1
+            text_buf = []
+            while i < len(lines) and lines[i].strip() != "":
+                text_buf.append(lines[i].strip())
+                i += 1
+            txt = " ".join(text_buf).strip()
+            if txt:
+                segs.append({"start": start, "end": end, "text": txt})
+        i += 1
     return segs
 
-def compact_segments_for_prompt(segs, max_chars: int = 12000) -> str:
-    """把 segs 壓成帶時間戳的文字，控制長度"""
-    if not segs:
-        return ""
+
+def compact_segments_for_prompt(segs: list, max_chars: int = 12000) -> str:
     out = []
     total = 0
     for s in segs:
-        start = float(s.get("start") or 0)
-        end = float(s.get("end") or 0)
-        text = (s.get("text") or "").strip()
-        if not text:
-            continue
-        line = f"[{start:.1f}-{end:.1f}] {text}"
+        st = int(float(s.get("start", 0)))
+        ed = int(float(s.get("end", 0)))
+        txt = (s.get("text") or "").strip()
+        line = f"[{st}-{ed}] {txt}"
         if total + len(line) + 1 > max_chars:
             break
         out.append(line)
         total += len(line) + 1
     return "\n".join(out)
 
-def extract_context_around(segs, center_start: float, center_end: float, window: int = 6) -> str:
-    """取出目標片段前後 window 個字幕片段作為上下文"""
-    if not segs:
+
+def extract_context_around(segs: list, start: float, end: float, window: int = 5) -> str:
+    picked = []
+    for s in segs:
+        st = float(s.get("start", 0))
+        ed = float(s.get("end", 0))
+        if ed < start:
+            continue
+        if st > end:
+            continue
+        picked.append(s)
+    if not picked:
         return ""
-    # 找最接近的 index
-    idx = 0
-    best = 1e18
-    mid = (float(center_start) + float(center_end)) / 2.0
-    for i, s in enumerate(segs):
-        m = (float(s.get("start") or 0) + float(s.get("end") or 0)) / 2.0
-        d = abs(m - mid)
-        if d < best:
-            best = d
-            idx = i
-    a = max(0, idx - window)
-    b = min(len(segs), idx + window + 1)
-    return compact_segments_for_prompt(segs[a:b], max_chars=4000)
+    picked = picked[: max(1, window)]
+    return "\n".join([f"[{int(p.get('start', 0))}-{int(p.get('end', 0))}] {p.get('text','')}" for p in picked])
 
 
-def log_event(event_type: str, **payload):
-    try:
-        db.events.insert_one({"type": event_type, "payload": payload, "created_at": now_utc()})
-    except Exception:
-        pass
-
-
-def maybe_oid(s: str) -> Optional[ObjectId]:
-    try:
-        return ObjectId(s)
-    except Exception:
-        return None
-
-
-def normalize_video_id(v) -> str:
-    """把 video_id 無論是 ObjectId 或字串，都轉成字串回給前端"""
-    if v is None:
-        return ""
-    return str(v)
-
-
-# =========================
-# [新增] Subtitle chooser（優先使用 subtitles collection 最新校正版）
-# =========================
 def pick_latest_subtitle_path(video_doc: dict, video_id_str: str) -> str:
-    """
-    目的：避免一直讀 videos.subtitle_path 造成空字幕 -> fallback
-    策略：
-    1) 優先找 subtitles collection 裡該 video 的最新版本（version 最大，其次 created_at 最新）
-    2) 找不到才退回 videos.subtitle_path
-    """
-    # 影片 ObjectId（優先用 video_doc._id，否則用傳入字串轉 oid）
-    vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
-
-    # 先找 subtitles 最新版本
     try:
+        vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
         if vid_oid:
             sub_doc = db.subtitles.find_one(
                 {"video_id": vid_oid},
@@ -242,11 +205,7 @@ def pick_latest_subtitle_path(video_doc: dict, video_id_str: str) -> str:
             )
             if sub_doc and (sub_doc.get("path") or "").strip():
                 return (sub_doc.get("path") or "").strip()
-    except Exception:
-        pass
 
-    # 若 subtitles 的 video_id 有存成字串（保守兼容）
-    try:
         if vid_oid:
             sub_doc2 = db.subtitles.find_one(
                 {"video_id": str(vid_oid)},
@@ -257,8 +216,37 @@ def pick_latest_subtitle_path(video_doc: dict, video_id_str: str) -> str:
     except Exception:
         pass
 
-    # fallback：回到 videos.subtitle_path
     return (video_doc.get("subtitle_path", "") or "").strip()
+
+
+# =========================
+# t5doc_to_parsons_task (teacher->student normalize)
+# =========================
+def t5doc_to_parsons_task(doc: dict) -> dict:
+    solution_blocks = doc.get("solution_blocks") or []
+    distractor_blocks = doc.get("distractor_blocks") or []
+    pool = doc.get("pool") or []
+    template_slots = doc.get("template_slots") or []
+    if not pool:
+        pool = (distractor_blocks or []) + (solution_blocks or [])
+    if not template_slots:
+        template_slots = [{"label": f"第{i+1}格", "slot": str(i), "expected_id": b.get("id")} for i, b in enumerate(solution_blocks)]
+    else:
+        for i in range(min(len(template_slots), len(solution_blocks))):
+            if not template_slots[i].get("expected_id"):
+                template_slots[i]["expected_id"] = solution_blocks[i].get("id")
+
+    return {
+        "question_text": doc.get("question_text") or "",
+        "solution_blocks": solution_blocks,
+        "distractor_blocks": distractor_blocks,
+        "pool": pool,
+        "template_slots": template_slots,
+        "ai_feedback": doc.get("ai_feedback") or {},
+        "ai_segment_map": doc.get("ai_segment_map") or {},
+        "ai_slot_hints": doc.get("ai_slot_hints") or {},
+        "ai_segments_compact": doc.get("ai_segments_compact") or "",
+    }
 
 
 # =========================
@@ -289,132 +277,609 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
 # =========================
 def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title: str, level: str = "L1") -> Dict[str, Any]:
     """
-    [修改] V1.5：
-    - 仍從字幕生成 Parsons 題目
-    - 額外產出每一格建議回看時間軸（start/end 秒）與錯誤提示（slot_hint）
-    - 不改既有 student 端路由/格式：這些會存進 parsons_tasks，submit 時再回傳
+    V1.6-goClass-lite（Parsons 低 token + 閉環驗收 + 回看片段）
+    - Parsons 題（非選擇題）
+    - 低 token：AI 只生「question_text + solution_lines」，干擾題/中文語意用本地規則（0 token）
+    - goClass 風：本地驗收確保 solution_lines 可執行且符合題意（閉環），縮排錯也算錯（透過干擾題 + 本地檢查）
+    - B：額外用 AI 產出 segment_map（含 evidence）+ slot_hints（每格一句），用於錯誤回看影片片段
     """
     if not ai_enabled():
         raise RuntimeError("AI_ENABLED is false -> skip OpenAI")
-
     if not subtitle_text:
         raise RuntimeError("subtitle_text is empty")
 
-    # [新增] 解析 SRT（保留時間戳）給 AI 做時間軸對應
+    # --- subtitles ---
     segs = parse_srt_segments(subtitle_text)
-    segs_compact = compact_segments_for_prompt(segs, max_chars=12000)
-
-    # [保留] 也保留乾淨版字幕（避免純時間戳太吵）
     cleaned = strip_srt_noise(subtitle_text)
-    if not cleaned:
-        raise RuntimeError("subtitle_text is empty after cleaning")
+
+    # [新增] 低 token：字幕壓縮（只提供必要片段給 AI）
+    segs_compact = compact_segments_for_prompt(segs, max_chars=4000)
+    if not segs_compact:
+        # 仍允許無字幕，但 segment_map 會走 fallback
+        segs_compact = ""
+
+    import random, hashlib, ast, io, contextlib
 
     model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
 
-    prompt = f"""
-你是一位 Python 程式設計助教，要根據「影片字幕（含時間戳）」生成一題 Parsons 題目（程式重組），難度={level}。
-請輸出「純 JSON」（不能有多餘文字），格式如下：
+    # ===============================
+    # [新增] 0 token：用字幕關鍵字挑情境（看不出來就 seed 隨機）
+    # ===============================
+    def _kw_hit(*kws: str) -> bool:
+        t = (cleaned or "").lower()
+        return any((kw.lower() in t) for kw in kws if kw)
 
+    scenarios = [
+        {
+            "name": "avg_scores",
+            "desc": "成績平均：持續輸入成績直到輸入 -1（-1 不納入），最後輸出平均與筆數。",
+            "tests": [["10", "20", "-1"]],
+            "check": "nums>=2",  # avg + count
+            "keywords": ["平均", "成績", "分數", "mean", "average"],
+        },
+        {
+            "name": "sum_prices",
+            "desc": "購物累計：重複輸入價格直到輸入 0 結束，最後輸出總金額與筆數。",
+            "tests": [["30", "70", "0"]],
+            "check": "nums>=2",
+            "keywords": ["金額", "價格", "總和", "sum", "total"],
+        },
+        {
+            "name": "menu_loop",
+            "desc": "選單迴圈：反覆輸入 1/2/0，1=新增一筆、2=顯示筆數、0=離開，最後輸出總筆數。",
+            "tests": [["1", "1", "2", "0"]],
+            "check": "nums>=1",
+            "keywords": ["選單", "功能", "menu", "選項"],
+        },
+        {
+            "name": "validate_range",
+            "desc": "資料驗證：反覆輸入數值直到介於指定範圍內才結束，最後輸出有效數值。",
+            "tests": [["-5", "200", "18"]],
+            "check": "nums>=1",
+            "keywords": ["驗證", "範圍", "合法", "valid"],
+        },
+        {
+            "name": "sentinel_ok",
+            "desc": "資料輸入：反覆輸入文字直到輸入 'ok' 結束，最後輸出輸入筆數。",
+            "tests": [["a", "b", "ok"]],
+            "check": "nums>=1",
+            "keywords": ["直到", "結束", "停止", "ok"],
+        },
+        {
+            "name": "guess_game",
+            "desc": "猜數字：反覆輸入猜測直到猜中答案（可在程式中寫死答案），輸出猜測次數。",
+            "tests": [["3", "7"]],
+            "check": "nums>=1",
+            "keywords": ["猜", "猜數字", "guess"],
+        },
+    ]
+
+    # keyword pick
+    picked = None
+    for sc in scenarios:
+        if _kw_hit(*sc.get("keywords", [])):
+            picked = sc
+            break
+
+    if not picked:
+        seed_src = (unit or "") + "|" + (video_title or "") + "|" + ((cleaned or "")[:1500])
+        seed_int = int(hashlib.md5(seed_src.encode("utf-8")).hexdigest(), 16)
+        rnd = random.Random(seed_int ^ random.randint(0, 10**9))  # regenerate 可變化
+        picked = rnd.choice(scenarios)
+    else:
+        # 若字幕命中，仍讓 regenerate 有變化：用影片資訊做微隨機
+        seed_src = (unit or "") + "|" + (video_title or "") + "|" + picked["name"] + "|" + ((cleaned or "")[:800])
+        seed_int = int(hashlib.md5(seed_src.encode("utf-8")).hexdigest(), 16)
+        rnd = random.Random(seed_int ^ random.randint(0, 10**9))
+        # 同一情境下也可能變體（例如換 sentinel 值/輸出格式），交給 AI
+        # 這裡不更換情境，僅保留 rnd 供後續使用
+
+    scenario_desc = picked["desc"]
+    scenario_tests = picked["tests"]
+    scenario_check = picked["check"]
+
+    # ===============================
+    # [新增] 本地 0 token：安全驗收（閉環）
+    # ===============================
+    import re as _re
+
+    _cjk_re = _re.compile(r"[\u4e00-\u9fff]")
+    _python_token_re = _re.compile(r"\b(while|for|if|elif|else|break|continue|input|print|int|float|str|len|range)\b|[=:+\-*/()<>]")
+
+    def _looks_like_code(line: str) -> bool:
+        s = (line or "").rstrip("\n")
+        if not s.strip():
+            return False
+        if _cjk_re.search(s):
+            return False
+        return bool(_python_token_re.search(s))
+
+    def _compile_ok(lines: list) -> bool:
+        try:
+            compile("\n".join(lines), "<parsons_ai>", "exec")
+            return True
+        except Exception:
+            return False
+
+    def _has_loop(lines: list) -> bool:
+        joined = "\n".join(lines).lower()
+        return ("while " in joined) or ("for " in joined)
+
+    def _loop_has_body_indent(lines: list) -> bool:
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith("while ") or ln.strip().startswith("for "):
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1]
+                    if nxt.startswith("    "):  # 你要的縮排檢查
+                        return True
+        return False
+
+    def _has_print(lines: list) -> bool:
+        return "print(" in ("\n".join(lines).lower())
+
+    def _has_input(lines: list) -> bool:
+        return "input(" in ("\n".join(lines).lower())
+
+    def _has_end_control(lines: list) -> bool:
+        joined = "\n".join(lines).lower()
+        return ("break" in joined) or any(ln.strip().startswith("while ") and ("true" not in ln.lower()) for ln in lines)
+
+    # AST sandbox
+    ALLOWED_NODES = (
+        ast.Module, ast.Assign, ast.AugAssign, ast.Expr, ast.Call,
+        ast.Name, ast.Load, ast.Store, ast.Constant,
+        ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+        ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.If, ast.While, ast.For, ast.Break, ast.Continue, ast.Pass,
+        ast.List, ast.Tuple,
+    )
+    ALLOWED_FUNCS = {"input", "print", "int", "float", "str", "len", "range"}
+
+    def _ast_safe(code: str) -> bool:
+        try:
+            tree = ast.parse(code, mode="exec")
+        except Exception:
+            return False
+        for node in ast.walk(tree):
+            if not isinstance(node, ALLOWED_NODES):
+                return False
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Attribute, ast.Subscript, ast.Lambda, ast.With, ast.Try, ast.FunctionDef, ast.ClassDef)):
+                return False
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id not in ALLOWED_FUNCS:
+                        return False
+                else:
+                    return False
+        return True
+
+    def _run_with_inputs(code: str, inputs: list) -> str:
+        it = iter(inputs)
+
+        def _fake_input(prompt=""):
+            try:
+                return next(it)
+            except StopIteration:
+                return ""
+
+        out = io.StringIO()
+        safe_globals = {"__builtins__": {}}
+        safe_locals = {
+            "input": _fake_input,
+            "print": lambda *args, **kwargs: print(*args, file=out, **{k: v for k, v in kwargs.items() if k in ("sep", "end")}),
+            "int": int,
+            "float": float,
+            "str": str,
+            "len": len,
+            "range": range,
+        }
+        with contextlib.redirect_stdout(out):
+            exec(code, safe_globals, safe_locals)
+        return out.getvalue().strip()
+
+    def _output_check(check: str, out: str) -> bool:
+        if not out:
+            return False
+        nums = _re.findall(r"-?\d+\.?\d*", out)
+        if check.startswith("nums>="):
+            try:
+                need = int(check.split(">=")[1])
+            except Exception:
+                need = 1
+            return len(nums) >= need
+        return True
+
+    def _auto_grade(solution_lines: list) -> str:
+        if not _compile_ok(solution_lines):
+            return "compile failed"
+        if any(not _looks_like_code(x) for x in solution_lines):
+            return "solution_lines contains Chinese or non-code"
+        if any(_re.search(r"^\s*def\s+", x) for x in solution_lines):
+            return "contains def"
+        if any(_re.search(r"^\s*class\s+", x) for x in solution_lines):
+            return "contains class"
+        if not _has_loop(solution_lines):
+            return "missing loop"
+        if not _loop_has_body_indent(solution_lines):
+            return "loop body indentation missing"
+        if not _has_input(solution_lines):
+            return "missing input"
+        if not _has_print(solution_lines):
+            return "missing print output"
+        if not _has_end_control(solution_lines):
+            return "missing end condition/break"
+
+        code = "\n".join(solution_lines)
+        if not _ast_safe(code):
+            return "AST rejected"
+
+        # [新增] 低 token：只跑 1 組測資
+        test_inputs = (scenario_tests[:1] or [[]])
+        for inputs in test_inputs:
+            try:
+                out = _run_with_inputs(code, inputs)
+            except Exception as e:
+                return f"exec failed: {e}"
+            if not _output_check(scenario_check, out):
+                return "output check failed"
+        return ""
+
+    # ===============================
+    # [新增] AI 生成（最小輸出）+ 失敗只修一次（省 token）
+    # ===============================
+    system_msg = "你是Python程式設計助教。請嚴格只輸出『合法 JSON』，不要輸出 Markdown 或多餘文字。"
+
+    banned_patterns = """
+請避免以下過度常見模板與禁止項：
+- 直到輸入 'ok' 為止（除非情境就是 ok sentinel）
+- def / class
+- 中文註解或中文程式碼
+"""
+
+    base_prompt = f"""
+你要產生一題 Parsons 程式重組題（不是選擇題）。
+題型固定：迴圈（while 或 for），不得使用 def/class。
+
+【情境】
+{scenario_desc}
+
+【硬性規則（必須遵守）】
+- 只輸出合法 JSON（不要 Markdown、不要多餘文字）
+- 只輸出以下欄位：question_text、solution_lines
+- question_text：繁體中文，描述要做什麼（不要直接透露程式碼）
+- solution_lines：英文 Python code 4~10 行，且必須包含：
+  1) 迴圈
+  2) 迴圈內至少一行縮排（4 spaces）
+  3) 結束條件（可用 break）
+  4) 最後要輸出結果（print）
+- solution_lines 禁止中文與註解
+{banned_patterns}
+
+輸出 JSON 格式：
 {{
   "question_text": "題目敘述（繁中）",
-  "solution_lines": ["正確程式第1行", "第2行", "...（3~7行）"],
-  "distractor_lines": ["干擾行1", "干擾行2", "...（2~4行）"],
-  "template_slot_labels": ["第1格的中文提示", "第2格的中文提示", "...（對應 solution_lines 行數）"],
+  "solution_lines": ["python code line 1", "..."]
+}}
 
+字幕（含時間戳）（格式：[start-end] text）：
+{segs_compact}
+""".strip()
+
+    MAX_RETRY = 2
+    data = None
+    last_error = ""
+    last_candidate = None
+
+    for attempt in range(MAX_RETRY):
+        if attempt == 0:
+            user_msg = base_prompt
+        else:
+            prev = last_candidate or {}
+            prev_q = (prev.get("question_text") or "").strip()
+            prev_sol = prev.get("solution_lines") or []
+            user_msg = f"""
+你上一版未通過自動驗收：{last_error}
+
+【只修正 solution_lines】（保持同一情境方向）
+- 修正縮排/缺少結束條件/缺少輸出/缺少更新等問題
+- 仍需 while/for、仍需迴圈內縮排、仍需 print、仍需可執行
+- solution_lines 禁止中文與註解
+- 不得 def/class
+- 只輸出合法 JSON（欄位仍是 question_text + solution_lines）
+
+上一版 question_text（參考）：{prev_q}
+上一版 solution_lines：{prev_sol}
+""".strip()
+
+        text = (parsons_ai.call_openai_output_text(system=system_msg, user=user_msg, model=model, max_output_tokens=900) or "").strip()
+        cand = safe_json_loads(text)
+        if not cand:
+            last_error = "non-JSON"
+            last_candidate = None
+            continue
+
+        q = (cand.get("question_text") or "").strip()
+        sol = cand.get("solution_lines") or []
+        last_candidate = cand
+
+        if not q:
+            last_error = "missing question_text"
+            continue
+        if not isinstance(sol, list) or len(sol) < 4 or len(sol) > 10:
+            last_error = "solution_lines length not 4~10"
+            continue
+
+        sol = [str(x) for x in sol]
+        cand["solution_lines"] = sol
+
+        grade_err = _auto_grade(sol)
+        if grade_err:
+            last_error = grade_err
+            continue
+
+        data = cand
+        break
+
+    if not data:
+        raise RuntimeError(f"AI generation failed: {last_error}")
+
+    question_text = (data.get("question_text") or "").strip()
+    solution_lines = data["solution_lines"]
+
+    # ===============================
+    # [新增] B：segment_map + slot_hints（含 evidence）— 低 token 對齊任務
+    # ===============================
+    seg_map = {}
+    slot_hints = {}
+
+    if ai_enabled() and segs_compact:
+        try:
+            align_system = (
+                "你是Python教學助教。你要把『每一行程式（slot）』對齊到字幕時間戳。\n"
+                "請嚴格只輸出合法 JSON，不要輸出 Markdown 或多餘文字。\n"
+                "必須包含：segment_map、slot_hints。\n"
+                "segment_map 每格都要有，並含 evidence（引用字幕關鍵句，可短）。"
+            )
+            align_user = f"""
+請根據題目與字幕，為每一格（slot_index）提供最相關的回看片段時間（start/end，秒），並給一句短提示（hint）。
+
+輸出 JSON 格式：
+{{
   "segment_map": [
-    {{"slot_index": 0, "start": 12.3, "end": 24.8, "evidence": "字幕關鍵句（繁中，可簡短）"}},
-    {{"slot_index": 1, "start": 25.0, "end": 38.6, "evidence": "..."}}
+    {{"slot_index": 0, "start": 12.3, "end": 24.8, "evidence": "字幕關鍵句（繁中，可短）"}},
+    ...
   ],
-
   "slot_hints": [
-    {{"slot_index": 0, "hint": "如果第1格錯，應該提醒學生什麼（繁中，1~2句）"}},
-    {{"slot_index": 1, "hint": "..." }}
-  ],
-
-  "ai_feedback": {{
-    "general": "整體回饋（繁中，1~2句）",
-    "common_mistakes": ["常見錯誤1", "常見錯誤2"],
-    "hints": ["提示1", "提示2"]
-  }}
+    {{"slot_index": 0, "hint": "如果第1格錯，提醒學生什麼（繁中，1句）"}},
+    ...
+  ]
 }}
 
 限制：
-- solution_lines 必須是可執行且一致的 Python 程式片段
-- distractor_lines 要像學生常犯錯
-- template_slot_labels 要對應每一行的語意
-- segment_map 的 start/end 必須來自字幕時間戳的合理區間（秒數），每格都要給
-- slot_hints 每格都要給（用來 submit 時回饋）
-- 全部用繁體中文
-- 不要輸出 Markdown，只要 JSON
+- slot_index 必須從 0 開始，數量要等於 solution_lines 行數
+- start/end 必須是字幕時間戳合理區間（秒數）
+- evidence 必須是字幕中的關鍵句（可短，不要超過 15 字）
+- hint 每格 1 句，繁體中文，不要直接給出程式碼或變數名
 
-影片資訊：
-- unit: {unit}
-- title: {video_title}
+題目：{question_text}
+solution_lines：{solution_lines}
 
-字幕（含時間戳）如下（格式：[start-end] text）：
+字幕（含時間戳）（格式：[start-end] text）：
 {segs_compact}
-
-（若需要純字幕參考）：
-{cleaned[:4000]}
 """.strip()
 
-    client = get_openai_client()
-    resp = client.responses.create(model=model, input=prompt)
+            align = parsons_ai.call_openai_json(
+                system=align_system,
+                user=align_user,
+                model=model,
+                temperature=0.2,
+                max_output_tokens=900,
+            ) or {}
 
-    text = (resp.output_text or "").strip()
-    data = safe_json_loads(text)
-    if not data:
-        raise RuntimeError("OpenAI 回傳不是合法 JSON")
+            seg_map_in = align.get("segment_map") or []
+            hint_in = align.get("slot_hints") or []
 
-    question_text = (data.get("question_text") or "").strip()
-    solution_lines = data.get("solution_lines") or []
-    distractor_lines = data.get("distractor_lines") or []
-    labels = data.get("template_slot_labels") or []
-    ai_fb = data.get("ai_feedback") or {}
+            for it in seg_map_in:
+                try:
+                    si = int(it.get("slot_index"))
+                    s = float(it.get("start"))
+                    e = float(it.get("end"))
+                    if si < 0 or si >= len(solution_lines) or e <= s:
+                        continue
+                    seg_map[str(si)] = {
+                        "start": s,
+                        "end": e,
+                        "evidence": (it.get("evidence") or "").strip(),
+                    }
+                except Exception:
+                    continue
 
-    if not question_text or not solution_lines:
-        raise RuntimeError("OpenAI JSON 缺少 question_text 或 solution_lines")
+            for it in hint_in:
+                try:
+                    si = int(it.get("slot_index"))
+                    if si < 0 or si >= len(solution_lines):
+                        continue
+                    slot_hints[str(si)] = (it.get("hint") or "").strip()
+                except Exception:
+                    continue
+        except Exception:
+            seg_map = {}
+            slot_hints = {}
+
+    # [新增] 若 AI 對齊失敗：用字幕片段平均分配 fallback（0 token）
+    if not seg_map:
+        if segs:
+            n = len(solution_lines)
+            picked_segs = segs[: max(n, 1)]
+            for i in range(n):
+                s = picked_segs[min(i, len(picked_segs)-1)]
+                seg_map[str(i)] = {
+                    "start": float(s.get("start", 0.0)),
+                    "end": float(s.get("end", float(s.get("start", 0.0)) + 5.0)),
+                    "evidence": (s.get("text", "") or "").strip()[:15],
+                }
+        else:
+            for i in range(len(solution_lines)):
+                seg_map[str(i)] = {"start": 0.0, "end": 5.0, "evidence": ""}
+
+    if not slot_hints:
+        for i in range(len(solution_lines)):
+            slot_hints[str(i)] = "請確認此步驟是否在正確的流程位置與縮排層級。"
+
+    # ===============================
+    # [新增] 干擾題 mutation（0 token，含縮排錯）
+    # ===============================
+    def _normalize_line(s: str) -> str:
+        return _re.sub(r"\s+", "", (s or "").strip()).lower()
+
+    def _tokenize(s: str):
+        return _re.findall(r"[A-Za-z_]+|\d+|==|!=|<=|>=|\+=|-=|\*=|/=|[=:+\-*/()<>]", (s or ""))
+
+    def _diff_score(a: str, b: str) -> int:
+        sa, sb = set(_tokenize(a)), set(_tokenize(b))
+        return len(sa.symmetric_difference(sb))
+
+    def _mutate_line(line: str) -> list:
+        variants = []
+        s = line
+        if "+=" in s:
+            variants.append(s.replace("+=", "="))
+        if "==" in s:
+            variants.append(s.replace("==", "!="))
+        if "!=" in s:
+            variants.append(s.replace("!=", "=="))
+        if "<=" in s:
+            variants.append(s.replace("<=", ">="))
+        if ">=" in s:
+            variants.append(s.replace(">=", "<="))
+        if s.strip() == "break":
+            variants.append("continue")
+        if "int(input(" in s:
+            variants.append(s.replace("int(input(", "input("))
+        if "float(input(" in s:
+            variants.append(s.replace("float(input(", "input("))
+        if _re.search(r"\bcount\s*\+=\s*1\b", s):
+            variants.append(_re.sub(r"\bcount\s*\+=\s*1\b", "count += 0", s))
+        return variants
+
+    def _make_indent_wrong(line: str) -> str:
+        if line.startswith("    "):
+            return line[4:]
+        return "    " + line
+
+    def _distractor_semantic_zh(line: str) -> str:
+        s = (line or "").strip().lower()
+        if not (line or "").startswith("    ") and ("+=" in s or "=" in s):
+            return "此行可能不在正確縮排層級，導致流程不符合預期"
+        if "==" in s or "!=" in s or "<" in s or ">" in s:
+            return "條件判斷可能寫反，導致提早結束或無法結束"
+        if "break" in s or "continue" in s:
+            return "迴圈控制語句可能使用不當，造成流程錯誤"
+        if "+=" in s or "=" in s:
+            return "統計更新方式可能錯誤，導致結果不正確"
+        if "input" in s:
+            return "資料處理方式可能不一致，導致判斷或計算出錯"
+        return "此行邏輯可能與題目需求不一致"
+
+    distractor_lines = []
+    sol_norm = {_normalize_line(x) for x in solution_lines}
+
+    candidates = []
+    for ln in solution_lines:
+        for v in _mutate_line(ln):
+            if v and _looks_like_code(v):
+                candidates.append(v)
+
+    # 強制加入至少一個縮排錯版本
+    indented = [x for x in solution_lines if x.startswith("    ")]
+    if indented:
+        candidates.append(_make_indent_wrong(indented[0]))
+    else:
+        candidates.append(_make_indent_wrong(solution_lines[-1]))
+
+    uniq = []
+    seen = set()
+    for c in candidates:
+        cn = _normalize_line(c)
+        if cn in sol_norm:
+            continue
+        if cn in seen:
+            continue
+        seen.add(cn)
+        uniq.append(c)
+
+    def _best_diff_to_solution(c: str) -> int:
+        return min((_diff_score(c, s) for s in solution_lines), default=0)
+
+    uniq.sort(key=_best_diff_to_solution, reverse=True)
+    for c in uniq:
+        if len(distractor_lines) >= 3:
+            break
+        distractor_lines.append(c)
+
+    if len(distractor_lines) < 2:
+        fallback = ["count = 1", "total = score", "if score != -1: break", "continue"]
+        for f in fallback:
+            fn = _normalize_line(f)
+            if fn in sol_norm or fn in {_normalize_line(x) for x in distractor_lines}:
+                continue
+            distractor_lines.append(f)
+            if len(distractor_lines) >= 3:
+                break
+
+    # ===============================
+    # [新增] 中文語意 template_slots（0 token，不洩漏答案/不出現 input）
+    # ===============================
+    def _label_for_solution_line(line: str) -> str:
+        raw = (line or "").strip()
+        low = raw.lower()
+        if _re.search(r"=\s*0\b", low):
+            return "設定統計所需的起始狀態"
+        if raw.endswith(":") and (low.startswith("while ") or low.startswith("for ")):
+            return "建立重複處理的流程架構"
+        if "input" in low:
+            return "取得新資料並準備後續處理"
+        if low.startswith("if ") and "break" in low:
+            return "判斷是否達到結束條件並結束流程"
+        if low.startswith("if "):
+            return "根據條件決定下一步處理"
+        if "+=" in low:
+            return "更新統計或累積的結果"
+        if "print" in low:
+            return "輸出整理後的結果"
+        if "=" in low:
+            return "更新流程中需要記錄的狀態"
+        if low.strip() == "break":
+            return "在適當時機結束重複流程"
+        return "完成此步驟所需的處理"
+
+    labels = [_label_for_solution_line(x) for x in solution_lines]
+    template_slots = [{"label": labels[i], "slot": str(i)} for i in range(len(solution_lines))]
 
     solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core"} for i, line in enumerate(solution_lines)]
     distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
+
+    for i in range(len(distractor_blocks)):
+        try:
+            distractor_blocks[i]["semantic_zh"] = _distractor_semantic_zh(distractor_blocks[i]["text"])
+        except Exception:
+            pass
+
     pool = distractor_blocks + solution_blocks
 
-    if not labels or len(labels) != len(solution_lines):
-        labels = [f"請放入正確的第{i+1}行" for i in range(len(solution_lines))]
-
-    template_slots = [{"label": labels[i], "slot": str(i)} for i in range(len(solution_lines))]
-
-    # [新增] V1.5：segment_map 與 slot_hints（以 slot index 對齊）
-    seg_map_in = data.get("segment_map") or []
-    hint_in = data.get("slot_hints") or []
-
-    seg_map = {}
-    for it in seg_map_in:
-        try:
-            si = int(it.get("slot_index"))
-            s = float(it.get("start"))
-            e = float(it.get("end"))
-            if si < 0 or si >= len(solution_lines):
-                continue
-            if e <= s:
-                continue
-            seg_map[str(si)] = {
-                "start": s,
-                "end": e,
-                "evidence": (it.get("evidence") or "").strip(),
-            }
-        except Exception:
-            continue
-
-    slot_hints = {}
-    for it in hint_in:
-        try:
-            si = int(it.get("slot_index"))
-            if si < 0 or si >= len(solution_lines):
-                continue
-            slot_hints[str(si)] = (it.get("hint") or "").strip()
-        except Exception:
-            continue
+    ai_feedback = {
+        "general": "請注意結束條件、統計更新與縮排層級是否正確。",
+        "common_mistakes": [
+            "結束條件寫反導致無法停止或提早停止",
+            "忘記更新統計值（總和/次數）",
+            "縮排錯誤導致程式流程不在迴圈內",
+        ],
+        "hints": [
+            "確認結束條件是在迴圈內判斷",
+            "確認統計更新行也在迴圈內",
+            "最後要輸出題目要求的結果",
+        ],
+    }
 
     return {
         "question_text": question_text,
@@ -422,17 +887,11 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         "distractor_blocks": distractor_blocks,
         "pool": pool,
         "template_slots": template_slots,
-        "ai_feedback": {
-            "general": (ai_fb.get("general") or "").strip(),
-            "common_mistakes": ai_fb.get("common_mistakes") or [],
-            "hints": ai_fb.get("hints") or [],
-        },
-        # [新增] V1.5
+        "ai_feedback": ai_feedback,
         "ai_segment_map": seg_map,
         "ai_slot_hints": slot_hints,
         "ai_segments_compact": segs_compact,
     }
-
 
 
 # =========================
@@ -442,19 +901,16 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
     unit = video_doc.get("unit", "") or ""
     video_title = video_doc.get("title", "") or ""
 
-    # [修改] V1.5：生成題目時，優先用 subtitles collection 最新校正版字幕
-    subtitle_path = pick_latest_subtitle_path(video_doc, video_id_str)  # [新增]
+    subtitle_path = pick_latest_subtitle_path(video_doc, video_id_str)
     sub_text = read_subtitle_text(subtitle_path)
 
     gen_source = None
     gen_error = None
     env = env_snapshot()
 
-    # [修改] V1.5：同時兼容 video_id 存字串 / ObjectId
     vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
     video_id_match = {"$or": [{"video_id": video_id_str}] + ([{"video_id": vid_oid}] if vid_oid else [])}
 
-    # 只取消同 video+level 的 active（避免不同 level 互相覆蓋）
     db.parsons_tasks.update_many({**video_id_match, "level": level, "active": True}, {"$set": {"active": False}})
 
     try:
@@ -467,11 +923,8 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         gen_source = "fallback"
         gen_error = str(e)
 
-    # ✅ 新產生的題目預設是 draft（學生端看不到）
     doc = {
-        # [修改] V1.5：video_id 優先用 ObjectId（老師端好查），但學生端 get_task 已兼容字串/oid
         "video_id": vid_oid if vid_oid else video_id_str,
-        # [新增] 保留原始字串，讓 debug / 追查更穩（不改既有 schema，只新增欄位）
         "video_id_str": video_id_str,
 
         "unit": unit,
@@ -489,7 +942,6 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         "template_slots": ai.get("template_slots", []),
         "ai_feedback": ai.get("ai_feedback", {}),
 
-        # [新增] V1.5：AI 時間軸與每格提示（不改學生端路由/格式，只存 DB，submit 再回傳）
         "ai_generated": True if gen_source == "openai" else False,
         "ai_segment_map": ai.get("ai_segment_map", {}) or {},
         "ai_slot_hints": ai.get("ai_slot_hints", {}) or {},
@@ -521,217 +973,51 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
 
 
 # =========================
-# t5doc_to_parsons_task（你已有，保留原本版本即可）
-# =========================
-def t5doc_to_parsons_task(doc: dict) -> dict:
-    q = doc.get("question") or {}
-    question_text = doc.get("question_text") or q.get("prompt") or ""
-
-    sol = doc.get("solution_blocks") or []
-    dis = doc.get("distractor_blocks") or []
-    dis = [b for b in dis if b.get("enabled", True) is True]
-
-    pool = []
-    for b in sol:
-        pool.append({
-            "id": str(b.get("id")),
-            "text": b.get("text", ""),
-            "meaning_zh": b.get("semantic_zh") or b.get("meaning_zh") or "",
-            "type": "solution"
-        })
-    for b in dis:
-        pool.append({
-            "id": str(b.get("id")),
-            "text": b.get("text", ""),
-            "meaning_zh": b.get("semantic_zh") or b.get("meaning_zh") or "",
-            "type": "distractor"
-        })
-
-    order = doc.get("solution_order") or []
-    if not order:
-        order = [b.get("id") for b in sol if b.get("id")]
-
-    # [新增] 優先沿用 DB 裡已存在的 template_slots[].label（AI 先生成＋老師審核後存進去的固定中文題詞）
-    # - 你的學生端左側提示會用 slot.label 顯示（你要求：一進來就看得到中文提示）
-    # - 若 DB 沒有 label，才退回顯示「第 N 格」
-    label_by_slot = {}
-    try:
-        for s in (doc.get("template_slots") or []):
-            sk = s.get("slot")
-            if sk is None:
-                continue
-            lab = (s.get("label") or "").strip()
-            if lab:
-                label_by_slot[str(sk)] = lab
-    except Exception:
-        label_by_slot = {}
-
-    # [修正] template_slots 的 label：以 label_by_slot 為主，避免被覆蓋成「第 N 格」
-    template_slots = []
-    for i, bid in enumerate(order):
-        template_slots.append({
-            "slot": str(i),
-            "expected_id": str(bid),
-            "label": label_by_slot.get(str(i)) or f"第 {i+1} 格"
-        })
-
-    return {"question_text": question_text, "pool": pool, "template_slots": template_slots}
-
-# =========================
-# (A) GET /task  (學生端只抓 published)
-# ==========================
-# =========================
-# (A) GET /task 取得學生端要做的題目（只取已發布 enabled=True 的最新一筆）
+# (A) GET /task  取得學生端題目（只取 enabled=True 最新）
 # =========================
 @parsons_bp.get("/task")
 def get_task():
-    video_id = (request.args.get("video_id") or "").strip()
-    level = (request.args.get("level") or "L2").strip()
+    video_id = request.args.get("video_id", "").strip()
+    level = request.args.get("level", "L2").strip()
 
     if not video_id:
         return jsonify({"ok": False, "message": "missing video_id"}), 400
 
-    # 兼容 video_id 可能是 ObjectId 或字串存法
     try:
-        vid = ObjectId(video_id)
-        video_q = {"$or": [{"video_id": vid}, {"video_id": str(vid)}]}
+        vid_oid = ObjectId(video_id)
     except Exception:
-        # 若傳入不是 ObjectId，就直接當字串比對
-        video_q = {"video_id": video_id}
+        vid_oid = None
 
-    # ✅ 只取已發布（enabled=True）的最新一筆
-    q = {
-        **video_q,
-        "level": level,
-        "enabled": True,
-    }
+    q = {"level": level, "enabled": True}
+    if vid_oid:
+        q["video_id"] = {"$in": [video_id, vid_oid]}
+    else:
+        q["video_id"] = video_id
 
     task = db.parsons_tasks.find_one(q, sort=[("created_at", -1)])
     if not task:
-        # 沒有已發布題目：維持你原本「尚未發布」的行為（不要噴錯）
-        return jsonify({
-            "ok": True,
-            "noTask": True,
-            "message": "此影片尚未發布題目",
-        })
+        return jsonify({"ok": True, "noTask": True, "message": "此影片尚未發布題目"})
 
-    # 兼容多種欄位命名（你 teacher_t5.py 也是這樣兼容）
-    # - prompt 可能在 question.prompt 或 t.prompt
-    question_obj = task.get("question", {}) or {}
-    prompt = question_obj.get("prompt") or task.get("prompt") or task.get("question_text") or ""
+    parsed = t5doc_to_parsons_task(task)
 
-    solution_blocks = task.get("solution_blocks", []) or task.get("blocks", []) or []
-    distractor_blocks = task.get("distractor_blocks", []) or task.get("distractors", []) or []
-    solution_order = task.get("solution_order", []) or task.get("solution_ids", []) or []
-
-    # ✅ 重要：把 semantic_zh 原樣回傳（學生端就能顯示中文語意）
-    # 同時提供舊欄位 question_text，避免你 parsons.vue 舊版用這個欄位
     return jsonify({
         "ok": True,
         "noTask": False,
-
         "task_id": str(task.get("_id")),
-        "video_id": str(task.get("video_id")) if task.get("video_id") else None,
-        "level": task.get("level", level),
-
-        # 新舊相容
-        "question_text": prompt,
-        "question": {"prompt": prompt},
-
-        "solution_blocks": solution_blocks,
-        "distractor_blocks": distractor_blocks,
-        "solution_order": solution_order,
-
-        # 方便前端一次拿全部 blocks
-        "blocks": (solution_blocks or []) + (distractor_blocks or []),
-
-        "segment_label": task.get("segment_label", "—"),
-        "subtitle_version": task.get("subtitle_version", None),
-        "version": task.get("version", "v1"),
+        "video_id": normalize_video_id(task.get("video_id")),
+        "level": task.get("level"),
+        "question_text": parsed.get("question_text", ""),
+        "pool": parsed.get("pool", []),
+        "template_slots": parsed.get("template_slots", []),
+        "solution_blocks": parsed.get("solution_blocks", []),
+        "distractor_blocks": parsed.get("distractor_blocks", []),
+        "ai_feedback": parsed.get("ai_feedback", {}),
+        "version": task.get("version", "v1.AI"),
     })
 
 
-
-def t5doc_to_parsons_task(doc: dict) -> dict:
-    q = doc.get("question") or {}
-    question_text = doc.get("question_text") or q.get("prompt") or ""
-
-    sol = doc.get("solution_blocks") or []
-    dis = doc.get("distractor_blocks") or []
-    dis = [b for b in dis if b.get("enabled", True) is True]
-
-    pool = []
-    for b in sol:
-        pool.append({
-            "id": str(b.get("id")),
-            "text": b.get("text", ""),
-            "meaning_zh": b.get("semantic_zh") or b.get("meaning_zh") or "",
-            "type": "solution"
-        })
-    for b in dis:
-        pool.append({
-            "id": str(b.get("id")),
-            "text": b.get("text", ""),
-            "meaning_zh": b.get("semantic_zh") or b.get("meaning_zh") or "",
-            "type": "distractor"
-        })
-
-    order = doc.get("solution_order") or []
-    if not order:
-        order = [b.get("id") for b in sol if b.get("id")]
-
-    # [新增] 讓學生端一進來就看到固定中文提示：
-    # 你的 DB 中文提示詞目前放在 solution_blocks[].semantic_zh（不是 template_slots[].label）
-    semantic_by_id = {}
-    for b in sol:
-        bid = b.get("id")
-        if not bid:
-            continue
-        zh = (b.get("semantic_zh") or b.get("meaning_zh") or "")
-        if isinstance(zh, str):
-            zh = zh.strip()
-        semantic_by_id[str(bid)] = zh or ""
-
-    # [新增] 若未來 DB 有存 template_slots[].label，也優先沿用（更保守）
-    label_by_slot = {}
-    label_by_expected = {}
-    try:
-        for s in (doc.get("template_slots") or []):
-            sk = s.get("slot")
-            eid = s.get("expected_id")
-            lab = (s.get("label") or "")
-            lab = lab.strip() if isinstance(lab, str) else ""
-            if sk is not None and lab:
-                label_by_slot[str(sk)] = lab
-            if eid is not None and lab:
-                label_by_expected[str(eid)] = lab
-    except Exception:
-        label_by_slot = {}
-        label_by_expected = {}
-
-    template_slots = []
-    for i, bid in enumerate(order):
-        bid_str = str(bid)
-        template_slots.append({
-            "slot": str(i),
-            "expected_id": bid_str,
-            # [修改] label 優先順序：
-            # 1) DB 既存 label（slot / expected_id）
-            # 2) solution_blocks.semantic_zh
-            # 3) fallback「第 N 格」
-            "label": (
-                label_by_slot.get(str(i))
-                or label_by_expected.get(bid_str)
-                or semantic_by_id.get(bid_str)
-                or f"第 {i+1} 格"
-            )
-        })
-
-    return {"question_text": question_text, "pool": pool, "template_slots": template_slots}
-
 # =========================
-# ✅ 發布 API（後端保留給你測試/備用）
-#    重要修正：發布時「同影片同 level」只保留一筆 published，避免學生拿到舊題
+# (A) POST /publish  老師端：發布題目（同影片同 level 只允許一題 enabled）
 # =========================
 @parsons_bp.post("/publish")
 def publish_task():
@@ -753,12 +1039,10 @@ def publish_task():
     task_video_id = task.get("video_id")
     task_level = task.get("level")
 
-    # ✅ 先把同影片同 level 的其他題目全部取消發布
     db.parsons_tasks.update_many(
         {"video_id": task_video_id, "level": task_level, "_id": {"$ne": oid}},
         {"$set": {"enabled": False, "review_status": "draft"}}
     )
-    # 如果別的資料是 ObjectId 存 video_id，也一併處理（更穩）
     if isinstance(task_video_id, str):
         v_oid = maybe_oid(task_video_id)
         if v_oid:
@@ -794,7 +1078,6 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
     end = None
     subtitle_context = ""
 
-    # 1) 優先用 DB 已存的 segment/hint
     seg_map = (task.get("ai_segment_map") or {}) if isinstance(task.get("ai_segment_map"), dict) else {}
     slot_hints = (task.get("ai_slot_hints") or {}) if isinstance(task.get("ai_slot_hints"), dict) else {}
 
@@ -810,7 +1093,6 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
 
     hint = (slot_hints.get(str(slot_key)) or "").strip()
 
-    # 2) 嘗試補上下文（可用於 debug / data.ai_hint）
     try:
         sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
         if sub_path:
@@ -819,16 +1101,13 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
             if start is not None and end is not None:
                 subtitle_context = extract_context_around(segs, start, end, window=5)
             else:
-                # 沒有 start/end 時，先給前面一點內容
                 subtitle_context = compact_segments_for_prompt(segs[:18], max_chars=3000)
     except Exception:
         subtitle_context = ""
 
-    # 3) 若缺少 hint 或缺少 start/end 且 AI 可用：即時推估並回寫
     if ai_enabled() and (not hint or start is None or end is None):
         try:
             model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
-            # 優先用生成時存的 compact（更快）
             segs_compact = (task.get("ai_segments_compact") or "").strip()
             if not segs_compact:
                 sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
@@ -858,9 +1137,8 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
 {segs_compact}
 """.strip()
 
-            client = get_openai_client()
-            resp = client.responses.create(model=model, input=prompt)
-            data = safe_json_loads((resp.output_text or "").strip()) or {}
+            # [新增] OpenAI 呼叫改由 parsons_ai 統一管理（不改既有 prompt/解析）
+            data = parsons_ai.call_openai_json(model=model, prompt=prompt) or {}
 
             ai_hint = (data.get("hint") or "").strip()
             ai_s = data.get("start", None)
@@ -874,7 +1152,6 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
             if ai_start is not None and ai_end is not None and ai_end > ai_start:
                 start, end = ai_start, ai_end
 
-            # 回寫到 task（不改 schema）
             try:
                 update = {}
                 if hint:
@@ -890,7 +1167,6 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
             except Exception:
                 pass
 
-            # 補上下文
             try:
                 sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
                 if sub_path:
@@ -902,7 +1178,6 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
                 pass
 
         except Exception:
-            # AI 即時推估失敗：留空，走外層 fallback
             pass
 
     return hint, start, end, subtitle_context
@@ -937,6 +1212,132 @@ def submit_answer():
         solution_blocks = task.get("solution_blocks", []) or []
         solution_ids = [b.get("id") for b in solution_blocks if b.get("type") in ("core", "solution", None)]
         solution_ids = [sid for sid in solution_ids if sid]
+
+    # [新增] V1.3：Submit 端 fallback 解析 SRT（把 [行-行] 轉成秒數）
+    def _parse_srt_time_to_seconds(t: str) -> float:
+        # 格式：HH:MM:SS,mmm
+        try:
+            t = (t or "").strip()
+            hh, mm, rest = t.split(":")
+            ss, ms = rest.split(",")
+            return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+        except Exception:
+            return 0.0
+
+    def _read_srt_segments(abs_or_rel_path: str):
+        """
+        回傳 list[dict]: [{start:float, end:float, text:str}, ...]
+        若讀不到就回 []
+        """
+        try:
+            import os
+            import re
+
+            p = (abs_or_rel_path or "").strip()
+            if not p:
+                return []
+
+            # 允許 DB 存 uploads/... 的相對路徑
+            if not os.path.isabs(p):
+                # 專案根目錄下的 uploads
+                # 你原本 DB 例子：uploads/subtitles/xxx.srt
+                root = os.getcwd()
+                p = os.path.join(root, p)
+
+            if not os.path.exists(p):
+                return []
+
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+
+            # 以空行分段
+            blocks = re.split(r"\n\s*\n", raw.strip(), flags=re.M)
+            out = []
+            for b in blocks:
+                lines = [x.strip("\ufeff").strip() for x in b.splitlines() if x.strip()]
+                if len(lines) < 2:
+                    continue
+                # lines[0] 可能是序號
+                time_line = lines[1] if "-->" in lines[1] else (lines[0] if "-->" in lines[0] else "")
+                if "-->" not in time_line:
+                    continue
+                a, b2 = [x.strip() for x in time_line.split("-->")[:2]]
+                start = _parse_srt_time_to_seconds(a)
+                end = _parse_srt_time_to_seconds(b2)
+                text = "\n".join(lines[2:]) if "-->" in lines[1] else "\n".join(lines[1:])
+                out.append({"start": float(start), "end": float(end), "text": text})
+            return out
+        except Exception:
+            return []
+
+    def _pick_segment_from_compact(compact_text: str, slot_idx: int):
+        """
+        compact 格式像：
+        [0-5] ...
+        [5-11] ...
+        回傳 (line_start:int, line_end:int) 或 (None,None)
+        """
+        try:
+            import re
+            pairs = re.findall(r"\[(\d+)\s*-\s*(\d+)\]", compact_text or "")
+            if not pairs:
+                return (None, None)
+            # 簡單穩定策略：用 slot_idx 映射到第 k 段
+            k = slot_idx if slot_idx is not None else 0
+            if k < 0:
+                k = 0
+            if k >= len(pairs):
+                k = len(pairs) - 1
+            a, b = pairs[k]
+            return (int(a), int(b))
+        except Exception:
+            return (None, None)
+
+    def _fallback_segment_from_task(task_doc, slot_idx: int):
+        """
+        依 task 裡的 ai_segment_map / ai_segments_compact + subtitle_path 推算秒數
+        回傳 (t_start, t_end, subtitle_context)
+        """
+        try:
+            # ① 優先用 ai_segment_map（A 電腦通常有）
+            seg_map = task_doc.get("ai_segment_map") or {}
+            key1 = str(slot_idx) if slot_idx is not None else "0"
+            key2 = f"第{(slot_idx + 1)}格" if slot_idx is not None else "第1格"
+
+            seg = None
+            if key1 in seg_map:
+                seg = seg_map.get(key1)
+            elif key2 in seg_map:
+                seg = seg_map.get(key2)
+
+            if isinstance(seg, dict):
+                ts = seg.get("start")
+                te = seg.get("end")
+                if ts is not None and te is not None and float(te) > float(ts):
+                    ctx = seg.get("evidence") or ""
+                    return (float(ts), float(te), ctx)
+
+            # ② 沒有 map，就用 compact + subtitle_path 做推算（B 電腦常見）
+            compact = task_doc.get("ai_segments_compact") or ""
+            subtitle_path = (((task_doc.get("prompt_source") or {}).get("subtitle_path")) or "").strip()
+            if compact and subtitle_path:
+                line_a, line_b = _pick_segment_from_compact(compact, slot_idx or 0)
+                if line_a is not None and line_b is not None and line_b > line_a:
+                    segs = _read_srt_segments(subtitle_path)
+                    if segs:
+                        a = max(0, min(line_a, len(segs) - 1))
+                        b = max(0, min(line_b - 1, len(segs) - 1))
+                        ts = float(segs[a]["start"])
+                        te = float(segs[b]["end"])
+                        # context：取範圍內前幾句
+                        ctx_lines = [segs[i]["text"] for i in range(a, min(b + 1, a + 6))]
+                        ctx = "\n".join([x for x in ctx_lines if x]).strip()
+                        if te > ts:
+                            return (ts, te, ctx)
+
+            return (None, None, "")
+        except Exception:
+            return (None, None, "")
 
     # [新增] V1.4：用「template_slots 的順序」做一格一格比對，避免 idx 錯位（第3格變第4格）
     parsed = t5doc_to_parsons_task(task)
@@ -1039,6 +1440,16 @@ def submit_answer():
             level=(level or task.get("level") or "L1"),
             slot_label=(slot_label or f"第{(wrong_index + 1)}格" if wrong_index is not None else "第1格"),
         )
+        print("DEBUG_SEGMENT:", t_start, t_end)
+
+        # [新增] V1.3：若 AI 沒回出有效秒數，嘗試從 task 的 ai_segment_map / ai_segments_compact 推算
+        if t_start is None or t_end is None or t_end <= t_start:
+            fb_start, fb_end, fb_ctx = _fallback_segment_from_task(task, wrong_index if wrong_index is not None else 0)
+            if fb_start is not None and fb_end is not None and fb_end > fb_start:
+                t_start = fb_start
+                t_end = fb_end
+                if not subtitle_context:
+                    subtitle_context = fb_ctx
 
         # fallback（維持你原本行為：一定會有 jump 秒數，不讓學生卡住）
         if t_start is None or t_end is None or t_end <= t_start:
@@ -1064,6 +1475,300 @@ def submit_answer():
         }
 
     return jsonify(resp)
+
+# =========================
+# (C) POST /review  學生選擇是否回看影片（V1.7-A）
+# =========================
+# @parsons_bp.post("/review")
+# def review_choice():
+#     data = request.get_json(silent=True) or {}
+
+#     attempt_id = (data.get("attempt_id") or "").strip()
+#     student_id = (data.get("student_id") or "").strip()
+#     task_id = (data.get("task_id") or "").strip()
+#     video_id = (data.get("video_id") or "").strip()
+#     student_choice = (data.get("student_choice") or "").strip().lower()  # yes / no
+
+#     if not attempt_id:
+#         return jsonify({"ok": False, "message": "missing attempt_id"}), 400
+
+#     if student_choice not in ("yes", "no"):
+#         return jsonify({"ok": False, "message": "student_choice must be 'yes' or 'no'"}), 400
+
+#     # 允許前端沒傳 task_id/video_id：我們嘗試從 attempts 裡補
+#     task_id_f = task_id or None
+#     video_id_f = video_id or None
+#     student_id_f = student_id or None
+
+#     try:
+#         att = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
+#         if att:
+#             if not task_id_f:
+#                 task_id_f = att.get("task_id") or None
+#             if not video_id_f:
+#                 video_id_f = att.get("video_id") or None
+#             if not student_id_f:
+#                 student_id_f = att.get("student_id") or None
+#     except Exception:
+#         # attempt_id 不是 ObjectId 也沒關係（你目前 attempts 的 _id 是 ObjectId）
+#         pass
+
+#     doc = {
+#         "attempt_id": attempt_id,
+#         "task_id": task_id_f,
+#         "video_id": video_id_f,
+#         "student_id": student_id_f,
+#         "student_choice": student_choice,  # yes/no
+#         "created_at": now_utc(),
+#     }
+
+#     # ✅ 安全策略：同一個 attempt_id 只留一筆（避免重複點擊產生多筆）
+#     # - 若已存在：更新 choice + updated_at
+#     # - 若不存在：插入
+#     existed = db.parsons_review_logs.find_one({"attempt_id": attempt_id})
+#     if existed:
+#         db.parsons_review_logs.update_one(
+#             {"_id": existed["_id"]},
+#             {"$set": {
+#                 "student_choice": student_choice,
+#                 "student_id": student_id_f,
+#                 "task_id": task_id_f,
+#                 "video_id": video_id_f,
+#                 "updated_at": now_utc(),
+#             }}
+#         )
+#         return jsonify({"ok": True, "mode": "update"})
+#     else:
+#         db.parsons_review_logs.insert_one(doc)
+#         return jsonify({"ok": True, "mode": "insert"})
+
+# =========================
+# (C) POST /review_choice  記錄學生是否選擇回看（yes/no）
+# =========================
+@parsons_bp.route("/review_choice", methods=["POST", "OPTIONS"], endpoint="parsons_review_choice_v17")
+def review_choice():
+    # CORS preflight
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+
+    attempt_id = (data.get("attempt_id") or "").strip()
+    student_choice = (data.get("student_choice") or "").strip().lower()  # yes/no
+
+    # ✅ A 方案：後端盡量補齊 student_id
+    student_id = (data.get("student_id") or "").strip()  # 若前端未來願意送，直接吃
+    participant_id = (data.get("participant_id") or data.get("token") or "").strip()  # 兼容你登入的 uid
+
+    if not attempt_id:
+        return jsonify({"ok": False, "message": "missing attempt_id"}), 400
+    if student_choice not in ("yes", "no"):
+        return jsonify({"ok": False, "message": "student_choice must be yes/no"}), 400
+
+    # 先從 attempts 補 task_id / video_id（不改 schema）
+    task_id_f = None
+    video_id_f = None
+
+    try:
+        att = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
+        if att:
+            task_id_f = att.get("task_id") or None
+            video_id_f = att.get("video_id") or None
+            # 若 attempts 裡本來就有 student_id，也可以吃（目前你多半是 null）
+            if not student_id:
+                student_id = (att.get("student_id") or "").strip()
+    except Exception:
+        pass
+
+    # 若仍沒有 student_id，但有 participant_id → 去 users 查 student_id
+    if (not student_id) and participant_id:
+        try:
+            u = db.users.find_one({"_id": ObjectId(participant_id)})
+            if u:
+                student_id = (u.get("student_id") or "").strip()
+        except Exception:
+            pass
+
+    if not student_id:
+        student_id = "unknown"  # 至少不要空，方便你統計
+
+    db.parsons_review_logs.update_one(
+        {"attempt_id": attempt_id},
+        {
+            "$set": {
+                "attempt_id": attempt_id,
+                "task_id": task_id_f,
+                "video_id": video_id_f,
+                "student_id": student_id,
+                "participant_id": participant_id or None,
+                "student_choice": student_choice,
+                "updated_at": now_utc(),
+            },
+            "$setOnInsert": {"created_at": now_utc()},
+        },
+        upsert=True,
+    )
+
+    return jsonify({"ok": True, "student_id": student_id})
+
+
+# =========================
+# (D) POST/OPTIONS /review_watch  (V1.7-C 完整實現：記錄回看詳情)
+# 前端正在呼叫：/api/parsons/review_watch
+# 記錄學生回看視頻的所有互動數據
+# =========================
+@parsons_bp.route("/review_watch", methods=["POST", "OPTIONS"])
+def review_watch():
+    """
+    V1.7 完整實現：記錄視頻回看與互動詳情
+    
+    Expected Payload:
+    {
+        "attempt_id": "xxx",                    # 關聯的練習嘗試
+        "video_id": "xxx",
+        "task_id": "xxx",
+        "student_id": "xxx",                     # 學號
+        "start_sec": 120,                        # 指定回看片段開始時間
+        "end_sec": 180,                          # 指定回看片段結束時間
+        "watch_seconds": 3600,                   # 本次回看觀看秒數
+        "reached_end": true,                     # 是否播放到結束
+        "watch_start_at": "2026-02-26T...",     # 開始觀看時間
+        "watch_end_at": "2026-02-26T...",       # 停止觀看時間
+        "seek_events": [{"from": 10, "to": 50, "timestamp": "..."}, ...],  # V1.7 NEW
+        "is_complete_playback": true              # V1.7: 是否完整播放（無中斷）
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    
+    attempt_id = (data.get("attempt_id") or "").strip()
+    video_id = (data.get("video_id") or "").strip()
+    student_id = (data.get("student_id") or "").strip()
+    task_id = (data.get("task_id") or "").strip()
+    
+    watch_seconds = int(data.get("watch_seconds") or 0)
+    reached_end = bool(data.get("reached_end"))
+    watch_start_at = data.get("watch_start_at")
+    watch_end_at = data.get("watch_end_at")
+    start_sec = data.get("start_sec")
+    end_sec = data.get("end_sec")
+    seek_events = data.get("seek_events") or []  # V1.7: seek 事件列表
+    
+    # 基本檢驗
+    if not attempt_id or not video_id:
+        return jsonify({"ok": False, "message": "missing attempt_id or video_id"}), 400
+    
+    try:
+        # 從 parsons_attempts 中找到原始嘗試記錄
+        original_attempt = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
+        if not original_attempt:
+            return jsonify({"ok": False, "message": "attempt not found"}), 404
+        
+        # 若前端沒傳 student_id，從原始 attempt 取得
+        if not student_id:
+            student_id = original_attempt.get("student_id")
+        
+        # 取得用戶 participant_id（用于研究分析）
+        participant_id = None
+        user = db.users.find_one({"student_id": student_id}) if student_id else None
+        if user:
+            participant_id = user.get("participant_id")
+        
+        # 計算 seek 統計
+        seek_count = len(seek_events)
+        total_seek_distance = sum(abs(e.get("to", 0) - e.get("from", 0)) for e in seek_events)
+        avg_seek_distance = total_seek_distance / seek_count if seek_count > 0 else 0
+        
+        # 創建回看日誌記錄
+        rewatch_log = {
+            "attempt_id": attempt_id,
+            "video_id": video_id,
+            "task_id": task_id,
+            "student_id": student_id,
+            "participant_id": participant_id,
+            
+            # === 觀看行為 ===
+            "watch_seconds": watch_seconds,
+            "reached_end": reached_end,
+            "watch_start_at": watch_start_at,
+            "watch_end_at": watch_end_at,
+            "duration_minutes": round(watch_seconds / 60, 2),
+            
+            # === 回看片段信息 ===
+            "segment_start_sec": start_sec,
+            "segment_end_sec": end_sec,
+            "segment_duration_sec": (end_sec - start_sec) if end_sec and start_sec else None,
+            
+            # === V1.7 Seek 統計 ===
+            "seek_count": seek_count,
+            "total_seek_distance": total_seek_distance,
+            "avg_seek_distance": round(avg_seek_distance, 2),
+            "is_frequent_seeker": seek_count > 5,  # 5次以上視為頻繁 seek（可調整閾值）
+            "seek_events": seek_events,  # 保留原始事件供詳細分析
+            
+            # === 播放完整性 ===
+            "completed_fully": reached_end and seek_count <= 2,  # V1.7: 判定為完整播放
+            
+            # === 後續回答 ===
+            "has_followup": bool(original_attempt.get("followup_is_correct") is not None),
+            "followup_is_correct": original_attempt.get("followup_is_correct"),
+            "followup_attempt_id": original_attempt.get("followup_attempt_id"),
+            
+            # === 時間戳 ===
+            "recorded_at": now_utc(),
+        }
+        
+        # 插入回看日誌
+        log_result = db.video_rewatch_logs.insert_one(rewatch_log)
+        rewatch_log_id = str(log_result.inserted_id)
+        
+        # V1.7: 更新用戶的回看統計
+        if student_id:
+            db.users.update_one(
+                {"student_id": student_id},
+                {
+                    "$inc": {"rewatch_stats.total_rewatch_count": 1},
+                    "$push": {
+                        "rewatch_stats.rewatch_sessions": {
+                            "video_id": video_id,
+                            "attempt_id": attempt_id,
+                            "watched_at": watch_start_at,
+                            "watch_duration_sec": watch_seconds,
+                            "reached_end": reached_end,
+                            "is_frequent_seeker": seek_count > 5,
+                        }
+                    },
+                    "$set": {"last_login_at": now_utc()}
+                }
+            )
+        
+        # V1.7: 更新原始 attempt，記錄回看日誌 ID
+        db.parsons_attempts.update_one(
+            {"_id": ObjectId(attempt_id)},
+            {
+                "$set": {
+                    "review_log_id": rewatch_log_id,
+                    "review_log_recorded_at": now_utc()
+                }
+            }
+        )
+        
+        return jsonify({
+            "ok": True,
+            "rewatch_log_id": rewatch_log_id,
+            "message": f"✅ 回看記錄已保存 (seek_count={seek_count})",
+            "stats": {
+                "watch_duration": watch_seconds,
+                "reached_end": reached_end,
+                "seek_count": seek_count,
+                "is_frequent_seeker": seek_count > 5,
+            }
+        })
+    
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
 
 
 # =========================
@@ -1098,212 +1803,11 @@ def regenerate():
             "title": doc.get("video_title"),
             "level": doc.get("level"),
             "question_text": doc.get("question_text"),
-            "pool": doc.get("pool", []),
             "template_slots": doc.get("template_slots", []),
-            "enabled": doc.get("enabled"),
-            "review_status": doc.get("review_status"),
+            "pool": doc.get("pool", []),
+            "ai_feedback": doc.get("ai_feedback", {}),
         },
         "gen_source": gen_source,
         "gen_error": gen_error,
         "env": env,
-    }), 200
-
-
-# =========================
-# (D) POST /review_choice（你原本就有：寫 parsons_review_logs）
-# =========================
-@parsons_bp.post("/review_choice")
-def review_choice():
-    data = request.get_json(silent=True) or {}
-    attempt_id = (data.get("attempt_id") or "").strip()
-    student_choice = (data.get("student_choice") or "").strip()
-
-    if not attempt_id:
-        return jsonify({"ok": False, "message": "missing attempt_id"}), 400
-
-    doc = {
-        "attempt_id": attempt_id,
-        "student_choice": student_choice,
-        "created_at": datetime.now(timezone.utc),
-        "followup_is_correct": None,
-        "followup_submitted_at": None,
-        "followup_attempt_id": None,
-    }
-    db.parsons_review_logs.update_one(
-        {"attempt_id": attempt_id},
-        {"$set": doc},
-        upsert=True
-    )
-    return jsonify({"ok": True})
-
-
-# =========================
-# (D) Debug / health (保留既有)
-# =========================
-@parsons_bp.get("/debug/last_gen")
-def debug_last_gen():
-    video_id = request.args.get("video_id", "").strip()
-    if not video_id:
-        return jsonify({"ok": False, "message": "missing video_id"}), 400
-
-    vid_oid = maybe_oid(video_id)
-    if not vid_oid:
-        return jsonify({"ok": False, "message": "invalid video_id"}), 400
-
-    doc = db.parsons_tasks.find_one({"video_id": {"$in": [video_id, vid_oid]}}, sort=[("created_at", -1)])
-    if not doc:
-        return jsonify({"ok": True, "found": False}), 200
-
-    # [新增] 方便你判斷是不是 fallback、字幕有沒有讀到
-    subtitle_path = ((doc.get("prompt_source") or {}).get("subtitle_path") or "").strip()
-    qtext = (doc.get("question_text") or "").strip()
-
-    return jsonify({
-        "ok": True,
-        "found": True,
-        "id": str(doc.get("_id")),
-        "level": doc.get("level"),
-        "enabled": doc.get("enabled"),
-        "review_status": doc.get("review_status"),
-        "status": doc.get("status"),  # [新增] 兼容 teacher_t5 的 publish 欄位
-        "created_at": doc.get("created_at"),
-        "published_at": doc.get("published_at"),
-        "updated_at": doc.get("updated_at"),  # [新增]
-        "gen_source": doc.get("gen_source"),  # [新增]
-        "gen_error": doc.get("gen_error"),    # [新增]
-        "subtitle_path": subtitle_path,        # [新增]
-        "question_preview": qtext[:60],        # [新增]
-    }), 200
-
-
-
-# =========================
-# Jobs（保留）
-# =========================
-def _job_worker(job_id: str):
-    try:
-        db.parsons_jobs.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "running", "started_at": now_utc()}})
-        job = db.parsons_jobs.find_one({"_id": ObjectId(job_id)})
-        if not job:
-            return
-
-        video_id = job.get("video_id")
-        level = job.get("level", "L1")
-        mode = job.get("mode", "generate")
-
-        vid_oid = ObjectId(video_id)
-        v = db.videos.find_one({"_id": vid_oid})
-        if not v:
-            raise RuntimeError("video not found")
-
-        if mode == "regenerate":
-            db.parsons_tasks.update_many({"video_id": video_id, "level": level, "active": True}, {"$set": {"active": False}})
-
-        doc, gen_source, gen_error, env = create_task_for_video(v, video_id, level)
-
-        db.parsons_jobs.update_one(
-            {"_id": ObjectId(job_id)},
-            {"$set": {
-                "status": "done",
-                "finished_at": now_utc(),
-                "result_task_id": str(doc["_id"]),
-                "gen_source": gen_source,
-                "gen_error": gen_error,
-                "env": env
-            }}
-        )
-    except Exception as e:
-        db.parsons_jobs.update_one(
-            {"_id": ObjectId(job_id)},
-            {"$set": {"status": "failed", "finished_at": now_utc(), "error": str(e)}}
-        )
-
-
-@parsons_bp.post("/jobs")
-def create_job():
-    data = request.get_json(silent=True) or {}
-    video_id = (data.get("video_id") or "").strip()
-    level = (data.get("level") or "L1").strip()
-    mode = (data.get("mode") or "generate").strip()
-
-    if not video_id:
-        return jsonify({"ok": False, "message": "missing video_id"}), 400
-
-    ObjectId(video_id)
-
-    inserted = db.parsons_jobs.insert_one({
-        "video_id": video_id,
-        "level": level,
-        "mode": mode,
-        "status": "queued",
-        "created_at": now_utc()
     })
-
-    job_id = str(inserted.inserted_id)
-    t = threading.Thread(target=_job_worker, args=(job_id,), daemon=True)
-    t.start()
-
-    return jsonify({"ok": True, "job_id": job_id, "status": "queued"}), 200
-
-
-@parsons_bp.get("/jobs/<job_id>")
-def get_job(job_id):
-    oid = ObjectId(job_id)
-    job = db.parsons_jobs.find_one({"_id": oid})
-    if not job:
-        return jsonify({"ok": False, "message": "job not found"}), 404
-
-    return jsonify({
-        "ok": True,
-        "job": {
-            "job_id": job_id,
-            "status": job.get("status"),
-            "video_id": job.get("video_id"),
-            "level": job.get("level"),
-            "mode": job.get("mode"),
-            "result_task_id": job.get("result_task_id"),
-            "gen_source": job.get("gen_source"),
-            "gen_error": job.get("gen_error"),
-            "env": job.get("env"),
-            "error": job.get("error"),
-            "created_at": job.get("created_at"),
-            "started_at": job.get("started_at"),
-            "finished_at": job.get("finished_at"),
-        }
-    }), 200
-
-
-# =========================
-# 學生在 learning 回看時，離開或按「返回練習」→ 把回看資料存起來（保留，未來可以分析學生回看行為）
-# =========================
-@parsons_bp.post("/review_watch")
-def review_watch():
-    data = request.get_json(silent=True) or {}
-
-    attempt_id = (data.get("attempt_id") or "").strip()
-    if not attempt_id:
-        return jsonify({"ok": False, "message": "missing attempt_id"}), 400
-
-    doc = {
-        "attempt_id": attempt_id,
-        "video_id": (data.get("video_id") or "").strip(),
-        "task_id": (data.get("task_id") or "").strip(),
-
-        "watch_start_at": data.get("watch_start_at"),
-        "watch_end_at": data.get("watch_end_at"),
-        "watch_seconds": int(data.get("watch_seconds") or 0),
-        "reached_end": bool(data.get("reached_end")),
-
-        "created_at": datetime.now(timezone.utc),
-        # 下面兩個欄位：等「回看後再次 submit」時更新
-        "followup_is_correct": None,
-        "followup_submitted_at": None,
-        "followup_attempt_id": None,
-    }
-    # 同一個 attempt_id：用 upsert 方式更新/寫入（避免送多次變多筆）
-    db.parsons_review_logs.update_one(
-        {"attempt_id": attempt_id},
-        {"$set": doc},
-        upsert=True
-    )
-    return jsonify({"ok": True})

@@ -6,8 +6,121 @@ import re
 from openai import OpenAI
 from bson import ObjectId
 
+print("OPENAI_API_KEY =", os.environ.get("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 student_bp = Blueprint("student", __name__)
+
+
+# =========================
+# V1.8: Student Home - 單元進度 + 後測狀態（test_control）
+# =========================
+@student_bp.get("/units_progress")
+def units_progress():
+    """回傳學生首頁要用的：
+    1) 依老師端上傳 videos 的 unit 分組，計算每個 unit 的作答進度（%）
+    2) 後測開關狀態與已作答數（統一讀 test_control）
+
+    Query:
+      - student_id (或 participant_id)
+      - test_cycle_id (預設 default)
+    """
+    try:
+        student_id = (request.args.get("student_id") or request.args.get("participant_id") or "").strip()
+        test_cycle_id = (request.args.get("test_cycle_id") or "default").strip() or "default"
+
+        if not student_id:
+            return jsonify({"ok": False, "error": "missing student_id"}), 400
+
+        # 1) 取得影片（老師端上傳）=> 用 unit 分組
+        videos = list(
+            db.videos.find(
+                {"deleted": {"$ne": True}},
+                {"_id": 1, "unit": 1, "title": 1, "is_active": 1},
+            )
+        )
+        # 只計算「啟用」的影片；若你的 schema 不叫 is_active，這段也不會炸（預設 True）
+        videos = [v for v in videos if v.get("is_active", True)]
+
+        # unit -> [video_id]
+        unit_videos: dict = {}
+        for v in videos:
+            u = (v.get("unit") or "").strip()
+            if not u:
+                continue
+            vid = str(v.get("_id"))
+            unit_videos.setdefault(u, []).append(vid)
+
+        # 2) 取得學生作答紀錄（parsons_attempts）
+        #    以「某影片至少有一次正確作答」視為該影片完成
+        correct_video_ids = set(
+            db.parsons_attempts.distinct(
+                "video_id",
+                {
+                    "student_id": student_id,
+                    "is_correct": True,
+                    "video_id": {"$ne": None},
+                },
+            )
+        )
+        correct_video_ids = {str(x) for x in correct_video_ids if x is not None}
+
+        units_out = []
+        for unit, vids in sorted(unit_videos.items(), key=lambda x: x[0]):
+            total = len(vids)
+            done = sum(1 for vid in vids if vid in correct_video_ids)
+            progress = 0
+            if total > 0:
+                progress = round((done / total) * 100)
+            units_out.append(
+                {
+                    "unit": unit,
+                    "total_videos": total,
+                    "done_videos": done,
+                    "progress": progress,
+                }
+            )
+
+        # 3) 後測狀態（統一讀 test_control）
+        ctrl_id = f"post_open:{test_cycle_id}"
+        ctrl = db.test_control.find_one({"_id": ctrl_id}) or {}
+        post_open = bool(ctrl.get("post_open", False))
+
+        # 後測總題數：parsons_test_tasks
+        post_total = db.parsons_test_tasks.count_documents(
+            {
+                "test_cycle_id": test_cycle_id,
+                "test_role": "post",
+                "deleted": {"$ne": True},
+            }
+        )
+        # 後測已作答題數：parsons_test_attempts（同 test_cycle_id + post）
+        post_done = len(
+            db.parsons_test_attempts.distinct(
+                "task_id",
+                {
+                    "student_id": student_id,
+                    "test_cycle_id": test_cycle_id,
+                    "test_role": "post",
+                },
+            )
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "units": units_out,
+                "posttest": {
+                    "test_cycle_id": test_cycle_id,
+                    "post_open": post_open,
+                    "done": int(post_done),
+                    "total": int(post_total),
+                },
+            }
+        )
+
+    except Exception as e:
+        print("units_progress error:", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 PRE_TOTAL = 10
 
 

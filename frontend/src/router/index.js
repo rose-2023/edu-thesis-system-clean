@@ -3,8 +3,10 @@ import { createRouter, createWebHistory } from "vue-router";
 import Login from "../pages/Login.vue";
 import Entry from "../pages/Entry.vue";
 import Quiz from "../pages/Quiz.vue";
+import PreCheck from "../pages/PreCheck.vue";
 import StudentHome from "../pages/StudentHome.vue";
 import AdminUpload from "../pages/AdminUpload.vue";
+
 
 const routes = [
   { path: "/", redirect: "/login" },
@@ -15,10 +17,12 @@ const routes = [
   // ✅ 如果你的 entry/parsons 要免登入，就加 public
   { path: "/entry", name: "entry", component: Entry, meta: { public: true } },
   { path: "/parsons/:videoId", name: "parsons", component: () => import("../pages/parsons.vue"), meta: { public: true } },
+  { path: "/posttest/parsons", name: "posttest_parsons", component: () => import("../pages/parsons.vue"), meta: { public: true } }, // [新增] 後測 Parsons 專用路由(B)
   { path: "/learn/video/:videoId", name: "student-learning", component: () => import("../pages/StudentLearning.vue"), meta: { public: true } },
 
   // 其他頁面（需要登入就不要 public）
   { path: "/quiz", name: "quiz", component: Quiz },
+  { path: "/precheck", name: "precheck", component: PreCheck },
   { path: "/home", name: "home", component: StudentHome },
 
   // 老師端

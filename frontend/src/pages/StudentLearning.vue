@@ -48,7 +48,10 @@
               <div v-else class="thumb thumb-placeholder">影片</div>
 
               <div class="meta">
-                <div class="vtitle">{{ v.title }}</div>
+                <div class="vtitle">
+                  {{ v.title }}
+                  <span v-if="isVideoCompleted(v)" class="doneTag">✓ 已完成</span>
+                </div>
                 <div class="vsub"></div>
               </div>
             </button>
@@ -196,6 +199,7 @@ const API_BASE = "http://127.0.0.1:5000";
 
 const units = ref([]);
 const openIndex = ref(0);
+const completedVideoIds = ref(new Set());
 
 const selectedVideo = ref(null);
 const selectedVideoId = ref(null);
@@ -249,6 +253,46 @@ function selectVideo(u, v) {
   nextTick(() => {
     _bindPlayerWatchEvents();
   });
+}
+
+function videoKey(v) {
+  return String(v?._id || v?.id || v?.video_id || "").trim();
+}
+
+function isVideoCompleted(v) {
+  const key = videoKey(v);
+  if (!key) return false;
+  return completedVideoIds.value.has(key);
+}
+
+async function loadCompletedVideoIds() {
+  const sid = String(localStorage.getItem("student_id") || localStorage.getItem("studentId") || "").trim();
+  const pid = String(localStorage.getItem("participant_id") || "").trim();
+  if (!sid) {
+    if (!pid) {
+      completedVideoIds.value = new Set();
+      return;
+    }
+  }
+
+  try {
+    const qs = new URLSearchParams();
+    if (sid) qs.set("student_id", sid);
+    if (pid) qs.set("participant_id", pid);
+
+    const res = await fetch(`${API_BASE}/api/student/completed_videos?${qs.toString()}`);
+    if (!res.ok) {
+      completedVideoIds.value = new Set();
+      return;
+    }
+    const data = await res.json();
+    const ids = Array.isArray(data?.video_ids)
+      ? data.video_ids.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+    completedVideoIds.value = new Set(ids);
+  } catch (_) {
+    completedVideoIds.value = new Set();
+  }
 }
 
 function goParsons() {
@@ -320,6 +364,7 @@ async function seekToSegment(start, end) {
 
 onMounted(async () => {
   await nextTick();
+  await loadCompletedVideoIds();
 
   // ✅ 注意：影片 <video> 會在選到影片後才出現，所以監聽會在 selectVideo() 裡 nextTick 後綁定
 
@@ -365,6 +410,8 @@ onMounted(async () => {
   }));
 
   units.value = groupByUnit(normalized);
+  // 保險重抓一次完成清單，避免首次請求與列表載入時序造成漏顯示。
+  await loadCompletedVideoIds();
 
   // ✅ 方案 B：如果是 /learn/video/:videoId
   const routeVid = route.params.videoId ? String(route.params.videoId) : "";
@@ -768,6 +815,31 @@ async function sendWatchToServer() {
   color: #7b8795;
   font-size: 12px;
   font-weight: 700;
+}
+
+.meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vtitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.doneTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e7f8ee;
+  border: 1px solid #9edbb1;
+  color: #1f7a3f;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .meta {

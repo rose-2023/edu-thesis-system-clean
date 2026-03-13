@@ -1,5 +1,6 @@
 import os
 import re
+import hashlib
 _re = re
 import json
 from datetime import datetime, timezone
@@ -157,6 +158,328 @@ def _teacher_alignment_check(teacher_description: str, question_text: str, solut
     ok = len(hits) >= needed
     missing = [k for k in kws if k not in hits]
     return ok, missing
+
+
+def _extract_subtitle_signature_terms(text: str, max_terms: int = 10) -> list:
+    text = (text or "").strip().lower()
+    if not text:
+        return []
+
+    tokens = re.findall(r"[a-z_][a-z0-9_]*|[\u4e00-\u9fff]{2,}", text)
+    stop = {
+        "影片", "老師", "請", "題目", "程式", "使用", "完成", "判斷", "輸入", "輸出",
+        "python", "print", "input", "if", "for", "while", "內容", "說明", "這個", "那個",
+    }
+    out = []
+    seen = set()
+    for t in tokens:
+        if t in stop or len(t) <= 1 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _build_variation_directive(unit: str, subtitle_text: str, teacher_description: str, stable_mode: bool = False) -> str:
+    options = [
+        "把情境改成校園活動或社團管理，不要沿用影片原案例名詞。",
+        "把情境改成遊戲任務或關卡判定，不要沿用影片原案例名詞。",
+        "把情境改成生活消費或點數規則，不要沿用影片原案例名詞。",
+        "把情境改成交通/移動/排程，不要沿用影片原案例名詞。",
+        "把情境改成器材借還或庫存檢查，不要沿用影片原案例名詞。",
+    ]
+    seed = f"{unit}|{subtitle_text}|{teacher_description}"
+    hv = int(hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16)
+    idx = hv % len(options)
+    if not stable_mode:
+        idx = (idx + 1) % len(options)
+    return options[idx]
+
+
+def _build_avoid_terms_text(subtitle_text: str, teacher_description: str = "") -> str:
+    subtitle_terms = _extract_subtitle_signature_terms(subtitle_text, max_terms=10)
+    teacher_terms = set(_extract_focus_keywords(teacher_description, max_keywords=6))
+    banned = [t for t in subtitle_terms if t not in teacher_terms]
+    if not banned:
+        return ""
+    return "、".join(banned[:8])
+
+
+def _semantic_paraphrase(label: str, question_text: str, line: str) -> str:
+    """在 fallback 情況下做輕量同義改寫，避免每次語意完全相同。"""
+    text = (label or "").strip()
+    if not text:
+        return text
+
+    seed_src = f"{question_text}|{line}|{text}"
+    hv = int(hashlib.md5(seed_src.encode("utf-8", errors="ignore")).hexdigest()[:8], 16)
+    if hv % 2 == 0:
+        return text
+
+    rep = [
+        ("讀入整數，存入", "接收整數並存入"),
+        ("讀入輸入，存入", "接收輸入並存入"),
+        ("設定 ", "建立 "),
+        ("判斷條件：", "檢查條件："),
+        ("輸出結果：", "顯示結果："),
+        ("以上條件都不成立時", "其餘情況時"),
+    ]
+    out = text
+    for a, b in rep:
+        if a in out:
+            out = out.replace(a, b, 1)
+            break
+    return out
+
+
+def _guided_hint_by_line(line: str, is_distractor: bool = False) -> str:
+    """產生不揭露答案細節的引導式語意提示。"""
+    s = (line or "").strip()
+    low = s.lower()
+
+    if is_distractor:
+        if low.startswith("if ") or low.startswith("elif "):
+            return "這行看似可行，但判斷方向可能偏離題意"
+        if low.startswith("else"):
+            return "此分支位置需再確認，避免流程接錯"
+        if "input(" in low:
+            return "輸入處理看似合理，但可能影響後續判斷"
+        if "print(" in low:
+            return "輸出位置或內容可能與題目目標不一致"
+        if any(op in low for op in ["+=", "-=", "*=", "/=", "="]):
+            return "這行更新方式可能讓中間結果偏離"
+        if low.startswith("for ") or low.startswith("while "):
+            return "重複流程設定可能不符合本題需求"
+        return "這行容易誤選，建議結合前後流程再判斷"
+
+    if low.startswith("if ") or low.startswith("elif "):
+        return "先做一個條件判斷，再決定流程走向"
+    if low.startswith("else"):
+        return "處理前面條件未成立時的情況"
+    if "input(" in low:
+        return "先取得後續處理需要的輸入資料"
+    if "print(" in low:
+        return "在這一步輸出目前需要呈現的結果"
+    if low.startswith("for ") or low.startswith("while "):
+        return "進入重複處理流程，逐步完成任務"
+    if any(op in low for op in ["+=", "-=", "*=", "/="]):
+        return "更新中間結果，供後續步驟使用"
+    if "=" in low:
+        return "先準備一個後續會使用到的值"
+    return "完成這一步，銜接下一個程式流程"
+
+
+def _soften_semantic_hint(label: str, line: str, is_distractor: bool = False) -> str:
+    """將過度明確的語意標籤轉為引導式提示，避免直接暴露答案。"""
+    base = (label or "").strip()
+    if not base:
+        return _guided_hint_by_line(line, is_distractor=is_distractor)
+
+    # 明顯在洩漏程式細節（變數/運算式/常數）時，一律降級為引導式提示。
+    leak_patterns = [
+        r"[A-Za-z_]\w*\s*=",
+        r"==|!=|<=|>=|<|>|\+|-|\*|/|%",
+        r"\b\d+\b",
+        r"if\s+.+:",
+        r"for\s+.+:",
+        r"while\s+.+:",
+        r"print\s*\(",
+        r"input\s*\(",
+        r"[「『\"'].*?[」』\"']",
+    ]
+    for p in leak_patterns:
+        if _re.search(p, base, flags=_re.IGNORECASE):
+            return _guided_hint_by_line(line, is_distractor=is_distractor)
+
+    # 常見過度明確中文模板，直接降級避免提示過頭。
+    explicit_phrases = [
+        "讀入整數", "存入", "輸出結果", "顯示結果", "判斷條件", "檢查條件",
+        "設定", "建立", "等於", "小於", "大於", "倍數",
+    ]
+    if any(p in base for p in explicit_phrases):
+        return _guided_hint_by_line(line, is_distractor=is_distractor)
+
+    # 文字太長也容易透露關鍵，統一改為短引導。
+    if len(base) > 20:
+        return _guided_hint_by_line(line, is_distractor=is_distractor)
+
+    return base
+
+
+def _extract_int_literals(text: str) -> list:
+    vals = []
+    for m in re.findall(r"(?<![A-Za-z_\d])-?\d+(?![A-Za-z_\d])", text or ""):
+        try:
+            vals.append(int(m))
+        except Exception:
+            pass
+    return vals
+
+
+_ZH_DIGIT_MAP = {
+    "零": 0, "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _zh_num_to_int(token: str) -> Optional[int]:
+    t = (token or "").strip()
+    if not t:
+        return None
+    if t == "十":
+        return 10
+    if t.startswith("十") and len(t) == 2 and t[1] in _ZH_DIGIT_MAP:
+        return 10 + _ZH_DIGIT_MAP[t[1]]
+    if t.endswith("十") and len(t) == 2 and t[0] in _ZH_DIGIT_MAP:
+        return _ZH_DIGIT_MAP[t[0]] * 10
+    if len(t) == 3 and t[1] == "十" and t[0] in _ZH_DIGIT_MAP and t[2] in _ZH_DIGIT_MAP:
+        return _ZH_DIGIT_MAP[t[0]] * 10 + _ZH_DIGIT_MAP[t[2]]
+    if len(t) == 1 and t in _ZH_DIGIT_MAP:
+        return _ZH_DIGIT_MAP[t]
+    return None
+
+
+def _int_to_zh_small(n: int) -> str:
+    if n < 0:
+        return str(n)
+    if n < 10:
+        rev = {v: k for k, v in _ZH_DIGIT_MAP.items() if k != "兩"}
+        return rev.get(n, str(n))
+    if n == 10:
+        return "十"
+    if 10 < n < 20:
+        rev = {v: k for k, v in _ZH_DIGIT_MAP.items() if k != "兩"}
+        return "十" + rev.get(n - 10, str(n - 10))
+    if n % 10 == 0 and n < 100:
+        rev = {v: k for k, v in _ZH_DIGIT_MAP.items() if k != "兩"}
+        return rev.get(n // 10, str(n // 10)) + "十"
+    if n < 100:
+        rev = {v: k for k, v in _ZH_DIGIT_MAP.items() if k != "兩"}
+        return rev.get(n // 10, str(n // 10)) + "十" + rev.get(n % 10, str(n % 10))
+    return str(n)
+
+
+def _extract_number_signals(text: str) -> list:
+    nums = set(_extract_int_literals(text))
+    for tok in re.findall(r"[零一二兩三四五六七八九十]{1,3}", text or ""):
+        v = _zh_num_to_int(tok)
+        if v is not None:
+            nums.add(v)
+    return sorted(nums)
+
+
+def _pick_alt_int(n: int, seed_text: str) -> int:
+    pool = [3, 4, 5, 6, 7, 8, 9, 11, 12, 15, 16, 20]
+    pool = [x for x in pool if x != n]
+    if not pool:
+        return n + 1
+    hv = int(hashlib.md5(seed_text.encode("utf-8", errors="ignore")).hexdigest()[:8], 16)
+    return pool[hv % len(pool)]
+
+
+def _pick_alt_int_avoiding(n: int, seed_text: str, forbidden: set) -> int:
+    pool = [3, 4, 5, 6, 7, 8, 9, 11, 12, 15, 16, 18, 20, 24]
+    pool = [x for x in pool if x != n and x not in forbidden]
+    if not pool:
+        cand = n + 2
+        while cand in forbidden:
+            cand += 1
+        return cand
+    hv = int(hashlib.md5(seed_text.encode("utf-8", errors="ignore")).hexdigest()[:8], 16)
+    return pool[hv % len(pool)]
+
+
+def _token_set_for_similarity(text: str) -> set:
+    toks = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{2,}", (text or "").lower())
+    stop = {"請", "完成", "程式", "題目", "老師", "影片", "內容", "使用", "依據", "以及", "並"}
+    return {t for t in toks if t not in stop and len(t) > 1}
+
+
+def _jaccard_sim(a: str, b: str) -> float:
+    sa = _token_set_for_similarity(a)
+    sb = _token_set_for_similarity(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
+
+
+def _light_paraphrase_question_text(question_text: str, subtitle_text: str, unit: str = "") -> str:
+    q = str(question_text or "").strip()
+    if not q:
+        return q
+
+    sim = _jaccard_sim(q, subtitle_text)
+    if sim < 0.35:
+        return q
+
+    rep = [
+        ("請撰寫一段程式", "請完成一段程式"),
+        ("輸入", "讀入"),
+        ("判斷是否", "檢查是否"),
+        ("如果", "若"),
+        ("印出", "輸出"),
+        ("否則", "若不符合條件則"),
+        ("請使用", "請以"),
+    ]
+    out = q
+    for a, b in rep:
+        out = out.replace(a, b)
+
+    # 若仍偏高，再補一層改寫開場語句。
+    if _jaccard_sim(out, subtitle_text) >= 0.35:
+        u = (unit or "").upper()
+        if "-IF" in u or u.startswith("U2"):
+            out = "情境任務：請根據條件判斷完成下列需求。" + out
+        elif "-IO" in u or u.startswith("U1"):
+            out = "資料處理任務：請依題意完成輸入與輸出流程。" + out
+        else:
+            out = "請依題意完成程式流程。" + out
+    return out
+
+
+def _diversify_numbers_from_subtitle(question_text: str, solution_lines: list, subtitle_text: str, stable_mode: bool = False) -> Tuple[str, list]:
+    """避免題目把字幕裡的關鍵數字（例如 10）直接照抄。"""
+    q = str(question_text or "")
+    lines = [str(x or "") for x in (solution_lines or [])]
+
+    sub_nums = set(_extract_number_signals(subtitle_text))
+    if not sub_nums:
+        return q, lines
+
+    all_text = q + "\n" + "\n".join(lines)
+    used_nums = set(_extract_number_signals(all_text))
+    overlap = [n for n in used_nums if n in sub_nums and n not in {0, 1, -1}]
+    if not overlap:
+        return q, lines
+
+    q2 = q
+    lines2 = list(lines)
+    forbidden = set(sub_nums)
+    replaced = {}
+
+    for target in sorted(overlap):
+        alt = _pick_alt_int_avoiding(
+            target,
+            f"{q2}|{'|'.join(lines2)}|{subtitle_text}|{stable_mode}|{target}",
+            forbidden,
+        )
+        forbidden.add(alt)
+        replaced[target] = alt
+
+        pat = re.compile(rf"(?<![A-Za-z_\d]){target}(?![A-Za-z_\d])")
+        q2 = pat.sub(str(alt), q2)
+        lines2 = [pat.sub(str(alt), ln) for ln in lines2]
+
+    for target, alt in replaced.items():
+        target_zh = _int_to_zh_small(target)
+        alt_zh = _int_to_zh_small(alt)
+        q2 = q2.replace(f"{target_zh}的倍數", f"{alt_zh}的倍數")
+        q2 = q2.replace(f"為{target_zh}", f"為{alt_zh}")
+        q2 = q2.replace(f"等於{target_zh}", f"等於{alt_zh}")
+
+    return q2, lines2
 
 
 # =========================
@@ -331,10 +654,11 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
                 "print(i)",
             ]
 
-    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core"} for i, line in enumerate(solution_lines)]
+    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core", "semantic_zh": _label_for_code_line(line)} for i, line in enumerate(solution_lines)]
     distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
     pool = distractor_blocks + solution_blocks
-    template_slots = [{"label": f"請放入正確的第{i+1}行", "slot": str(i)} for i in range(len(solution_lines))]
+    _fb_labels = [_label_for_code_line(ln) for ln in solution_lines]
+    template_slots = [{"label": _fb_labels[i], "slot": str(i)} for i in range(len(solution_lines))]
 
     return {
         "question_text": question_text,
@@ -360,23 +684,29 @@ def resolve_unit_constraints(unit: str) -> Dict[str, Any]:
     u = (unit or "").strip().upper()
 
     # IO
-    if "-IO" in u:
+    if "-IO" in u or u.startswith("U1"):
         return {"unit_type": "io", "forbid_loop": True, "forbid_condition": True}
 
     # Condition (IF / IFELSE / ELIF)
-    if "-IFELSE" in u:
+    if "-IFELSE" in u or "IFELSE" in u:
         return {"unit_type": "condition", "require_if": True, "require_else": True, "require_elif": False, "forbid_loop": True, "forbid_break": True}
     if "-ELIF" in u:
         return {"unit_type": "condition", "require_if": True, "require_else": False, "require_elif": True, "forbid_loop": True, "forbid_break": True}
-    if "-IF" in u:
+    if "-IF" in u or u.startswith("U2"):
         return {"unit_type": "condition", "require_if": True, "require_else": False, "require_elif": False, "forbid_loop": True, "forbid_break": True}
 
-    # Loop styles
-    if "-FOR" in u:
+    # Loop styles（新課綱對齊）
+    if "-FOR" in u or u.startswith("U3"):
         return {"unit_type": "loop", "loop_style": "for_only"}
-    if "-WHILE" in u:
+    if "-NESTED" in u or u.startswith("U4"):
+        return {"unit_type": "loop", "loop_style": "for_only", "require_nested": True}
+    if "-WHILE" in u or u.startswith("U5"):
         return {"unit_type": "loop", "loop_style": "while_only"}
-    if "-LOOP" in u or u.startswith("U3"):
+    if "-LIST" in u or u.startswith("U6"):
+        return {"unit_type": "loop", "loop_style": "for_only", "prefer_list_ops": True}
+    if "-FUNCTION" in u or u.startswith("U7"):
+        return {"unit_type": "loop", "loop_style": "either", "prefer_function_style": True}
+    if "-LOOP" in u:
         return {"unit_type": "loop", "loop_style": "for_only"}
 
     # default
@@ -494,13 +824,498 @@ def build_rule_check(solution_lines: list, constraints: dict) -> Dict[str, Any]:
     rc["reason"] = reason
     return rc
 
-def _build_blocks_from_lines(question_text: str, solution_lines: list, distractor_lines: list) -> Dict[str, Any]:
+def _ai_generate_semantic_labels(solution_lines: list, question_text: str, model: str, temperature: float = 0.1) -> list:
+    """
+    用 AI 為每一行程式碼產生一句繁體中文教學語意說明。
+    回傳與 solution_lines 等長的 list[str]。失敗時 fallback 為規則式標籤。
+    """
+    if not ai_enabled() or not solution_lines:
+        return [_semantic_paraphrase(_label_for_code_line(ln), question_text, ln) for ln in solution_lines]
+
+    numbered = "\n".join(f"{i}: {ln}" for i, ln in enumerate(solution_lines))
+    try:
+        result = parsons_ai.call_openai_json(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=600,
+            system=(
+                "你是 Python 程式設計助教。"
+                "請為每一行程式碼寫一句簡短的繁體中文說明（12字以內），"
+                "只描述程式動作，不要使用題目情境名詞。"
+                "不要暴露變數名、數字、比較符號、運算式。"
+                "不要直接說明正確條件內容。"
+                "語氣要穩定、教學式，避免花俏修辭。"
+                "只輸出純 JSON，格式：{\"labels\": [\"第0行說明\", \"第1行說明\", ...]}"
+            ),
+            user=(
+                f"程式碼（格式：行號: 程式碼）：\n{numbered}\n\n"
+                "請依序為每行輸出一句繁體中文說明，數量必須和行數相同。"
+                "不得引用題目情境詞。"
+                "提示要保留學生思考空間，不可直接揭示答案。"
+            ),
+        ) or {}
+        labels = result.get("labels") or []
+        if isinstance(labels, list) and len(labels) == len(solution_lines):
+            return [
+                _soften_semantic_hint(str(l).strip() or _label_for_code_line(solution_lines[i]), solution_lines[i], is_distractor=False)
+                for i, l in enumerate(labels)
+            ]
+    except Exception:
+        pass
+    # fallback 規則式
+    return [
+        _soften_semantic_hint(_semantic_paraphrase(_label_for_code_line(ln), question_text, ln), ln, is_distractor=False)
+        for ln in solution_lines
+    ]
+
+
+def _apply_semantic_labels_to_blocks(blocks: dict, labels: list) -> None:
+    """將 AI 語意標籤寫入 solution_blocks.semantic_zh 和 template_slots.label（in-place）。"""
+    sol_blocks = blocks.get("solution_blocks") or []
+    for i, b in enumerate(sol_blocks):
+        if i < len(labels) and labels[i]:
+            b["semantic_zh"] = _soften_semantic_hint(labels[i], b.get("text", ""), is_distractor=False)
+    tmpl = blocks.get("template_slots") or []
+    for i, s in enumerate(tmpl):
+        if i < len(labels) and labels[i]:
+            s["label"] = _soften_semantic_hint(labels[i], (sol_blocks[i].get("text", "") if i < len(sol_blocks) else ""), is_distractor=False)
+
+
+def _label_for_code_line(line: str) -> str:
+    """規則式中文語意標籤（AI 不可用時的 fallback）。"""
+    s = (line or "").strip()
+    low = s.lower()
+    # 縮排層級
+    indent = len(s) - len(s.lstrip())
+
+    # if/elif/else
+    if _re.match(r"if\s+.+:", s):
+        return "先做一個條件判斷，再決定流程走向"
+    if _re.match(r"elif\s+.+:", s):
+        return "補充另一個條件分支"
+    if _re.match(r"else\s*:", s):
+        return "處理其餘未符合條件的情況"
+
+    # input / print
+    if "input(" in low:
+        return "先取得後續處理需要的輸入資料"
+    if low.startswith("print(") or (indent > 0 and "print(" in low):
+        return "在這一步輸出目前需要呈現的結果"
+
+    # 迴圈
+    if _re.match(r"for\s+\w+\s+in\s+range\(", s):
+        return "進入重複處理流程，逐步完成任務"
+    if s.startswith("while "):
+        return "透過條件控制重複執行流程"
+
+    # 賦值 / 累加
+    m_aug = _re.match(r"(\w+)\s*([+\-*/%]=)\s*(.+)", s)
+    if m_aug:
+        return "更新中間結果，供後續步驟使用"
+    m_assign = _re.match(r"(\w+)\s*=\s*(.+)", s)
+    if m_assign:
+        return "先準備一個後續會使用到的值"
+
+    return "完成這一步，銜接下一個程式流程" if s else "（空行）"
+
+
+def _normalize_code_line(line: str) -> str:
+    s = (line or "").rstrip("\n")
+    indent = len(s) - len(s.lstrip(" "))
+    core = _re.sub(r"\s+", "", s.lstrip(" "))
+    return f"{indent}|{core}".lower()
+
+
+def _mutate_distractor_candidates(line: str) -> list:
+    s = (line or "").rstrip("\n")
+    variants = []
+    stripped = s.strip()
+
+    if not stripped:
+        return variants
+
+    if "==" in s:
+        variants.append(s.replace("==", "!=", 1))
+    if "!=" in s:
+        variants.append(s.replace("!=", "==", 1))
+    if "<=" in s:
+        variants.append(s.replace("<=", ">=", 1))
+    if ">=" in s:
+        variants.append(s.replace(">=", "<=", 1))
+
+    swap_gt = _re.sub(r"(?<![<>=!])>(?!=)", "<", s, count=1)
+    if swap_gt != s:
+        variants.append(swap_gt)
+    swap_lt = _re.sub(r"(?<![<>=!])<(?!=)", ">", s, count=1)
+    if swap_lt != s:
+        variants.append(swap_lt)
+
+    if " or " in s:
+        variants.append(s.replace(" or ", " and ", 1))
+    if " and " in s:
+        variants.append(s.replace(" and ", " or ", 1))
+
+    if "+=" in s:
+        variants.append(s.replace("+=", "-=", 1))
+        variants.append(s.replace("+=", "=", 1))
+    if "-=" in s:
+        variants.append(s.replace("-=", "+=", 1))
+    if stripped == "break":
+        variants.append("continue")
+    if stripped == "continue":
+        variants.append("break")
+    if "int(input(" in s:
+        variants.append(_re.sub(r"int\(\s*input\(\s*\)\s*\)", "input()", s, count=1))
+    if "float(input(" in s:
+        variants.append(_re.sub(r"float\(\s*input\(\s*\)\s*\)", "input()", s, count=1))
+
+    if s.startswith("    "):
+        variants.append(s[4:])
+    elif stripped and not stripped.endswith(":"):
+        variants.append("    " + s)
+
+    return variants
+
+
+def _label_for_distractor_line(line: str) -> str:
+    raw = (line or "")
+    s = raw.strip()
+    low = s.lower()
+
+    if not raw.startswith("    ") and raw != s and s:
+        return "此行看似合理，但縮排層級可能造成流程偏差"
+    if low.startswith("if ") and " and " in low:
+        return "條件組合方式可能不符題意，建議再核對判斷方向"
+    if low.startswith("if ") and " or " in low:
+        return "條件組合方式可能不符題意，建議再核對判斷方向"
+    if any(op in low for op in ["==", "!=", "<=", ">=", "<", ">"]):
+        return "比較邏輯可能偏離預期，容易導致分支判斷錯誤"
+    if "input(" in low:
+        return "這行輸入處理可能影響後續判斷或計算"
+    if low.startswith("print(") or "print(" in low:
+        return "輸出位置或內容可能不符合題目要求"
+    if any(op in low for op in ["+=", "-=", "*=", "/="]):
+        return "更新方式可能使中間結果偏離預期"
+    if "=" in low:
+        return "資料更新邏輯可能與題目流程不一致"
+    if low in {"break", "continue"}:
+        return "流程控制語句可能放錯位置，請再檢查前後關係"
+    return "此行容易誤選，請結合上下文判斷是否合理"
+
+
+def _ensure_distractor_items(solution_lines: list, distractor_items: list, min_count: int = 2, max_count: int = 3) -> list:
     solution_lines = solution_lines or []
-    distractor_lines = distractor_lines or []
-    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core"} for i, line in enumerate(solution_lines)]
-    distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
+    distractor_items = distractor_items or []
+    sol_norm = {_normalize_code_line(x) for x in solution_lines if (x or "").strip()}
+
+    chosen = []
+    seen = set()
+
+    def _push(item):
+        line = item.get("text", "") if isinstance(item, dict) else str(item or "")
+        semantic = item.get("semantic_zh", "") if isinstance(item, dict) else ""
+        error_type = item.get("error_type", "") if isinstance(item, dict) else ""
+        normalized = _normalize_code_line(line)
+        if not normalized or normalized in sol_norm or normalized in seen:
+            return
+        seen.add(normalized)
+        chosen.append({
+            "text": line,
+            "semantic_zh": _soften_semantic_hint((semantic or "").strip() or _label_for_distractor_line(line), line, is_distractor=True),
+            "error_type": (error_type or "").strip(),
+        })
+
+    for item in distractor_items:
+        _push(item)
+        if len(chosen) >= max_count:
+            return chosen[:max_count]
+
+    candidates = []
+    for line in solution_lines:
+        candidates.extend(_mutate_distractor_candidates(line))
+
+    for line in candidates:
+        _push(line)
+        if len(chosen) >= max_count:
+            return chosen[:max_count]
+
+    fallback = [
+        "print('結果錯誤')",
+        "value = input()",
+        "count = count + 1",
+    ]
+    for line in fallback:
+        _push(line)
+        if len(chosen) >= min_count:
+            break
+
+    return chosen[:max_count]
+
+
+def _make_template_distractors_io(solution_lines: list) -> list:
+    """U1-IO 常見錯誤模板。"""
+    out = []
+    stripped = [ln.strip() for ln in (solution_lines or []) if (ln or "").strip()]
+
+    # missing_int_cast
+    for ln in stripped:
+        if "int(input(" in ln:
+            cast_removed = _re.sub(r"int\(\s*input\(\s*\)\s*\)", "input()", ln, count=1)
+            out.append({"text": cast_removed, "error_type": "missing_int_cast"})
+            break
+
+    # wrong_operator
+    for ln in stripped:
+        if any(op in ln for op in [" + ", "-", "*", "/"]):
+            if "+" in ln:
+                out.append({"text": ln.replace("+", "-", 1), "error_type": "wrong_operator"})
+            elif "*" in ln:
+                out.append({"text": ln.replace("*", "+", 1), "error_type": "wrong_operator"})
+            elif "-" in ln:
+                out.append({"text": ln.replace("-", "+", 1), "error_type": "wrong_operator"})
+            elif "/" in ln:
+                out.append({"text": ln.replace("/", "*", 1), "error_type": "wrong_operator"})
+            break
+
+    # wrong_output_var
+    vars_assigned = []
+    for ln in stripped:
+        m = _re.match(r"([A-Za-z_]\w*)\s*=", ln)
+        if m:
+            vars_assigned.append(m.group(1))
+    for ln in stripped:
+        if ln.startswith("print("):
+            if vars_assigned:
+                wrong_var = vars_assigned[-1]
+                if len(vars_assigned) >= 2:
+                    wrong_var = vars_assigned[0]
+                out.append({"text": f"print({wrong_var})", "error_type": "wrong_output_var"})
+            break
+
+    # missing_input
+    input_assigns = [ln for ln in stripped if "input(" in ln and "=" in ln]
+    if len(input_assigns) >= 2:
+        out.append({"text": input_assigns[0], "error_type": "missing_input"})
+
+    # order_error (print 在 input 前可誤導)
+    if vars_assigned:
+        out.append({"text": f"print({vars_assigned[0]})", "error_type": "order_error"})
+    elif stripped:
+        out.append({"text": "print(result)", "error_type": "order_error"})
+
+    return out
+
+
+def _make_template_distractors_condition(solution_lines: list) -> list:
+    """U2-IF 常見錯誤模板。"""
+    out = []
+    stripped = [ln.strip() for ln in (solution_lines or []) if (ln or "").strip()]
+
+    # compare_op_wrong / condition_reverse
+    for ln in stripped:
+        if ln.startswith("if ") or ln.startswith("elif "):
+            if "==" in ln:
+                out.append({"text": ln.replace("==", "!=", 1), "error_type": "compare_op_wrong"})
+                out.append({"text": ln.replace("==", "<=", 1), "error_type": "condition_reverse"})
+            elif ">=" in ln:
+                out.append({"text": ln.replace(">=", "==", 1), "error_type": "compare_op_wrong"})
+                out.append({"text": ln.replace(">=", "<", 1), "error_type": "condition_reverse"})
+            elif "<=" in ln:
+                out.append({"text": ln.replace("<=", "==", 1), "error_type": "compare_op_wrong"})
+                out.append({"text": ln.replace("<=", ">", 1), "error_type": "condition_reverse"})
+            elif ">" in ln:
+                out.append({"text": ln.replace(">", "<", 1), "error_type": "compare_op_wrong"})
+            elif "<" in ln:
+                out.append({"text": ln.replace("<", ">", 1), "error_type": "compare_op_wrong"})
+            break
+
+    # missing_else
+    has_else = any(ln == "else:" for ln in stripped)
+    if has_else:
+        cond_line = next((ln for ln in stripped if ln.startswith("if ")), "if score >= 60:")
+        out.append({"text": cond_line + " print('pass')", "error_type": "missing_else"})
+
+    # wrong_indent
+    indented = [ln for ln in (solution_lines or []) if (ln or "").startswith("    ")]
+    if indented:
+        out.append({"text": indented[0].lstrip(), "error_type": "wrong_indent"})
+
+    # loop_intrusion
+    out.append({"text": "for i in range(3):", "error_type": "loop_intrusion"})
+
+    return out
+
+
+def _make_template_distractors(unit_type: str, solution_lines: list) -> list:
+    u = (unit_type or "").strip().lower()
+    if u == "io":
+        return _make_template_distractors_io(solution_lines)
+    if u == "condition":
+        return _make_template_distractors_condition(solution_lines)
+    return []
+
+
+def _select_template_distractors(unit_type: str, items: list, max_count: int = 3) -> list:
+    u = (unit_type or "").strip().lower()
+    if u == "io":
+        order = ["missing_int_cast", "wrong_operator", "wrong_output_var", "missing_input", "order_error"]
+    elif u == "condition":
+        order = ["compare_op_wrong", "condition_reverse", "missing_else", "wrong_indent", "loop_intrusion"]
+    else:
+        order = []
+
+    picked = []
+    seen_text = set()
+    for et in order:
+        for it in items or []:
+            if (it.get("error_type") or "") != et:
+                continue
+            t = str(it.get("text", "")).strip()
+            if not t or t in seen_text:
+                continue
+            seen_text.add(t)
+            picked.append(it)
+            break
+        if len(picked) >= max_count:
+            return picked
+
+    for it in items or []:
+        t = str(it.get("text", "")).strip()
+        if not t or t in seen_text:
+            continue
+        seen_text.add(t)
+        picked.append(it)
+        if len(picked) >= max_count:
+            break
+    return picked
+
+
+def _ai_generate_distractor_semantics(question_text: str, solution_lines: list, distractor_items: list, model: str, temperature: float = 0.1) -> list:
+    """AI 只補 distractor semantic_zh；若失敗則用本地 fallback。"""
+    if not distractor_items:
+        return []
+
+    if not ai_enabled():
+        return [_label_for_distractor_line(str(x.get("text", ""))) for x in distractor_items]
+
+    sol_text = "\n".join(f"{i}: {ln}" for i, ln in enumerate(solution_lines or []))
+    dis_text = "\n".join(
+        f"{i}: {str(x.get('text', ''))} | error_type={str(x.get('error_type', '')) or 'unknown'}"
+        for i, x in enumerate(distractor_items)
+    )
+    try:
+        result = parsons_ai.call_openai_json(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=500,
+            system=(
+                "你是 Python 教學助教。"
+                "請為每個干擾程式碼區塊寫一句繁體中文語意（15字內），"
+                "指出它可能造成的風險方向。"
+                "不要直接揭露精確錯點或正確寫法。"
+                "只輸出 JSON：{\"labels\": [\"...\"]}"
+            ),
+            user=(
+                f"題目：{question_text}\n\n"
+                f"正解行：\n{sol_text}\n\n"
+                f"干擾題（含 error_type）：\n{dis_text}\n\n"
+                "請輸出與干擾題數量相同順序的 labels。"
+            ),
+        ) or {}
+        labels = result.get("labels") or []
+        if isinstance(labels, list) and len(labels) == len(distractor_items):
+            return [
+                _soften_semantic_hint(
+                    str(x).strip() or _label_for_distractor_line(str(distractor_items[i].get("text", ""))),
+                    str(distractor_items[i].get("text", "")),
+                    is_distractor=True,
+                )
+                for i, x in enumerate(labels)
+            ]
+    except Exception:
+        pass
+    return [
+        _soften_semantic_hint(_label_for_distractor_line(str(x.get("text", ""))), str(x.get("text", "")), is_distractor=True)
+        for x in distractor_items
+    ]
+
+
+def _apply_distractor_semantics_to_blocks(blocks: dict, labels: list) -> None:
+    dis = blocks.get("distractor_blocks") or []
+    for i, b in enumerate(dis):
+        if i < len(labels) and labels[i]:
+            b["semantic_zh"] = _soften_semantic_hint(labels[i], b.get("text", ""), is_distractor=True)
+
+
+def _ai_generate_distractor_items(question_text: str, solution_lines: list, model: str, temperature: float = 0.2) -> list:
+    """讓 AI 生成 2~3 個干擾題與中文語意，並交由本地邏輯過濾正解/重複。"""
+    if not ai_enabled() or not solution_lines:
+        return []
+
+    numbered = "\n".join(f"{i}: {ln}" for i, ln in enumerate(solution_lines))
+    try:
+        result = parsons_ai.call_openai_json(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=700,
+            system=(
+                "你是 Python Parsons 題目的出題助教。"
+                "請根據正確解答，設計 2 到 3 個單行的干擾程式碼區塊。"
+                "每個干擾題都必須看起來合理，但不能和任何正解行完全相同。"
+                "每個干擾題都要附上一句繁體中文語意，說明它為什麼是干擾。"
+                "禁止輸出完整解答、禁止輸出多行程式碼、禁止解釋段落。"
+                "只輸出純 JSON，格式："
+                "{\"distractors\": [{\"text\": \"程式碼\", \"semantic_zh\": \"中文語意\"}]}"
+            ),
+            user=(
+                f"題目：{question_text}\n\n"
+                f"正確解答行（格式：行號: 程式碼）：\n{numbered}\n\n"
+                "請輸出 2 到 3 個單行 distractors。"
+                "這些行要和正解主題相關，但必須是錯的、容易誤選的。"
+                "semantic_zh 要讓老師看得懂這題錯在哪裡。"
+            ),
+        ) or {}
+        items = result.get("distractors") or []
+        if isinstance(items, list):
+            return [x for x in items if isinstance(x, dict) and str(x.get("text", "")).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _build_blocks_from_lines(question_text: str, solution_lines: list, distractor_lines: list, distractor_items: Optional[list] = None) -> Dict[str, Any]:
+    solution_lines = solution_lines or []
+    seed_items = list(distractor_items or []) + [{"text": line} for line in (distractor_lines or [])]
+    distractor_items = _ensure_distractor_items(solution_lines, seed_items)
+
+    # 產生有意義的中文語意標籤
+    labels = [_label_for_code_line(ln) for ln in solution_lines]
+
+    solution_blocks = [
+        {
+            "id": f"b{i+1}",
+            "text": (line or "").lstrip(" "),
+            "indent": len(line or "") - len((line or "").lstrip(" ")),
+            "type": "core",
+            "semantic_zh": _soften_semantic_hint(labels[i], line, is_distractor=False),
+        }
+        for i, line in enumerate(solution_lines)
+    ]
+    distractor_blocks = [
+        {
+            "id": f"d{i+1}",
+            "text": item["text"],
+            "type": "distractor",
+            "semantic_zh": _soften_semantic_hint(item["semantic_zh"], item["text"], is_distractor=True),
+            **({"error_type": item.get("error_type")} if item.get("error_type") else {}),
+        }
+        for i, item in enumerate(distractor_items)
+    ]
     pool = distractor_blocks + solution_blocks
-    template_slots = [{"label": f"請放入正確的第{i+1}行", "slot": str(i)} for i in range(len(solution_lines))]
+    template_slots = [
+        {"label": _soften_semantic_hint(labels[i], solution_lines[i], is_distractor=False), "slot": str(i)}
+        for i in range(len(solution_lines))
+    ]
     return {
         "question_text": question_text,
         "solution_blocks": solution_blocks,
@@ -525,6 +1340,18 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
     concept = (plan.get("concept") or "").strip()
     scenario_hint = (plan.get("scenario") or "").strip()
     anti_copy_rules = plan.get("anti_copy_rules") or []
+    variation_directive = _build_variation_directive(
+        unit,
+        trace.get("subtitle_text_used", subtitle_text),
+        teacher_description,
+        stable_mode=stable_mode,
+    )
+    avoid_terms = _build_avoid_terms_text(trace.get("subtitle_text_used", subtitle_text), teacher_description)
+    avoid_terms_line = (
+        f"- 請避免直接使用以下字幕關鍵詞：{avoid_terms}"
+        if avoid_terms else
+        "- 不要直接複用字幕中的名詞組合。"
+    )
 
     model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
     gen_temperature = 0.05 if stable_mode else 0.2
@@ -567,14 +1394,19 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
 4️⃣ 不可使用 def / class  
 5️⃣ 程式行數 4~12 行  
 
+多樣化要求：
+- {variation_directive}
+- 題目敘述與影片字幕不可高相似改寫，必須換一組角色、場景與敘事語氣。
+{avoid_terms_line}
+
 若老師描述明確，請優先依據描述生成題目。
 
 輸出 JSON：
 
-{
+{{
  "question_text": "題目敘述",
  "solution_lines": ["code", "..."]
-}
+}}
 
 字幕參考：
 {segs_compact}
@@ -612,14 +1444,34 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
 
     question_text = (data.get("question_text") or "").strip()
 
-    # [新增] 第一次生成就先檢查是否太像字幕
-    if is_too_similar_to_subtitle(
-        trace.get("subtitle_text_used", subtitle_text),
-        question_text
-    ):
-        raise RuntimeError("generated question is too similar to subtitle example")
+    # 若太像字幕，先要求 AI 強制改寫再試一次
+    if is_too_similar_to_subtitle(trace.get("subtitle_text_used", subtitle_text), question_text):
+        retry_sim_prompt = base_prompt + (
+            "\n\n你上一版題目與字幕太相似，請重新改寫。"
+            "必須更換情境主詞、敘事語氣、任務細節，"
+            "但保留同一程式概念與單元難度。"
+        )
+        data = parsons_ai.call_openai_json(
+            system=system_msg,
+            user=retry_sim_prompt,
+            model=model,
+            temperature=min(0.45, gen_temperature + 0.15),
+            max_output_tokens=900
+        ) or {}
+        question_text = (data.get("question_text") or "").strip()
 
     solution_lines = data.get("solution_lines") or []
+    question_text, solution_lines = _diversify_numbers_from_subtitle(
+        question_text,
+        solution_lines,
+        trace.get("subtitle_text_used", subtitle_text),
+        stable_mode=stable_mode,
+    )
+    question_text = _light_paraphrase_question_text(
+        question_text,
+        trace.get("subtitle_text_used", subtitle_text),
+        unit,
+    )
 
     rc = build_rule_check(solution_lines, constraints)
     if not rc.get("ok"):
@@ -634,31 +1486,40 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
 
         question_text = (data.get("question_text") or "").strip()
 
-        # [新增] retry 後也檢查是否太像字幕
-        if is_too_similar_to_subtitle(
-            trace.get("subtitle_text_used", subtitle_text),
-            question_text
-        ):
-            raise RuntimeError("generated question is too similar to subtitle example")
-
         solution_lines = data.get("solution_lines") or []
+        question_text, solution_lines = _diversify_numbers_from_subtitle(
+            question_text,
+            solution_lines,
+            trace.get("subtitle_text_used", subtitle_text),
+            stable_mode=stable_mode,
+        )
+        question_text = _light_paraphrase_question_text(
+            question_text,
+            trace.get("subtitle_text_used", subtitle_text),
+            unit,
+        )
         rc = build_rule_check(solution_lines, constraints)
+
+    if is_too_similar_to_subtitle(trace.get("subtitle_text_used", subtitle_text), question_text):
+        raise RuntimeError("generated question is too similar to subtitle example")
 
     if not rc.get("ok"):
         raise RuntimeError(f"AI condition generation failed: {rc.get('reason')}")
 
-    distractor_lines = []
-    for line in solution_lines:
-        s = line.strip()
-        if s.startswith("if ") and "==" in s:
-            distractor_lines.append(s.replace("==", "!="))
-        elif s.startswith("if ") and ">" in s:
-            distractor_lines.append(s.replace(">", "<"))
-        elif s.startswith("elif ") and "==" in s:
-            distractor_lines.append(s.replace("==", "!="))
-    distractor_lines = (distractor_lines[:4] or ["print('錯誤')", "print('ok')"])
+    template_distractors = _select_template_distractors("condition", _make_template_distractors("condition", solution_lines), max_count=3)
+    blocks = _build_blocks_from_lines(question_text, solution_lines, [], distractor_items=template_distractors)
 
-    blocks = _build_blocks_from_lines(question_text, solution_lines, distractor_lines)
+    # AI 語意標籤
+    sem_labels = _ai_generate_semantic_labels(solution_lines, question_text, model, temperature=0.0)
+    _apply_semantic_labels_to_blocks(blocks, sem_labels)
+    dis_labels = _ai_generate_distractor_semantics(
+        question_text,
+        solution_lines,
+        blocks.get("distractor_blocks") or [],
+        model,
+        temperature=0.1,
+    )
+    _apply_distractor_semantics_to_blocks(blocks, dis_labels)
 
     blocks.update({
         "ai_feedback": {"general": "請注意條件判斷的比較運算與縮排層級是否正確。", "common_mistakes": [], "hints": []},
@@ -702,6 +1563,18 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
     concept = (plan.get("concept") or "").strip()
     scenario_hint = (plan.get("scenario") or "").strip()
     anti_copy_rules = plan.get("anti_copy_rules") or []
+    variation_directive = _build_variation_directive(
+        unit,
+        trace.get("subtitle_text_used", subtitle_text),
+        teacher_description,
+        stable_mode=stable_mode,
+    )
+    avoid_terms = _build_avoid_terms_text(trace.get("subtitle_text_used", subtitle_text), teacher_description)
+    avoid_terms_line = (
+        f"- 請避免直接使用以下字幕關鍵詞：{avoid_terms}"
+        if avoid_terms else
+        "- 不要直接複用字幕中的名詞組合。"
+    )
 
     model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
     gen_temperature = 0.05 if stable_mode else 0.2
@@ -745,6 +1618,11 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
 - 題目情境可改寫，但程式概念不可改變
 - 不可生成與 concept 不相關的題目
 
+多樣化要求：
+- {variation_directive}
+- 題目敘述與影片字幕不可高相似改寫，必須換一組角色、場景與敘事語氣。
+{avoid_terms_line}
+
 你要產生一題 Parsons 程式重組題（不是選擇題）。
 
 {rules}
@@ -782,14 +1660,34 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
 
     question_text = (data.get("question_text") or "").strip()
 
-    # [新增] 第一次生成就先檢查是否太像字幕
-    if is_too_similar_to_subtitle(
-        trace.get("subtitle_text_used", subtitle_text),
-        question_text
-    ):
-        raise RuntimeError("generated question is too similar to subtitle example")
+    # 若太像字幕，先要求 AI 強制改寫再試一次
+    if is_too_similar_to_subtitle(trace.get("subtitle_text_used", subtitle_text), question_text):
+        retry_sim_prompt = base_prompt + (
+            "\n\n你上一版題目與字幕太相似，請重新改寫。"
+            "必須更換情境主詞、敘事語氣、任務細節，"
+            "但保留同一程式概念與單元難度。"
+        )
+        data = parsons_ai.call_openai_json(
+            system=system_msg,
+            user=retry_sim_prompt,
+            model=model,
+            temperature=min(0.45, gen_temperature + 0.15),
+            max_output_tokens=900
+        ) or {}
+        question_text = (data.get("question_text") or "").strip()
 
     solution_lines = data.get("solution_lines") or []
+    question_text, solution_lines = _diversify_numbers_from_subtitle(
+        question_text,
+        solution_lines,
+        trace.get("subtitle_text_used", subtitle_text),
+        stable_mode=stable_mode,
+    )
+    question_text = _light_paraphrase_question_text(
+        question_text,
+        trace.get("subtitle_text_used", subtitle_text),
+        unit,
+    )
 
     align_ok, missing_kws = _teacher_alignment_check(teacher_description, question_text, solution_lines)
 
@@ -812,24 +1710,43 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
 
         question_text = (data.get("question_text") or "").strip()
 
-        # [新增] retry 後也檢查是否太像字幕
-        if is_too_similar_to_subtitle(
-            trace.get("subtitle_text_used", subtitle_text),
-            question_text
-        ):
-            raise RuntimeError("generated question is too similar to subtitle example")
-
         solution_lines = data.get("solution_lines") or []
+        question_text, solution_lines = _diversify_numbers_from_subtitle(
+            question_text,
+            solution_lines,
+            trace.get("subtitle_text_used", subtitle_text),
+            stable_mode=stable_mode,
+        )
+        question_text = _light_paraphrase_question_text(
+            question_text,
+            trace.get("subtitle_text_used", subtitle_text),
+            unit,
+        )
         rc = build_rule_check(solution_lines, constraints)
         align_ok, missing_kws = _teacher_alignment_check(teacher_description, question_text, solution_lines)
+
+    if is_too_similar_to_subtitle(trace.get("subtitle_text_used", subtitle_text), question_text):
+        raise RuntimeError("generated question is too similar to subtitle example")
 
     if not rc.get("ok"):
         raise RuntimeError(f"AI IO generation failed: {rc.get('reason')}")
     if not align_ok:
         raise RuntimeError("AI IO generation failed: not aligned with teacher_description")
 
-    distractor_lines = ["x = input()", "y = input()", "print(x - y)", "print(x * y)"][:4]
-    blocks = _build_blocks_from_lines(question_text, solution_lines, distractor_lines)
+    template_distractors = _select_template_distractors("io", _make_template_distractors("io", solution_lines), max_count=3)
+    blocks = _build_blocks_from_lines(question_text, solution_lines, [], distractor_items=template_distractors)
+
+    # AI 語意標籤
+    sem_labels = _ai_generate_semantic_labels(solution_lines, question_text, model, temperature=0.0)
+    _apply_semantic_labels_to_blocks(blocks, sem_labels)
+    dis_labels = _ai_generate_distractor_semantics(
+        question_text,
+        solution_lines,
+        blocks.get("distractor_blocks") or [],
+        model,
+        temperature=0.1,
+    )
+    _apply_distractor_semantics_to_blocks(blocks, dis_labels)
 
     blocks.update({
         "ai_feedback": {"general": "請確認輸入讀取與輸出格式是否符合題目要求。", "common_mistakes": [], "hints": []},
@@ -898,61 +1815,19 @@ def _build_semantic_loop_task(topic: str, subtitle_text: str, unit: str, video_t
 
     blocks = _build_blocks_from_lines(question_text, solution_lines, distractor_lines)
 
-    def _label_for_solution_line(line: str) -> str:
-        raw = (line or "").strip()
-        low = raw.lower()
-        if "input" in low and "m" in low:
-            return "讀入起始值 m"
-        if "input" in low and "n" in low:
-            return "讀入終點值 n"
-        if low.startswith("for ") and "-1" in low:
-            return "使用遞減迴圈，從 m 逐步走到 n"
-        if low.startswith("for "):
-            return "使用遞增迴圈，從 m 逐步走到 n"
-        if "print" in low:
-            return "逐一輸出範圍中的數列值"
-        return "完成此步驟所需的處理"
+    # 中文語意統一走 AI 生成；若 AI 不可用會自動回退到本地規則。
+    semantic_model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+    sem_labels = _ai_generate_semantic_labels(solution_lines, question_text, semantic_model, temperature=0.0)
+    _apply_semantic_labels_to_blocks(blocks, sem_labels)
 
-    low_topic = (topic or "").lower()
-
-    def _distractor_semantic_zh(line: str) -> str:
-        s = (line or "").strip().lower()
-        if low_topic == "range_desc":
-            if "n + 1" in s:
-                return "這會變成遞增範圍，與題目的遞減數列不一致"
-            if "range(n, m - 1, -1)" in s:
-                return "起點與終點顛倒，會輸出錯誤的範圍"
-            if s.startswith("print("):
-                return "只輸出單一值，沒有逐一列出遞減數列"
-        if low_topic == "range_asc":
-            if "-1" in s:
-                return "這會變成遞減方向，與題目的遞增數列不一致"
-            if "range(n, m + 1)" in s:
-                return "起點與終點顛倒，會輸出錯誤的範圍"
-            if s.startswith("print("):
-                return "只輸出單一值，沒有逐一列出遞增數列"
-        return "此行邏輯可能與題目需求不一致"
-
-    # if template and len(concept_template_slots) == len(solution_lines):
-    #     template_slots = concept_template_slots[:]
-    # else:
-    #     labels = [_label_for_solution_line(x) for x in solution_lines]
-    #     template_slots = [{"label": labels[i], "slot": str(i)} for i in range(len(solution_lines))]
-    labels = [_label_for_solution_line(x) for x in solution_lines]
-    template_slots = [{"label": labels[i], "slot": str(i)} for i in range(len(solution_lines))]
-    blocks["template_slots"] = template_slots
-
-    for i, b in enumerate(blocks.get("solution_blocks", []) or []):
-        try:
-            b["semantic_zh"] = labels[i]
-        except Exception:
-            pass
-
-    for b in blocks.get("distractor_blocks", []) or []:
-        try:
-            b["semantic_zh"] = _distractor_semantic_zh(b.get("text", ""))
-        except Exception:
-            pass
+    dis_labels = _ai_generate_distractor_semantics(
+        question_text,
+        solution_lines,
+        blocks.get("distractor_blocks") or [],
+        semantic_model,
+        temperature=0.1,
+    )
+    _apply_distractor_semantics_to_blocks(blocks, dis_labels)
 
     blocks.update({
         "ai_feedback": {
@@ -1146,14 +2021,34 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     else:
         scenarios = scenarios_for + scenarios_while
 
-    # ✅ 老師有描述時：不走 keyword matching，scenario_desc 直接用老師描述
+    # 以內容建立穩定 seed，避免同素材每次挑到不同 scenario
     seed_src = (unit or "") + "|" + (video_title or "") + "|" + ((cleaned or "")[:1500])
     seed_int = int(hashlib.md5(seed_src.encode("utf-8")).hexdigest(), 16)
-    rnd_seed = seed_int if stable_mode else (seed_int ^ random.randint(0, 10**9))
+    rnd_seed = seed_int
     rnd = random.Random(rnd_seed)
 
+    def _scenario_score(sc: dict) -> int:
+        kws = sc.get("keywords") or []
+        if not kws:
+            return 0
+        score = 0
+        body = (cleaned or "").lower()
+        td = (teacher_description or "").lower()
+        vt = (video_title or "").lower()
+        for kw in kws:
+            k = str(kw or "").lower().strip()
+            if not k:
+                continue
+            if k in body:
+                score += 2
+            if k in td:
+                score += 3
+            if k in vt:
+                score += 1
+        return score
+
     if has_teacher_desc:
-        # ✅ 修正：圖形/數列類題目產生有意義的 scenario_desc，不要直接把老師描述當情境
+        # 老師描述不再直接覆蓋 scenario，改為「加權影響」；只保留圖形類特例。
         _td_check = (teacher_description or "").lower()
         _is_pattern = any(k in _td_check for k in [
             "三角形", "直角", "正方形", "菱形", "星號", "圖形", "pattern", "triangle", "square", "*",
@@ -1167,24 +2062,25 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
                 "check": "skip",
             }
         else:
-            # 一般老師描述：直接當情境
-            picked = {"name": "teacher_defined", "desc": teacher_description.strip(),
-                      "tests": [["1", "2", "3"]], "check": "nums>=1"}
+            scored = sorted(scenarios, key=_scenario_score, reverse=True)
+            top_score = _scenario_score(scored[0]) if scored else 0
+            tops = [sc for sc in scored if _scenario_score(sc) == top_score] if scored else []
+            if tops:
+                tie_seed = (teacher_description or "") + "|" + (unit or "") + "|" + (video_title or "")
+                tie_idx = int(hashlib.md5(tie_seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(tops)
+                picked = tops[tie_idx]
+            else:
+                picked = scenarios[0]
     else:
-        # keyword pick
-        picked = None
-        for sc in scenarios:
-            if _kw_hit(*sc.get("keywords", [])):
-                picked = sc
-                break
-
-        if not picked:
-            picked = rnd.choice(scenarios)
+        scored = sorted(scenarios, key=_scenario_score, reverse=True)
+        top_score = _scenario_score(scored[0]) if scored else 0
+        tops = [sc for sc in scored if _scenario_score(sc) == top_score] if scored else []
+        if tops:
+            tie_seed = (unit or "") + "|" + (video_title or "") + "|" + ((cleaned or "")[:800])
+            tie_idx = int(hashlib.md5(tie_seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(tops)
+            picked = tops[tie_idx]
         else:
-            seed_src2 = (unit or "") + "|" + (video_title or "") + "|" + picked["name"] + "|" + ((cleaned or "")[:800])
-            seed_int2 = int(hashlib.md5(seed_src2.encode("utf-8")).hexdigest(), 16)
-            rnd_seed2 = seed_int2 if stable_mode else (seed_int2 ^ random.randint(0, 10**9))
-            rnd = random.Random(rnd_seed2)
+            picked = scenarios[0]
 
     scenario_desc = picked["desc"]
     scenario_tests = picked["tests"]
@@ -1895,22 +2791,6 @@ solution_lines：{solution_lines}
             return line[4:]
         return "    " + line
 
-    # =========================================
-    # 干擾提
-    def _distractor_semantic_zh(line: str) -> str:
-        s = (line or "").strip().lower()
-        if not (line or "").startswith("    ") and ("+=" in s or "=" in s):
-            return "此行可能不在正確縮排層級，導致流程不符合預期"
-        if "==" in s or "!=" in s or "<" in s or ">" in s:
-            return "條件判斷可能寫反，導致提早結束或無法結束"
-        if "break" in s or "continue" in s:
-            return "迴圈控制語句可能使用不當，造成流程錯誤"
-        if "+=" in s or "=" in s:
-            return "統計更新方式可能錯誤，導致結果不正確"
-        if "input" in s:
-            return "資料處理方式可能不一致，導致判斷或計算出錯"
-        return "此行邏輯可能與題目需求不一致"
-
     distractor_lines = []
     sol_norm = {_normalize_line(x) for x in solution_lines}
 
@@ -1958,42 +2838,49 @@ solution_lines：{solution_lines}
                 break
 
     # ===============================
-    # [新增] 中文語意 template_slots（0 token，不洩漏答案/不出現 input） 
-    # 備選題
+    # 中文語意改為優先 AI 生成；AI 不可用時才 fallback。
     # ===============================
-    def _label_for_solution_line(line: str) -> str:
-        raw = (line or "").strip()
-        low = raw.lower()
-        if _re.search(r"=\s*0\b", low):
-            return "設定統計所需的起始狀態"
-        if raw.endswith(":") and (low.startswith("while ") or low.startswith("for ")):
-            return "建立重複處理的流程架構"
-        if "input" in low:
-            return "取得新資料並準備後續處理"
-        if low.startswith("if ") and "break" in low:
-            return "判斷是否達到結束條件並結束流程"
-        if low.startswith("if "):
-            return "根據條件決定下一步處理"
-        if "+=" in low:
-            return "更新統計或累積的結果"
-        if "print" in low:
-            return "輸出整理後的結果"
-        if "=" in low:
-            return "更新流程中需要記錄的狀態"
-        if low.strip() == "break":
-            return "在適當時機結束重複流程"
-        return "完成此步驟所需的處理"
-
-    labels = [_label_for_solution_line(x) for x in solution_lines]
-    template_slots = [{"label": labels[i], "slot": str(i)} for i in range(len(solution_lines))]
-    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core"} for i, line in enumerate(solution_lines)]
+    solution_blocks = [
+        {
+            "id": f"b{i+1}",
+            "text": (line or "").lstrip(" "),
+            "indent": len(line or "") - len((line or "").lstrip(" ")),
+            "type": "core",
+        }
+        for i, line in enumerate(solution_lines)
+    ]
     distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
 
-    for i in range(len(distractor_blocks)):
-        try:
-            distractor_blocks[i]["semantic_zh"] = _distractor_semantic_zh(distractor_blocks[i]["text"])
-        except Exception:
-            pass
+    semantic_model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+
+    sem_labels = _ai_generate_semantic_labels(solution_lines, question_text, semantic_model, temperature=0.0)
+    for i, b in enumerate(solution_blocks):
+        if i < len(sem_labels):
+            b["semantic_zh"] = _soften_semantic_hint(sem_labels[i], b.get("text", ""), is_distractor=False)
+
+    template_slots = [
+        {
+            "label": _soften_semantic_hint(
+                sem_labels[i] if i < len(sem_labels) else _label_for_code_line(solution_lines[i]),
+                solution_lines[i],
+                is_distractor=False,
+            ),
+            "slot": str(i),
+        }
+        for i in range(len(solution_lines))
+    ]
+
+    dis_items = [{"text": b.get("text", "")} for b in distractor_blocks]
+    dis_labels = _ai_generate_distractor_semantics(
+        question_text,
+        solution_lines,
+        dis_items,
+        semantic_model,
+        temperature=0.1,
+    )
+    for i, b in enumerate(distractor_blocks):
+        if i < len(dis_labels):
+            b["semantic_zh"] = _soften_semantic_hint(dis_labels[i], b.get("text", ""), is_distractor=True)
 
     pool = distractor_blocks + solution_blocks
 

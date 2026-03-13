@@ -228,11 +228,14 @@ def save_fixed_task():
             text = str(ln).rstrip()
             if not text:
                 continue
-            indent = len(text) - len(text.lstrip())
+            # 計算縮排空格數（不是等級，就是空格數）
+            indent_spaces = len(text) - len(text.lstrip())
+            # 移除縮排，只保存程式文本
+            text_no_indent = text.lstrip()
             blocks.append({
                 "id": f"{prefix}{i}",
-                "text": text,
-                "indent": indent // 4,
+                "text": text_no_indent,  # 純文字，無縮排
+                "indent": indent_spaces,  # 縮排空格數（用於與學生答案比較）
                 "semantic_zh": "",
             })
         return blocks
@@ -857,11 +860,13 @@ def submit_test_answer():
     data = request.get_json(silent=True) or {}
 
     student_id = (data.get("student_id") or "").strip()
+    participant_id = (data.get("participant_id") or "").strip()
     test_cycle_id = (data.get("test_cycle_id") or get_default_test_cycle_id()).strip() or get_default_test_cycle_id()
     test_role = (data.get("test_role") or "").strip().lower()
     test_task_id = (data.get("test_task_id") or "").strip()
     source_task_id = (data.get("source_task_id") or data.get("task_id") or "").strip()
     answer_ids = data.get("answer_ids") or []
+    answer_lines = data.get("answer_lines") or []
     duration_sec = int(data.get("duration_sec") or 0)
 
     if not student_id:
@@ -880,8 +885,44 @@ def submit_test_answer():
     if not task:
         return jsonify({"ok": False, "message": "task not found"}), 404
 
+    # 若前端只帶 participant_id，嘗試回查 student_id，避免完成紀錄失聯。
+    if (not student_id) and participant_id:
+        try:
+            if ObjectId.is_valid(participant_id):
+                u = db.users.find_one({"_id": ObjectId(participant_id)})
+                if u and u.get("student_id"):
+                    student_id = str(u.get("student_id")).strip()
+        except Exception:
+            pass
+
     parsed = t5doc_to_parsons_task(task)
     expected_ids = [str(s.get("expected_id")) for s in (parsed.get("template_slots") or [])]
+
+    def _infer_indents_from_structure(blocks: list) -> list:
+        out = []
+        level = 0
+        for b in blocks or []:
+            raw = str((b or {}).get("text") or "")
+            s = raw.strip()
+            low = s.lower()
+            if low.startswith(("elif ", "else:", "except", "finally:")):
+                level = max(0, level - 1)
+            out.append(level * 4)
+            if s.endswith(":"):
+                level += 1
+        return out
+
+    expected_blocks = parsed.get("solution_blocks") or []
+    expected_indent_list = []
+    for b in expected_blocks:
+        b = b or {}
+        raw_text = str(b.get("text") or "")
+        if "indent" in b:
+            expected_indent_list.append(int(b.get("indent", 0) or 0))
+        else:
+            expected_indent_list.append(len(raw_text) - len(raw_text.lstrip(" ")))
+    if expected_indent_list and all(x == 0 for x in expected_indent_list):
+        expected_indent_list = _infer_indents_from_structure(expected_blocks)
 
     aligned = list(answer_ids)
     if len(aligned) < len(expected_ids):
@@ -915,6 +956,19 @@ def submit_test_answer():
 
         wrong_indices.append(i)
 
+    # 縮排檢查：有 answer_lines 時一併判定。
+    indent_errors = []
+    for i in range(min(len(expected_ids), len(answer_lines), len(expected_indent_list))):
+        expected_indent = int(expected_indent_list[i] or 0)
+
+        user_line = str(answer_lines[i] or "")
+        user_indent = len(user_line) - len(user_line.lstrip(" "))
+
+        if user_indent != expected_indent:
+            indent_errors.append(i)
+            if i not in wrong_indices:
+                wrong_indices.append(i)
+
     extra_wrong = max(0, len(answer_ids) - len(expected_ids))
     is_correct = (len(wrong_indices) == 0 and extra_wrong == 0)
 
@@ -932,6 +986,7 @@ def submit_test_answer():
         "score": score,
         "duration_sec": duration_sec,
         "wrong_indices": wrong_indices,
+        "indent_errors": indent_errors,
         "submitted_at": now_utc(),
     }
 
@@ -945,6 +1000,7 @@ def submit_test_answer():
             "is_correct": is_correct,
             "score": score,
             "wrong_indices": wrong_indices,
+            "indent_errors": indent_errors,
         })
     except Exception:
         # duplicate key => already submitted
@@ -954,6 +1010,7 @@ def submit_test_answer():
             "is_correct": is_correct,
             "score": score,
             "wrong_indices": wrong_indices,
+            "indent_errors": indent_errors,
         })
 
 
@@ -1116,6 +1173,7 @@ def submit_answer():
     answer_ids = data.get("answer_ids") or []
     answer_lines = data.get("answer_lines") or []
     student_id = (data.get("student_id") or "").strip()
+    participant_id = (data.get("participant_id") or "").strip()
 
     if not task_id:
         return jsonify({"ok": False, "message": "missing task_id"}), 400
@@ -1127,6 +1185,16 @@ def submit_answer():
 
     if not task:
         return jsonify({"ok": False, "message": "task not found"}), 404
+
+    # 若前端只帶 participant_id，嘗試回查 student_id，避免完成紀錄失聯。
+    if (not student_id) and participant_id:
+        try:
+            if ObjectId.is_valid(participant_id):
+                u = db.users.find_one({"_id": ObjectId(participant_id)})
+                if u and u.get("student_id"):
+                    student_id = str(u.get("student_id")).strip()
+        except Exception:
+            pass
 
     parsed = t5doc_to_parsons_task(task)
 
@@ -1146,71 +1214,10 @@ def submit_answer():
     print("answer_lines =", answer_lines)
     print("=========================================\n")
 
-    # ===== 順序比對 =====
-    aligned = list(answer_ids)
-    if len(aligned) < len(expected_ids):
-        aligned += [None] * (len(expected_ids) - len(aligned))
-
+    # 先初始化（最終正確性以後段「模板槽位比對 + 縮排比對」為準）
     wrong_indices = []
-    for i in range(len(expected_ids)):
-        if str(aligned[i]) != str(expected_ids[i]):
-            wrong_indices.append(i)
-
-    is_correct = len(wrong_indices) == 0
-
-    print("order_wrong_indices =", wrong_indices)
-    print("is_correct_after_order =", is_correct)
-
-    # ===== 縮排檢查（只在順序完全正確時）=====
-    if is_correct and answer_lines:
-        print("\n------ DEBUG INDENT CHECK START ------")
-
-        expected_blocks = parsed.get("solution_blocks") or []
-        expected_lines = [
-            (b.get("text") or "")
-            for b in expected_blocks
-        ]
-
-        indent_error = False
-
-        for i in range(min(len(expected_lines), len(answer_lines))):
-
-            expected_line = expected_lines[i]
-            user_line = answer_lines[i]
-
-            expected_indent = len(expected_line) - len(expected_line.lstrip(" "))
-            user_indent = len(user_line) - len(user_line.lstrip(" "))
-
-            print(f"[Slot {i}]")
-            print("expected_line =", repr(expected_line))
-            print("user_line     =", repr(user_line))
-            print("expected_indent =", expected_indent)
-            print("user_indent     =", user_indent)
-            print("-------------------------------")
-
-            # 只抓「缺縮排」
-            if user_indent < expected_indent:
-                indent_error = True
-                wrong_indices = [i]
-                is_correct = False
-                print(">>> INDENT ERROR at slot", i)
-                break
-
-        print("------ DEBUG INDENT CHECK END ------\n")
-        print("FINAL is_correct =", is_correct)
-        print("FINAL wrong_indices =", wrong_indices)
-        print("========== DEBUG SUBMIT END ==========\n")
-
-        return jsonify({
-            "ok": True,
-            "is_correct": is_correct,
-            "wrong_indices": wrong_indices,
-            "feedback": "✅ 完全正確！",
-            "score": 1.0,
-            "slot_label": "",
-            "actual_text": "",
-            "expected_text": "",
-        })
+    indent_errors = []
+    is_correct = False
 
     # [新增] V1.3：Submit 端 fallback 解析 SRT（把 [行-行] 轉成秒數）
     def _parse_srt_time_to_seconds(t: str) -> float:
@@ -1390,6 +1397,32 @@ def submit_answer():
     parsed = t5doc_to_parsons_task(task)
     expected_ids = [str(s.get("expected_id")) for s in (parsed.get("template_slots") or [])]
 
+    def _infer_indents_from_structure(blocks: list) -> list:
+        out = []
+        level = 0
+        for b in blocks or []:
+            raw = str((b or {}).get("text") or "")
+            s = raw.strip()
+            low = s.lower()
+            if low.startswith(("elif ", "else:", "except", "finally:")):
+                level = max(0, level - 1)
+            out.append(level * 4)
+            if s.endswith(":"):
+                level += 1
+        return out
+
+    expected_blocks_all = parsed.get("solution_blocks") or []
+    expected_indent_list = []
+    for b in expected_blocks_all:
+        b = b or {}
+        raw_text = str(b.get("text") or "")
+        if "indent" in b:
+            expected_indent_list.append(int(b.get("indent", 0) or 0))
+        else:
+            expected_indent_list.append(len(raw_text) - len(raw_text.lstrip(" ")))
+    if expected_indent_list and all(x == 0 for x in expected_indent_list):
+        expected_indent_list = _infer_indents_from_structure(expected_blocks_all)
+
     # [保留] 仍保留 answer_core_ids 欄位（不改 DB schema）
     answer_core = [bid for bid in answer_ids if str(bid).startswith("b")]
 
@@ -1426,6 +1459,16 @@ def submit_answer():
 
         wrong_indices.append(i)
 
+    # [關鍵修正] 縮排檢查要併入最終判定，不能只在前段檢查後被覆蓋。
+    for i in range(min(len(expected_ids), len(answer_lines), len(expected_indent_list))):
+        expected_indent = int(expected_indent_list[i] or 0)
+        user_line = answer_lines[i] or ""
+        user_indent = len(user_line) - len(user_line.lstrip(" "))
+        if user_indent != expected_indent:
+            indent_errors.append(i)
+            if i not in wrong_indices:
+                wrong_indices.append(i)
+
     # 額外多填的答案也算錯（不新增不存在的格 index，只影響 is_correct / score）
     extra_wrong = max(0, len(answer_ids) - len(expected_ids))
 
@@ -1450,7 +1493,6 @@ def submit_answer():
     feedback = "✅ 完全正確！" if is_correct else ((task.get("ai_feedback") or {}).get("general") or f"❌ 目前正確率 {score:.0%}，建議先確認「輸入 → 計算 → 輸出」的順序。")
 
     # [修正] expected_lines 需在所有分支先定義，避免 UnboundLocalError（錯誤答案也會走到下方 debug）
-    expected_blocks_all = parsed.get("solution_blocks") or []
     expected_lines = [(b.get("text") or "") for b in expected_blocks_all]
     if len(expected_lines) < len(expected_ids):
         expected_lines += [""] * (len(expected_ids) - len(expected_lines))
@@ -1463,7 +1505,7 @@ def submit_answer():
         expected_line = expected_lines[i]
         user_line = answer_lines[i]
 
-        expected_indent = len(expected_line) - len(expected_line.lstrip(" "))
+        expected_indent = int(expected_indent_list[i] or 0) if i < len(expected_indent_list) else 0
         user_indent = len(user_line) - len(user_line.lstrip(" "))
 
         print(f"[Slot {i}]")
@@ -1481,6 +1523,7 @@ def submit_answer():
         "video_id": video_id_str,
         "unit": task.get("unit"),
         "student_id": student_id or None,
+        "participant_id": participant_id or None,
         "level": level or task.get("level") or None,
         "answer_ids": answer_ids,
         "answer_block_ids": answer_ids,
@@ -1490,6 +1533,7 @@ def submit_answer():
         "feedback": feedback,
         "wrong_index": wrong_index,
         "wrong_indices": wrong_indices,
+        "indent_errors": indent_errors,  # [紋緒] 縮排錯誤格數
         "review": {"student_choice": None},
         "created_at": now_utc(),
     }
@@ -1516,6 +1560,7 @@ def submit_answer():
         "feedback": feedback,
         "wrong_index": wrong_index,
         "wrong_indices": wrong_indices,
+        "indent_errors": indent_errors,  # [新增] 縮排錯誤的格數
 
         # [新增] V1.4：送出後回傳欄位（前端顯示以後端為準）
         "slot_label": slot_label,
@@ -1527,6 +1572,18 @@ def submit_answer():
 
     if not is_correct:
         slot_key = str(wrong_index) if wrong_index is not None else "0"
+        
+        # [新增] 若是縮排錯誤，特別說明
+        if indent_errors and wrong_index is not None and wrong_index in indent_errors:
+            expected_blocks = parsed.get("solution_blocks") or []
+            expected_lines = [(b.get("text") or "") for b in expected_blocks]
+            if wrong_index < len(expected_lines) and wrong_index < len(answer_lines):
+                exp_indent = len(expected_lines[wrong_index]) - len(expected_lines[wrong_index].lstrip(" "))
+                user_indent = len(answer_lines[wrong_index]) - len(answer_lines[wrong_index].lstrip(" "))
+                if user_indent < exp_indent:
+                    feedback = f"❌ 你錯在：第{(wrong_index + 1)}格\n\n縮排不足：你的程式碼沒有正確的縮排。"  + f"\n\n預期縮排：{exp_indent} 空格\n你的縮排：{user_indent} 空格\n\n請檢查第 {(wrong_index + 1)} 格的縮排是否符合需求。"
+                else:
+                    feedback = f"❌ 你錯在：第{(wrong_index + 1)}格\n\n縮排過多：你的程式碼縮排超過預期。"  + f"\n\n預期縮排：{exp_indent} 空格\n你的縮排：{user_indent} 空格\n\n請檢查第 {(wrong_index + 1)} 格的縮排是否符合需求。"
 
         # [修正] ① 優先從 ai_segment_map 讀字幕對齊片段（老師講解程式碼的片段）
         seg_map = (task.get("ai_segment_map") or {}) if isinstance(task.get("ai_segment_map"), dict) else {}
@@ -2934,6 +2991,13 @@ ai_segments_compact:
 
 
 def diagnose_fixed_task_attempt(task_id: str, student_order: list):
+    def _build_pool_map(task):
+        pool = task.get("pool", [])
+        return {str(b.get("id", "")): b for b in pool}
+    
+    def _normalize_text(s: str) -> str:
+        return (s or "").strip()
+    
     task = db.parsons_tasks.find_one({"_id": ObjectId(task_id)})
     if not task:
         raise ValueError("task not found")

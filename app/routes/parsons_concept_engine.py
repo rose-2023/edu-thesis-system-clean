@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import random
+import hashlib
+import re
 from typing import Dict, Any, Optional, List
 
 
@@ -111,6 +112,25 @@ SCENARIO_POOL: Dict[str, List[str]] = {
     ],
 
     # -------------------------
+    # U6: List
+    # -------------------------
+    "list_basic": [
+        "讀入一串成績後逐一輸出",
+        "將多筆資料存進列表並顯示",
+        "依序走訪列表中的每個元素",
+    ],
+    "list_sum": [
+        "計算列表中所有數值的總和",
+        "統計清單資料的累積值",
+        "加總多筆輸入後輸出結果",
+    ],
+    "list_filter": [
+        "篩選列表中的偶數項目",
+        "挑出符合條件的資料並輸出",
+        "從清單中找出達標項目",
+    ],
+
+    # -------------------------
     # U4: While Loop
     # -------------------------
     "while_counter": [
@@ -160,125 +180,157 @@ SCENARIO_POOL: Dict[str, List[str]] = {
 }
 
 
+TRACK_CONCEPTS: Dict[str, List[str]] = {
+    "io": ["io_basic", "io_two_inputs", "io_calculation", "io_swap", "io_format"],
+    "condition": ["if_basic", "if_else", "if_compare", "if_grade", "if_range", "if_mod"],
+    "for": ["range_print", "range_pattern", "range_sum", "range_desc", "range_even", "range_multiples", "range_input"],
+    "while": ["while_counter", "while_condition", "while_input", "while_sum"],
+    "list": ["list_basic", "list_sum", "list_filter"],
+    "function": ["function_basic", "function_return", "function_two_params", "function_calculation"],
+}
+
+
+CONCEPT_KEYWORDS: Dict[str, List[str]] = {
+    "io_basic": ["輸入", "輸出", "顯示", "print", "input"],
+    "io_two_inputs": ["兩個", "兩位", "two", "兩次輸入"],
+    "io_calculation": ["計算", "總和", "加總", "運算", "面積", "average", "total"],
+    "io_swap": ["交換", "swap"],
+    "io_format": ["格式", "format", "f-string"],
+    "if_basic": ["判斷", "條件", "if"],
+    "if_else": ["else", "否則", "否則就"],
+    "if_compare": ["比較", "大於", "小於", ">", "<"],
+    "if_grade": ["成績", "及格", "pass", "fail", "達標"],
+    "if_range": ["範圍", "區間", "之間", "介於"],
+    "if_mod": ["奇數", "偶數", "%", "餘數"],
+    "range_print": ["列出", "輸出", "編號", "print"],
+    "range_pattern": ["圖形", "星號", "三角形", "pattern", "*"],
+    "range_sum": ["總和", "加總", "累加", "sum", "total"],
+    "range_desc": ["遞減", "倒數", "由大到小", "-1"],
+    "range_even": ["偶數"],
+    "range_multiples": ["倍數"],
+    "range_input": ["m到n", "m 到 n", "起點", "終點", "from", "to"],
+    "while_counter": ["計數", "counter", "逐步", "遞增"],
+    "while_condition": ["條件", "成立", "while"],
+    "while_input": ["直到", "停止", "quit", "sentinel"],
+    "while_sum": ["累加", "總和", "sum", "total"],
+    "list_basic": ["list", "列表", "清單", "陣列", "走訪", "append"],
+    "list_sum": ["list", "列表", "總和", "加總", "累積", "sum", "total"],
+    "list_filter": ["list", "列表", "篩選", "過濾", "條件", "偶數", "達標"],
+    "function_basic": ["函式", "function", "def"],
+    "function_return": ["回傳", "return"],
+    "function_two_params": ["兩個參數", "兩個數", "two params"],
+    "function_calculation": ["計算", "面積", "平均", "折扣"],
+}
+
+
+def _norm_text(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _infer_track(unit: str, subtitle_text: str, teacher_description: str = "", video_title: str = "") -> str:
+    u = (unit or "").strip().upper()
+    all_text = _norm_text("\n".join([subtitle_text or "", teacher_description or "", video_title or ""]))
+
+    # 課程單元優先，避免關鍵字把題型帶偏
+    if "-IO" in u or u.startswith("U1"):
+        return "io"
+    if any(k in u for k in ["-IF", "-ELIF", "-IFELSE"]) or u.startswith("U2"):
+        return "condition"
+    if "-FOR" in u or u.startswith("U3"):
+        return "for"
+
+    # 新課綱對齊：U4-NESTED、U5-WHILE、U6-LIST、U7-FUNCTION
+    if "-NESTED" in u or (u.startswith("U4") and "WHILE" not in u):
+        return "for"
+    if "-WHILE" in u or u.startswith("U5"):
+        return "while"
+    if "-FUNCTION" in u or u.startswith("U7"):
+        return "function"
+    if "-LIST" in u or u.startswith("U6"):
+        return "list"
+
+    if any(k in all_text for k in ["while", "直到", "停止", "quit"]):
+        return "while"
+    if any(k in all_text for k in ["for", "range", "迴圈", "重複"]):
+        return "for"
+    if any(k in all_text for k in ["if", "elif", "else", "條件", "判斷"]):
+        return "condition"
+    return "io"
+
+
+def _score_concept(concept: str, subtitle_text: str, teacher_description: str, video_title: str) -> int:
+    keys = CONCEPT_KEYWORDS.get(concept) or []
+    if not keys:
+        return 0
+
+    score = 0
+    sub = _norm_text(subtitle_text)
+    tea = _norm_text(teacher_description)
+    title = _norm_text(video_title)
+
+    for k in keys:
+        kk = _norm_text(k)
+        if not kk:
+            continue
+        if kk in sub:
+            score += 2
+        if kk in tea:
+            score += 3
+        if kk in title:
+            score += 1
+    return score
+
+
 # =========================================================
 # concept detection
 # =========================================================
-def detect_concept(unit: str, subtitle_text: str, teacher_description: str = "") -> str:
-    u = (unit or "").strip().upper()
-    raw = (subtitle_text or "").strip()
-    t = raw.lower()
+def detect_concept(unit: str, subtitle_text: str, teacher_description: str = "", video_title: str = "") -> str:
+    track = _infer_track(unit, subtitle_text, teacher_description, video_title)
+    candidates = TRACK_CONCEPTS.get(track) or ["generic"]
 
-    # 老師描述優先：若有明確描述，直接從描述推斷 concept
-    td = (teacher_description or "").strip()
-    if td:
-        if any(k in td for k in ["三角形", "正方形", "菱形", "星號", "圖形", "pattern", "*"]):
-            return "range_pattern"
-        if any(k in td for k in ["累加", "總和", "加總", "sum", "total"]):
-            return "range_sum"
-        if any(k in td for k in ["遞減", "倒數", "由大到小"]):
-            return "range_desc"
-        if any(k in td for k in ["偶數"]):
-            return "range_even"
-        if any(k in td for k in ["倍數"]):
-            return "range_multiples"
-        if any(k in td for k in ["計算", "面積", "加法"]):
-            return "io_calculation"
-        if any(k in td for k in ["交換", "swap"]):
-            return "io_swap"
-        if any(k in td for k in ["判斷", "if", "條件", "及格"]):
-            return "if_grade"
-        if any(k in td for k in ["函式", "function", "def", "回傳"]):
-            return "function_return"
+    scored = [(c, _score_concept(c, subtitle_text, teacher_description, video_title)) for c in candidates]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_score = scored[0][1] if scored else 0
+    if top_score <= 0:
+        return candidates[0]
 
-    # -------------------------
-    # U1: Input / Output
-    # -------------------------
-    if u.startswith("U1"):
-        if ("交換" in raw) or ("swap" in t):
-            return "io_swap"
-        if ("格式" in raw) or ("format" in t) or ("f-string" in t):
-            return "io_format"
-        if (("兩個" in raw) and ("輸入" in raw)) or (("two" in t) and ("input" in t)):
-            return "io_two_inputs"
-        if ("計算" in raw) or ("加總" in raw) or ("運算" in raw) or ("面積" in raw):
-            return "io_calculation"
-        return "io_basic"
-
-    # -------------------------
-    # U2: If
-    # -------------------------
-    if u.startswith("U2"):
-        if ("奇數" in raw) or ("偶數" in raw) or ("%" in raw):
-            return "if_mod"
-        if ("成績" in raw) or ("及格" in raw) or ("pass" in t) or ("fail" in t):
-            return "if_grade"
-        if ("範圍" in raw) or ("區間" in raw) or ("之間" in raw):
-            return "if_range"
-        if ("大於" in raw) or ("小於" in raw) or (">" in raw) or ("<" in raw):
-            return "if_compare"
-        if ("否則" in raw) or ("else" in t):
-            return "if_else"
-        return "if_basic"
-
-    # -------------------------
-    # U3: For Loop
-    # -------------------------
-    if u.startswith("U3"):
-        if ("總和" in raw) or ("加總" in raw) or ("累加" in raw) or ("sum" in t) or ("total" in t):
-            return "range_sum"
-        if ("遞減" in raw) or ("倒數" in raw) or ("-1" in raw):
-            return "range_desc"
-        if ("偶數" in raw):
-            return "range_even"
-        if ("倍數" in raw):
-            return "range_multiples"
-        if ("m到n" in raw) or ("m 到 n" in raw) or ("從 m 到 n" in raw) or ("起點" in raw and "終點" in raw):
-            return "range_input"
-        if ("輸出" in raw) or ("列印" in raw) or ("print" in t):
-            return "range_print"
-        return "range_print"
-
-    # -------------------------
-    # U4: While Loop
-    # -------------------------
-    if u.startswith("U4"):
-        if ("直到" in raw) or ("輸入 quit" in raw) or ("停止" in raw) or ("quit" in t):
-            return "while_input"
-        if ("總和" in raw) or ("累加" in raw):
-            return "while_sum"
-        if ("條件" in raw):
-            return "while_condition"
-        return "while_counter"
-
-    # -------------------------
-    # U5: Function
-    # -------------------------
-    if u.startswith("U5"):
-        if ("回傳" in raw) or ("return" in t):
-            return "function_return"
-        if ("兩個參數" in raw) or ("兩個數" in raw) or ("兩個整數" in raw):
-            return "function_two_params"
-        if ("面積" in raw) or ("平均" in raw) or ("折扣" in raw) or ("計算" in raw):
-            return "function_calculation"
-        return "function_basic"
-
-    return "generic"
+    # 分數相同時用穩定 hash 決定，避免 random 導致同素材卻不同題目
+    top = [c for c, s in scored if s == top_score]
+    seed = f"{unit}|{subtitle_text}|{teacher_description}|{video_title}"
+    idx = int(hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(top)
+    return top[idx]
 
 
 # =========================================================
 # scenario picker
 # =========================================================
-def pick_scenario(concept: str) -> str:
+def pick_scenario(concept: str, unit: str = "", subtitle_text: str = "", teacher_description: str = "", video_title: str = "") -> str:
     items = SCENARIO_POOL.get(concept) or ["一般生活情境"]
-    return random.choice(items)
+    evidence = _norm_text("\n".join([subtitle_text or "", teacher_description or "", video_title or ""]))
+
+    # 先做語意貼合分數，分數相同再用穩定 hash 選擇，避免每次 random。
+    best_score = -1
+    best_items: List[str] = []
+    for item in items:
+        parts = re.findall(r"[a-z_]{3,}|[\u4e00-\u9fff]{2,}", _norm_text(item))
+        score = sum(1 for p in parts if p and p in evidence)
+        if score > best_score:
+            best_score = score
+            best_items = [item]
+        elif score == best_score:
+            best_items.append(item)
+
+    seed = f"{unit}|{concept}|{subtitle_text}|{teacher_description}|{video_title}"
+    idx = int(hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest()[:8], 16) % len(best_items)
+    return best_items[idx]
 
 
 # =========================================================
 # generation plan
 # =========================================================
 def build_generation_plan(unit: str, subtitle_text: str, video_title: str = "", teacher_description: str = "") -> Dict[str, Any]:
-    concept = detect_concept(unit, subtitle_text, teacher_description)
-    scenario = pick_scenario(concept)
+    concept = detect_concept(unit, subtitle_text, teacher_description, video_title)
+    scenario = pick_scenario(concept, unit, subtitle_text, teacher_description, video_title)
 
     return {
         "unit": unit,

@@ -12,6 +12,55 @@ student_bp = Blueprint("student", __name__)
 
 
 # =========================
+# StudentLearning: 已完成影片清單（每位學生）
+# GET /api/student/completed_videos?student_id=...
+# =========================
+@student_bp.get("/completed_videos")
+def completed_videos():
+    try:
+        student_id = (request.args.get("student_id") or "").strip()
+        participant_id = (request.args.get("participant_id") or "").strip()
+        sid = student_id or participant_id
+
+        if not sid:
+            return jsonify({"ok": False, "error": "missing student_id"}), 400
+
+        # 支援 student_id / participant_id 兩種傳法，盡量補齊對應學生學號。
+        sid_candidates = {sid}
+        if participant_id:
+            sid_candidates.add(participant_id)
+
+        # participant_id 若是 users._id，可回查 student_id
+        try:
+            if ObjectId.is_valid(participant_id or sid):
+                u = db.users.find_one({"_id": ObjectId(participant_id or sid)})
+                if u and u.get("student_id"):
+                    sid_candidates.add(str(u.get("student_id")).strip())
+        except Exception:
+            pass
+
+        # 只算「答對」才完成。
+        query = {
+            "video_id": {"$ne": None},
+            "is_correct": True,
+            "$or": [
+                {"student_id": {"$in": list(sid_candidates)}},
+                {"participant_id": {"$in": list(sid_candidates)}},
+            ],
+        }
+
+        video_ids = db.parsons_attempts.distinct(
+            "video_id",
+            query,
+        )
+        out = [str(x) for x in (video_ids or []) if x is not None and str(x).strip()]
+        return jsonify({"ok": True, "student_id": sid, "video_ids": out})
+    except Exception as e:
+        print("completed_videos error:", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# =========================
 # V1.8: Student Home - 單元進度 + 後測狀態（test_control）
 # =========================
 @student_bp.get("/units_progress")

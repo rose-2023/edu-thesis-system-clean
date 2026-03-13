@@ -98,7 +98,7 @@
         <div class="fb-title">❌ 你錯在：{{ feedbackModal.slotLabel }}</div>
 
         <div class="fb-section">
-          <div class="fb-label">診斷結果</div>
+          <div class="fb-label">錯誤類型</div>
           <div class="fb-text">{{ feedbackModal.diagnosis }}</div>
         </div>
 
@@ -108,20 +108,48 @@
         </div>
 
         <div class="fb-section">
-          <div class="fb-label">請你反思</div>
+          <div class="fb-label">引導問題</div>
           <ol class="fb-list">
             <li v-for="(q, i) in feedbackModal.reflectionQuestions" :key="`${i}-${q}`">{{ q }}</li>
           </ol>
         </div>
 
         <div class="fb-section fb-review">
-          <div class="fb-label">建議回看影片時間軸</div>
+          <div class="fb-label">建議回看影片</div>
           <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
         </div>
 
         <div class="fb-actions">
           <button class="btn ghost" @click="dismissFeedbackModal">稍後再看</button>
           <button class="btn submit" @click="goReviewFromModal">前往複習片段</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 正確回饋 Modal（練習模式） -->
+    <div
+      v-if="successModal.open"
+      class="fb-modal-backdrop"
+      @click.self="dismissSuccessModal"
+    >
+      <div class="fb-modal success" role="dialog" aria-modal="true" aria-label="作答正確回饋">
+        <div class="fb-title success">✓ 作答正確</div>
+
+        <div class="fb-section success">
+          <div class="fb-text">恭喜！你已正確完成本題的程式重組。</div>
+        </div>
+
+        <div class="fb-section success soft">
+          <div class="fb-text">
+            若想再次確認老師的講解內容，可以回到影片單元頁面進行複習；
+            或是繼續前往下一個單元，學習新的程式概念。
+          </div>
+          <div v-if="!successModal.hasNext" class="fb-complete">恭喜你！完成本單元。</div>
+        </div>
+
+        <div class="fb-actions">
+          <button class="btn ghost" @click="goBackToUnitPage">回到影片單元頁面</button>
+          <button v-if="successModal.hasNext" class="btn submit" @click="goNextUnit">前往下一題</button>
         </div>
       </div>
     </div>
@@ -152,7 +180,8 @@ onMounted(() => {
 const isTestMode = computed(() => String(route.query.mode || "") === "test");
 const testRole = computed(() => String(route.query.test_role || "pre").toLowerCase());
 const testCycleId = computed(() => String(route.query.test_cycle_id || "default"));
-const studentId = computed(() => String(localStorage.getItem("student_id") || "").trim());
+const studentId = computed(() => String(localStorage.getItem("student_id") || localStorage.getItem("studentId") || "").trim());
+const participantId = computed(() => String(localStorage.getItem("participant_id") || "").trim());
 
 // AI 回饋（練習模式用）
 const aiFeedbackDetail = ref(null);
@@ -314,6 +343,13 @@ const feedbackModal = reactive({
   taskId: "",
 });
 
+const successModal = reactive({
+  open: false,
+  hasNext: false,
+  nextVideoId: "",
+  unitName: "",
+});
+
 // ========= localStorage 暫存 =========
 const PRACTICE_STATE_KEY = "parsons_practice_state_v1";
 const RESTORE_ONCE_KEY = "parsons_restore_once_v1";
@@ -464,11 +500,22 @@ function fmtTime(sec) {
 }
 
 function buildWrongFeedbackParts(r) {
-  const slotLabel = r?.slot_label ? String(r.slot_label) : "（未提供格數）";
+  const indentErrors = Array.isArray(r?.indent_errors) ? r.indent_errors : [];
+  const hasIndentError = indentErrors.length > 0;
+  const wrongIndex = Number.isInteger(r?.wrong_index) ? Number(r.wrong_index) : null;
+  const focusIndex = hasIndentError
+    ? Number(indentErrors[0])
+    : (wrongIndex != null ? wrongIndex : null);
+  const slotNum = (focusIndex != null && focusIndex >= 0) ? (focusIndex + 1) : null;
+
+  const slotLabel = hasIndentError
+    ? `第${slotNum || "?"}格的程式區塊縮排不正確`
+    : (r?.slot_label ? `${String(r.slot_label)}的程式區塊位置不正確` : `第${slotNum || "?"}格的程式區塊位置不正確`);
+
   const startSec = r?.jump?.start ?? r?.review_t ?? null;
   const endSec = r?.jump?.end ?? null;
   const reviewRange = (startSec != null && endSec != null)
-    ? `${fmtTime(startSec)}-${fmtTime(endSec)}`
+    ? `${fmtTime(startSec)}–${fmtTime(endSec)}`
     : "（未提供）";
 
   const possibleCauses = Array.isArray(r?.ai_feedback_detail?.possible_causes)
@@ -484,53 +531,128 @@ function buildWrongFeedbackParts(r) {
         .slice(0, 3)
     : [];
 
-  const diagnosis =
-    (r?.ai_diagnosis_summary && String(r.ai_diagnosis_summary).trim()) ||
-    (r?.ai_feedback_detail?.concept_explanation && String(r.ai_feedback_detail.concept_explanation).trim()) ||
-    `這一格的程式片段與題目需要的處理方式不完全一致，請再檢查此格在流程中的角色。`;
+  const diagnosis = hasIndentError
+    ? `縮排錯誤（共 ${indentErrors.length} 格）`
+    : "程式區塊錯誤";
 
-  const conceptHint =
-    (r?.ai_feedback_detail?.concept_hint && String(r.ai_feedback_detail.concept_hint).trim()) ||
-    (r?.hint && String(r.hint).trim()) ||
-    (r?.ai_feedback_detail?.concept_explanation && String(r.ai_feedback_detail.concept_explanation).trim()) ||
-    (r?.ai_feedback_detail?.guiding_question && String(r.ai_feedback_detail.guiding_question).trim()) ||
-    "請重新檢查這一格在整體程式流程中的角色。";
+  const conceptHint = hasIndentError
+    ? "Python 中 if 條件成立時，\n其程式區塊需要使用縮排表示。"
+    : (
+        (r?.ai_feedback_detail?.concept_hint && String(r.ai_feedback_detail.concept_hint).trim()) ||
+        (r?.hint && String(r.hint).trim()) ||
+        (r?.ai_feedback_detail?.concept_explanation && String(r.ai_feedback_detail.concept_explanation).trim()) ||
+        "請重新檢查這一格在整體程式流程中的角色。"
+      );
 
-  const guidingQuestion = reflectionQuestions[0]
-    || ((r?.ai_feedback_detail?.guiding_question && String(r.ai_feedback_detail.guiding_question).trim()) || "這一格的目的，是接收輸入，還是設定初始值？");
+  const guidingQuestion1 = hasIndentError
+    ? "這一行程式是否只應在條件成立時執行？"
+    : (reflectionQuestions[0] || ((r?.ai_feedback_detail?.guiding_question && String(r.ai_feedback_detail.guiding_question).trim()) || "這一格程式在流程中的主要目的為何？"));
 
-  const reflectQ2 = reflectionQuestions[1]
-    || (possibleCauses[0] ? `你覺得這次是否出現這個狀況：${possibleCauses[0]}？` : "這個值在後面會如何被使用？");
-
-  const reflectQ3 = reflectionQuestions[2]
-    || (possibleCauses[1] ? `如果改掉「${possibleCauses[1]}」，目前流程會更接近正確解法嗎？` : "用目前的寫法，能順利完成運算嗎？");
+  const guidingQuestion2 = hasIndentError
+    ? "如果沒有縮排，程式會在哪些情況執行？"
+    : (reflectionQuestions[1] || (possibleCauses[0] ? `你覺得這次是否出現這個狀況：${possibleCauses[0]}？` : "這行程式放在目前位置，會不會提早或延後執行？"));
 
   return {
     slotLabel,
     diagnosis,
     conceptHint,
-    reflectionQuestions: [guidingQuestion, reflectQ2, reflectQ3],
+    reflectionQuestions: [guidingQuestion1, guidingQuestion2],
     reviewRange,
     startSec,
     endSec,
+    hasIndentError,
+    indentErrorCount: indentErrors.length,
   };
 }
 
 function buildWrongFeedback(r) {
   const parts = buildWrongFeedbackParts(r);
-  return (
-    `❌ 你錯在：${parts.slotLabel}\n\n` +
-    `診斷結果：\n` +
-    `${parts.diagnosis}\n\n` +
-    `概念提示：\n` +
-    `${parts.conceptHint}\n\n` +
-    `反思建議：\n\n` +
-    `${parts.reflectionQuestions[0]}\n\n` +
-    `${parts.reflectionQuestions[1]}\n\n` +
-    `${parts.reflectionQuestions[2]}\n\n` +
-    `建議回看影片時間軸：\n` +
-    `${parts.reviewRange}`
-  );
+
+  return [
+    `❌ 你錯在：${parts.slotLabel}`,
+    "",
+    "錯誤類型",
+    parts.diagnosis,
+    "",
+    "概念提示",
+    parts.conceptHint,
+    "",
+    "引導思考",
+    `1 ${parts.reflectionQuestions[0] || "請重新檢查此格在流程中的執行條件。"}`,
+    `2 ${parts.reflectionQuestions[1] || "這行程式若放在目前位置，執行時機是否正確？"}`,
+    "",
+    "建議回看影片",
+    parts.reviewRange,
+  ].join("\n");
+}
+
+async function resolveNextVideoInUnit(curVideoId) {
+  const vid = String(curVideoId || "").trim();
+  if (!vid) return { hasNext: false, nextVideoId: "", unitName: "" };
+
+  try {
+    const res = await fetch(`${API_BASE}/api/admin_upload/videos`);
+    if (!res.ok) return { hasNext: false, nextVideoId: "", unitName: "" };
+
+    const data = await res.json();
+    const list = Array.isArray(data) ? data : (data?.items || data?.videos || []);
+    const rows = (list || [])
+      .filter((v) => v && v.active !== false && v.deleted !== true)
+      .map((v) => ({
+        id: String(v?._id?.$oid || v?._id || v?.id || "").trim(),
+        unit: String(v?.unit || "").trim(),
+      }))
+      .filter((v) => v.id);
+
+    const curIdx = rows.findIndex((x) => x.id === vid);
+    if (curIdx < 0) return { hasNext: false, nextVideoId: "", unitName: "" };
+
+    const unitName = rows[curIdx].unit;
+    if (!unitName) return { hasNext: false, nextVideoId: "", unitName: "" };
+
+    const sameUnit = rows.filter((x) => x.unit === unitName);
+    const unitIdx = sameUnit.findIndex((x) => x.id === vid);
+    if (unitIdx < 0 || unitIdx >= sameUnit.length - 1) {
+      return { hasNext: false, nextVideoId: "", unitName };
+    }
+
+    return { hasNext: true, nextVideoId: sameUnit[unitIdx + 1].id, unitName };
+  } catch (_) {
+    return { hasNext: false, nextVideoId: "", unitName: "" };
+  }
+}
+
+async function openSuccessModal(r) {
+  const nextInfo = await resolveNextVideoInUnit(videoId.value);
+  successModal.hasNext = !!nextInfo.hasNext;
+  successModal.nextVideoId = String(nextInfo.nextVideoId || "");
+  successModal.unitName = String(nextInfo.unitName || "");
+  successModal.open = true;
+}
+
+function dismissSuccessModal() {
+  successModal.open = false;
+}
+
+function goBackToUnitPage() {
+  successModal.open = false;
+  if (videoId.value) {
+    router.push(`/learn/video/${encodeURIComponent(String(videoId.value))}`);
+    return;
+  }
+  router.push("/home");
+}
+
+function goNextUnit() {
+  successModal.open = false;
+  const nextId = String(successModal.nextVideoId || "").trim();
+  if (!nextId) return;
+  router.push({
+    path: `/parsons/${encodeURIComponent(nextId)}`,
+    query: {
+      level: route.query.level ? String(route.query.level) : "L1",
+    },
+  });
 }
 
 function openFeedbackModal(r, taskId) {
@@ -725,6 +847,7 @@ async function submit() {
 
       const body = {
         student_id: String(studentId.value || ""),
+        participant_id: String(participantId.value || ""),
         test_cycle_id: String(testCycleId.value || ""),
         test_role: String(testRole.value || ""),
         test_task_id: String(testMeta.test_task_id || ""),
@@ -803,6 +926,7 @@ async function submit() {
       level: route.query.level ? String(route.query.level) : "L1",
       review_attempt_id: review_attempt_id.value,
       student_id: String(studentId.value || ""),
+      participant_id: String(participantId.value || ""),
     };
 
     const res = await fetch(`${API_BASE}/api/parsons/submit`, {
@@ -832,6 +956,7 @@ async function submit() {
     aiGuidingQuestion.value = r?.ai_feedback_detail?.guiding_question || "";
 
     if (r?.ok && r?.is_correct === false) {
+      // 統一使用前端模板，避免後端舊訊息混入「診斷結果」等舊格式
       r.feedback = buildWrongFeedback(r);
     }
 
@@ -845,6 +970,7 @@ async function submit() {
       localStorage.removeItem(PRACTICE_STATE_KEY);
       localStorage.removeItem(RESTORE_ONCE_KEY);
       localStorage.removeItem(RESTORE_MSG_KEY);
+      await openSuccessModal(r);
     }
 
     if (r?.ok && r?.is_correct === false && r?.jump?.video_id) {
@@ -1283,11 +1409,20 @@ watch(
   animation: modal-pop .2s ease-out both;
 }
 
+.fb-modal.success{
+  width: min(560px, 100%);
+  background: linear-gradient(180deg, #f6fff8 0%, #ffffff 100%);
+}
+
 .fb-title{
   font-size: 22px;
   font-weight: 900;
   color: #b91c1c;
   margin-bottom: 10px;
+}
+
+.fb-title.success{
+  color: #047857;
 }
 
 .fb-section{
@@ -1296,6 +1431,23 @@ watch(
   padding: 12px;
   background: #ffffff;
   margin-top: 10px;
+}
+
+.fb-section.success{
+  background: #f0fdf4;
+  border-color: #a7f3d0;
+}
+
+.fb-section.success.soft{
+  background: #f8fafc;
+  border-color: #dbe4ee;
+}
+
+.fb-complete{
+  margin-top: 10px;
+  font-size: 16px;
+  font-weight: 900;
+  color: #065f46;
 }
 
 .fb-label{

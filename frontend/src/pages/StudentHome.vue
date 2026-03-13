@@ -15,42 +15,52 @@
 
         <div class="profileText">
           <div class="hello">你好，{{ studentName }}同學</div>
+          <div class="welcomeText">歡迎回來，今天也一起完成學習進度吧！</div>
         </div>
       </div>
 
-      <div class="rightProgress">
-        <div class="progressTitle">
-          未完成課程：<span>{{ ongoingUnit }}</span> Parsons
-        </div>
-        <div class="dots">
-          <span
-            v-for="i in totalDots"
-            :key="i"
-            class="dot"
-            :class="{ on: i <= doneDots }"
-          ></span>
-        </div>
-
-        <!-- ✅【新增】後測進度點點：與老師端「後測發布/取消發布」連動（同一份 test_control） -->
-        <div class="postProgress">
+      <div class="rightTools">
+        <div class="rightProgress cardPanel">
           <div class="progressTitle">
-            後測：<span>{{ postOpen ? (postDone ? "已完成" : "進行中") : "未開放" }}</span>
+            未完成課程：<span>{{ ongoingUnit }}</span> Parsons
           </div>
-          <div class="dots postDots" v-if="postOpen">
+          <div class="dots">
             <span
-              v-for="i in postTotalDots"
-              :key="'post-dot-' + i"
+              v-for="i in totalDots"
+              :key="i"
               class="dot"
-              :class="{ on: i <= postDoneDots }"
+              :class="{ on: i <= doneDots }"
             ></span>
           </div>
+
+          <!-- ✅【新增】後測進度點點：與老師端「後測發布/取消發布」連動（同一份 test_control） -->
+          <div class="postProgress">
+            <div class="progressTitle">
+              後測：<span>{{ postOpen ? (postDone ? "已完成" : "進行中") : "未開放" }}</span>
+            </div>
+            <div class="dots postDots" v-if="postOpen">
+              <span
+                v-for="i in postTotalDots"
+                :key="'post-dot-' + i"
+                class="dot"
+                :class="{ on: i <= postDoneDots }"
+              ></span>
+            </div>
+          </div>
         </div>
+
+        <button class="logoutBtn" @click="logout">
+          登出
+        </button>
       </div>
     </header>
 
     <!-- 單元列表 -->
     <main class="main">
-      <h1 class="title">單元列表</h1>
+      <div class="pageIntro">
+        <h1 class="title">單元列表</h1>
+        <p class="subtitle">請選擇要進入的學習單元，依序完成影片學習與 Parsons 練習。</p>
+      </div>
 
       <div class="unitGrid">
         <!-- ✅【新增】後測區塊：由 test_control 控制顯示/隱藏 -->
@@ -58,7 +68,10 @@
           v-if="postOpen"
           class="unitCard post"
         >
+          <div class="cardGlow"></div>
+
           <div class="unitHeader">
+            <div class="unitBadge">測驗</div>
             <div class="unitName">後測 Parsons</div>
           </div>
 
@@ -100,12 +113,15 @@
           class="unitCard"
           :class="u.theme"
         >
+          <div class="cardGlow"></div>
+
           <div class="unitHeader">
+            <div class="unitBadge">課程單元</div>
             <div class="unitName">{{ u.unit }} {{ u.name }}</div>
           </div>
 
           <div class="unitFooter">
-            <div class="progressText">進度{{ u.progress }}%</div>
+            <div class="progressText">進度 {{ u.progress }}%</div>
 
             <button class="enterBtn" @click="goUnit(u.unit)">
               進入
@@ -121,12 +137,10 @@
   </div>
 </template>
 
-
 <script setup>
 import { ref, computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import axios from "axios";
-
 
 // ✅ 固定打後端（避免相對路徑打到 Vite 5173 回傳 index.html => <!doctype html>）
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
@@ -137,7 +151,8 @@ const router = useRouter();
 // 基本資訊（維持原本畫面用）
 // ==============================
 const avatarUrl = ref("");
-const studentName = ref("")
+const studentName = ref("");
+
 // ==============================
 // 單元列表（動態）
 // ==============================
@@ -170,6 +185,12 @@ const postDoneDots = computed(() => {
   return d;
 });
 
+const postDone = computed(() => {
+  const total = Number(postTotalCount.value || 0);
+  const done = Number(postDoneCount.value || 0);
+  return total > 0 && done >= total;
+});
+
 // ==============================
 // API：載入首頁資料（單元進度 + 後測狀態）
 // ==============================
@@ -195,10 +216,11 @@ async function loadHomeData() {
     // 1) units
     // 後端會回：[{unit, progress, total_videos, done_videos}]
     const nameMap = {
-      U1: "迴圈基礎",
-      U2: "串列與字串",
-      U3: "函式",
-      U4: "檔案處理",
+      U1: "輸入輸出",
+      U2: "條件判斷",
+      U3: "迴圈觀念解析",
+      U4: "函式",
+      U5: "串列與字典",
     };
     const themePool = ["blue", "green", "purple", "orange"];
 
@@ -229,7 +251,7 @@ async function loadHomeData() {
 }
 
 // ==============================
-// 互動：進入單元 / 後測
+// 互動：進入單元 / 後測 / 登出
 // ==============================
 function goUnit(unit) {
   // 保留你原本的進入單元邏輯（這裡只示範：導到 /unit/:unit）
@@ -245,51 +267,84 @@ function goPostTest() {
   });
 }
 
-onMounted(async () => {
-  const id = localStorage.getItem("student_id")
-  if (!id) return
+function logout() {
+  localStorage.removeItem("student_id");
+  localStorage.removeItem("studentId");
+  localStorage.removeItem("token");
+  localStorage.removeItem("access_token");
+  localStorage.removeItem("refresh_token");
+  router.replace("/");
+}
 
-  const res = await fetch(`http://127.0.0.1:5000/api/records/students?page=1&page_size=100`)
-  const data = await res.json()
+onMounted(async () => {
+  const id = localStorage.getItem("student_id") || localStorage.getItem("studentId");
+  if (!id) return;
+
+  // [新增] 進首頁先檢查「前測是否必做」：未完成就先導去前測
+  try {
+    const sres = await fetch(`${API_BASE}/api/parsons/test/status?student_id=${encodeURIComponent(id)}&test_cycle_id=default`);
+    const sdata = await sres.json();
+    if (sdata?.ok && sdata?.pre_open && !sdata?.pre_done) {
+      router.replace({
+        path: "/posttest/parsons",
+        query: { mode: "test", test_role: "pre", test_cycle_id: "default" },
+      });
+      return;
+    }
+  } catch (e) {
+    console.warn("pretest status check failed:", e);
+  }
+
+  // [修改] 用 API_BASE，避免打到錯的 host/port
+  const res = await fetch(`${API_BASE}/api/records/students?page=1&page_size=100`);
+  const data = await res.json();
 
   if (data.ok) {
-    const found = data.students.find(s => s.student_id === id)
+    const found = data.students.find((s) => s.student_id === id);
     if (found) {
-      studentName.value = found.name
+      studentName.value = found.name;
     }
   }
+
   loadHomeData();
-})
+});
 </script>
+
 <style scoped>
 .homePage {
   min-height: 100vh;
-  background: #ffffff;
+  background:
+    radial-gradient(circle at top left, rgba(255, 223, 186, 0.28), transparent 26%),
+    linear-gradient(180deg, #fffdf9 0%, #f7f8fc 100%);
 }
 
 /* 上方資訊列 */
 .topBar {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  padding: 22px 32px;
-  border-bottom: 1px solid #f0f0f0;
+  align-items: flex-start;
+  padding: 26px 36px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+  background: rgba(255, 255, 255, 0.84);
+  backdrop-filter: blur(10px);
 }
 
 .leftProfile {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 16px;
 }
 
 .avatar {
-  width: 56px;
-  height: 56px;
+  width: 62px;
+  height: 62px;
   border-radius: 50%;
   overflow: hidden;
   background: #fde2d1;
   display: grid;
   place-items: center;
+  box-shadow: 0 8px 18px rgba(246, 178, 74, 0.2);
+  border: 3px solid rgba(255, 255, 255, 0.8);
 }
 
 .avatarImg {
@@ -299,31 +354,49 @@ onMounted(async () => {
 }
 
 .avatarPlaceholder {
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   background: rgba(0, 0, 0, 0.15);
 }
 
 .profileText .hello {
   font-weight: 900;
-  font-size: 20px;
+  font-size: 22px;
+  color: #111827;
 }
 
-.profileText .level {
-  margin-top: 4px;
-  color: #4b5563;
-  font-weight: 800;
+.welcomeText {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 14px;
+  font-weight: 700;
 }
 
-.rightProgress {
-  min-width: 320px;
+.rightTools {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.cardPanel {
+  min-width: 360px;
   text-align: left;
+  padding: 18px 20px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.85);
 }
 
 .progressTitle {
   font-weight: 900;
   margin-bottom: 10px;
+  color: #111827;
+}
+
+.progressTitle span {
+  color: #0b6aa6;
 }
 
 .dots {
@@ -335,48 +408,125 @@ onMounted(async () => {
 .dot {
   width: 14px;
   height: 14px;
-  border-radius: 4px;
-  border: 1.5px solid #1f2937;
+  border-radius: 5px;
+  border: 1.5px solid #334155;
   background: transparent;
 }
 
 .dot.on {
-  background: #1f2937;
+  background: #0f172a;
+}
+
+.postProgress {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(15, 23, 42, 0.12);
+}
+
+.logoutBtn {
+  border: 0;
+  min-width: 96px;
+  height: 48px;
+  padding: 0 18px;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 900;
+  cursor: pointer;
+  background: linear-gradient(135deg, #f6b24a, #f59e0b);
+  color: #3f2a00;
+  box-shadow: 0 10px 20px rgba(245, 158, 11, 0.22);
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.logoutBtn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 24px rgba(245, 158, 11, 0.28);
 }
 
 /* 主內容 */
 .main {
-  padding: 30px 32px;
+  padding: 34px 36px 42px;
+}
+
+.pageIntro {
+  margin-bottom: 26px;
 }
 
 .title {
-  font-size: 40px;
-  margin: 10px 0 24px;
+  font-size: 54px;
+  margin: 0 0 10px;
   font-weight: 1000;
   letter-spacing: 1px;
+  color: #111827;
+}
+
+.subtitle {
+  margin: 0;
+  color: #6b7280;
+  font-size: 16px;
+  font-weight: 700;
 }
 
 /* 單元卡片 */
 .unitGrid {
   display: flex;
-  gap: 36px;
+  gap: 30px;
   flex-wrap: wrap;
 }
 
 .unitCard {
   width: 360px;
-  height: 170px;
-  border-radius: 26px;
+  min-height: 190px;
+  border-radius: 28px;
   padding: 22px 22px 18px;
   position: relative;
   overflow: hidden;
-  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.08);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.unitCard:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 22px 40px rgba(15, 23, 42, 0.12);
+}
+
+.cardGlow {
+  position: absolute;
+  top: -48px;
+  right: -28px;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.unitHeader {
+  position: relative;
+  z-index: 1;
+}
+
+.unitBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 76px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  margin-bottom: 12px;
+  background: rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.5px;
 }
 
 .unitHeader .unitName {
-  color: #fff;
+  color: #ffffff;
   font-weight: 1000;
-  font-size: 22px;
+  font-size: 28px;
+  line-height: 1.25;
+  word-break: break-word;
 }
 
 /* 底部：進度文字 + 進入按鈕 */
@@ -388,21 +538,35 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
 
 .progressText {
-  color: #fff;
+  color: #ffffff;
   font-weight: 900;
+  font-size: 18px;
 }
 
 .enterBtn {
   border: 0;
-  padding: 10px 18px;
+  padding: 10px 20px;
   border-radius: 999px;
   font-weight: 1000;
+  font-size: 15px;
   cursor: pointer;
   background: #f6b24a;
-  color: #ffffff;
+  color: #333;
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.12);
+  transition: transform 0.18s ease, opacity 0.18s ease;
+}
+
+.enterBtn:hover:not(:disabled) {
+  transform: translateY(-2px);
+}
+
+.enterBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
 }
 
 /* 進度條 */
@@ -411,9 +575,9 @@ onMounted(async () => {
   left: 22px;
   right: 22px;
   bottom: 18px;
-  height: 6px;
+  height: 8px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.4);
   overflow: hidden;
 }
 
@@ -423,36 +587,24 @@ onMounted(async () => {
   background: #f6b24a;
 }
 
-/* 顏色主題（像截圖） */
+/* 顏色主題 */
 .unitCard.blue {
-  background: #0b6aa6;
+  background: linear-gradient(135deg, #0b6aa6 0%, #0f86cf 100%);
 }
 
 .unitCard.green {
-  background: #5fa371;
+  background: linear-gradient(135deg, #5fa371 0%, #74bf84 100%);
 }
 
-/* RWD */
-@media (max-width: 900px) {
-  .topBar {
-    gap: 18px;
-    flex-direction: column;
-    align-items: flex-start;
-  }
-  .rightProgress {
-    min-width: auto;
-  }
-  .unitCard {
-    width: min(420px, 100%);
-  }
+.unitCard.purple {
+  background: linear-gradient(135deg, #7b61c9 0%, #9a84e6 100%);
 }
 
-
-/* ✅【新增】後測卡片/後測進度點點 */
-.postProgress {
-  margin-top: 10px;
+.unitCard.orange {
+  background: linear-gradient(135deg, #d9893b 0%, #f2a14f 100%);
 }
 
+/* 後測卡片 */
 .postDotsInline {
   flex: 1;
   display: flex;
@@ -474,23 +626,68 @@ onMounted(async () => {
   height: 10px;
 }
 
-/* ✅【新增】後測卡片樣式（沿用單元卡片結構，只改主色系） */
 .unitCard.post {
-  background: #f7f7f7;
+  background: linear-gradient(135deg, #f8fafc 0%, #eef2f7 100%);
 }
 
-.unitCard.post .unitName {
-  color: #333;
+.unitCard.post .cardGlow {
+  background: rgba(148, 163, 184, 0.18);
 }
 
+.unitCard.post .unitBadge {
+  background: rgba(148, 163, 184, 0.18);
+  color: #334155;
+}
+
+.unitCard.post .unitName,
 .unitCard.post .progressText {
-  color: #333;
+  color: #1f2937;
+}
+
+.unitCard.post .progressBar {
+  background: rgba(148, 163, 184, 0.28);
 }
 
 .unitCard.post .progressFill {
-  background: #333;
+  background: #334155;
+}
+
+/* RWD */
+@media (max-width: 900px) {
+  .topBar {
+    gap: 18px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .rightTools {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cardPanel {
+    min-width: auto;
+  }
+
+  .logoutBtn {
+    width: 100%;
+  }
+
+  .main {
+    padding: 28px 20px 36px;
+  }
+
+  .topBar {
+    padding: 22px 20px;
+  }
+
+  .title {
+    font-size: 40px;
+  }
+
+  .unitCard {
+    width: min(420px, 100%);
+  }
 }
 </style>
-
-
-

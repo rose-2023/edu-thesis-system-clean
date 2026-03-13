@@ -1,23 +1,7 @@
 <template>
   <div class="t5-layout">
     <!-- ===== Sidebar ===== -->
-    <aside class="sidebar">
-      <div class="profile">
-        <div class="avatar"></div>
-        <div class="hello">您好，老師</div>
-      </div>
-
-      <nav class="menu">
-        <button class="menu-item">總覽</button>
-        <button class="menu-item">影片管理</button>
-        <button class="menu-item active">AI 管理生成紀錄檢視</button>
-        <button class="menu-item">分析</button>
-      </nav>
-
-      <div class="logout">
-        <button class="btn-outline">登出</button>
-      </div>
-    </aside>
+    <TeacherSidebar active="agentlog" />
 
     <!-- ===== Main ===== -->
     <main class="main">
@@ -175,6 +159,14 @@
                 <option value="oldest">生成時間（舊→新）</option>
               </select>
             </div>
+
+            <!-- 穩定模式開關 -->
+            <div class="stable-toggle" :class="{ 'stable-on': stableMode }" @click="stableMode = !stableMode" title="穩定模式：降低隨機性，讓 AI 生題更穩定（適合課前備課）">
+              <div class="stable-knob"></div>
+              <span class="stable-label">
+                {{ stableMode ? '⚙️ 穩定模式 ON' : '🎲 創意模式 ON' }}
+              </span>
+            </div>
           </div>
 
           <!-- states -->
@@ -203,55 +195,91 @@
             <table class="t">
               <thead>
                 <tr>
-                  <th style="width: 90px;">題目ID</th>
-                  <th style="width: 170px;">生成時間</th>
-                  <th style="width: 150px;">狀態</th>
-                  <th style="width: 210px;">操作</th>
-                  <th style="width: 90px;">備註</th>
+                  <th style="width: 90px;">題型</th>
+                  <th style="width: 110px;">題目代號</th>
+                  <th style="width: 80px;">來源</th>
+                  <th style="width: 170px;">建立時間</th>
+                  <th style="width: 110px;">狀態</th>
+                  <th style="width: 90px;">學生可見</th>
+                  <th style="width: 250px;">操作</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="q in questions" :key="q.task_id">
-                  <td class="mono">
-                    {{ q.version }}
-                    <div class="sub" v-if="q.parent_version">（由 {{ q.parent_version }} 重新生成）</div>
-                  </td>
-                  <td class="mono">{{ fmtTime(q.created_at) }}</td>
-                  <td>
-                    <span class="dot" :class="dotClass(q.status)"></span>
-                    {{ q.status_zh }}
-                    <div class="sub" v-if="q.status === 'pending'">學生端不可見</div>
-                  </td>
-                  <td>
-                    <div class="btns">
-                      <button class="pillBtn preview" @click="openPreview(q)">預覽</button>
+                  <tr v-for="q in questions" :key="q.task_id" :class="{ 'fixed-row': getSourceType(q) === 'fixed' }">
+                    <!-- 題型 -->
+                    <td>
+                      <span v-if="getSourceType(q) === 'fixed'" class="pin-badge">固定題</span>
+                      <span v-else class="ai-badge">AI題</span>
+                    </td>
 
-                      <button
-                        v-if="q.status !== 'published'"
-                        class="pillBtn publish"
-                        @click="publish(q)"
-                      >
-                        發布
-                      </button>
+                    <!-- 題目代號 -->
+                    <td class="mono">
+                      {{ getTaskCode(q) }}
+                      <div class="sub" v-if="q.parent_version">（由 {{ q.parent_version }} 重新生成）</div>
+                    </td>
 
-                      <button
-                        v-else
-                        class="pillBtn unpub"
-                        @click="unpublish(q)"
-                      >
-                        取消發布
-                      </button>
+                    <!-- 來源 -->
+                    <td class="mono">
+                      {{ getSourceType(q) }}
+                    </td>
 
-                      <button class="pillBtn regen" @click="regenerate(q)">重新生成</button>
-                    </div>
-                  </td>
-                  <td>
-                    <button class="noteBtn" @click="openPreview(q)">
-                      📝 {{ q.has_note ? "老師備註" : "—" }}
-                    </button>
-                  </td>
-                </tr>
-              </tbody>
+                    <!-- 建立時間 -->
+                    <td class="mono">
+                      {{ fmtTime(q.created_at) }}
+                    </td>
+
+                    <!-- 狀態 -->
+                    <td>
+                      <span class="dot" :class="dotClass(getStatus(q))"></span>
+                      {{ getStatusZh(q) }}
+                    </td>
+
+                    <!-- 學生可見 -->
+                    <td>
+                      <span v-if="isStudentVisible(q)" class="visible-yes">是</span>
+                      <span v-else class="visible-no">否</span>
+                    </td>
+
+                    <!-- 操作 -->
+                    <td>
+                      <div class="btns">
+                        <button class="pillBtn preview" @click="openPreview(q)">預覽</button>
+
+                        <button
+                          v-if="!isStudentVisible(q)"
+                          class="pillBtn publish"
+                          @click="publish(q)"
+                        >
+                          發布
+                        </button>
+
+                        <button
+                          v-else
+                          class="pillBtn unpub"
+                          @click="unpublish(q)"
+                        >
+                          取消發布
+                        </button>
+
+                        <button
+                          v-if="getSourceType(q) === 'fixed'"
+                          class="pillBtn edit"
+                          @click="openPreview(q)"
+                        >
+                          編輯
+                        </button>
+
+                        <button
+                          v-if="getSourceType(q) !== 'fixed'"
+                          class="pillBtn regen"
+                          @click="regenerate(q)"
+                        >
+                          重新生成
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
             </table>
           </div>
 
@@ -302,7 +330,73 @@
               </div>
             </div>
 
-            <!-- Parsons 區塊 -->
+            
+            <!-- [新增] Traceability：字幕對應證據 -->
+            <div class="pvSection">
+              <div class="pvH">【字幕對應證據（Traceability）】</div>
+              <div class="pvBox">
+                <div class="pvMetaRow">
+                  <div class="pill">
+                    對應字幕時間：{{ fmtTimeRange(previewData) }}
+                  </div>
+                  <div class="pill">
+                    字幕句數：{{ fmtIndexRange(previewData) }}
+                  </div>
+                </div>
+
+                <details v-if="getSubtitleText(previewData)">
+                  <summary>使用字幕內容（點我展開）</summary>
+                  <div style="white-space: pre-line;">{{ getSubtitleText(previewData) }}</div>
+                </details>
+                <div v-else class="hint">（目前沒有保存使用字幕內容）</div>
+              </div>
+            </div>
+
+            <!-- [新增] Rule Check：規則驗證 -->
+            <div class="pvSection">
+              <div class="pvH">【規則驗證】</div>
+              <div class="pvBox">
+                <div class="pvMetaRow">
+                  <div class="pill">單元類型：{{ (previewData?.unit_type || previewData?.meta?.unit_type || "—") }}</div>
+                  <div class="pill">限制條件：{{ fmtConstraints(previewData) }}</div>
+                </div>
+
+                <div class="pvRules" v-if="previewData?.rule_check">
+                  <div class="pvRuleLine">{{ mark(previewData.rule_check.has_for) }} 包含 for</div>
+                  <div class="pvRuleLine">{{ mark(!previewData.rule_check.has_while) }} 未使用 while</div>
+                  <div class="pvRuleLine">{{ mark(previewData.rule_check.has_range) }} 使用 range()</div>
+                  <div class="pvRuleLine">{{ mark(previewData.rule_check.has_accumulate) }} 使用累加 (+= 或 count = count + 1)</div>
+
+                  <div class="pvRuleLine" v-if="previewData.rule_check.has_if !== undefined">
+                    {{ mark(previewData.rule_check.has_if) }} 包含 if
+                  </div>
+                  <div class="pvRuleLine" v-if="previewData.rule_check.has_else !== undefined">
+                    {{ mark(previewData.rule_check.has_else) }} 包含 else
+                  </div>
+                  <div class="pvRuleLine" v-if="previewData.rule_check.has_elif !== undefined">
+                    {{ mark(previewData.rule_check.has_elif) }} 包含 elif
+                  </div>
+
+                  <div class="pvRuleLine" v-if="previewData.rule_check.exec_ok !== undefined">
+                    {{ mark(previewData.rule_check.exec_ok) }} 執行測試
+                  </div>
+                  <div class="pvRuleLine" v-if="previewData.rule_check.compile_ok !== undefined">
+                    {{ mark(previewData.rule_check.compile_ok) }} 編譯檢查
+                  </div>
+
+                  <div class="pvRuleSummary">
+                    整體結果：
+                    <span :class="previewData.rule_check.ok ? 'okText' : 'warnText'">
+                      {{ previewData.rule_check.ok ? "符合教學目標" : "部分符合教學目標" }}
+                    </span>
+                    <span v-if="previewData.rule_check.reason">（{{ previewData.rule_check.reason }}）</span>
+                  </div>
+                </div>
+
+                <div v-else class="hint">（目前沒有 rule_check，請確認後端是否有寫入 rule_check）</div>
+              </div>
+            </div>
+<!-- Parsons 區塊 -->
             <div class="pvSection">
               <div class="pvH">Parsons 區塊（AI 生成｜逐區塊中文語意）</div>
               <div class="pvGrid">
@@ -428,27 +522,37 @@
 import { ref, reactive, watch, onMounted, computed } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "../api";
+import TeacherSidebar from "../components/TeacherSidebar.vue";
 
 // ✅ Teacher T5 API base（有些版本用 /api/teacher/t5，有些用 /api/teacher_t5）
 const T5_BASE_PRIMARY = "/api/teacher_t5";
 const T5_BASE_FALLBACK = "/api/teacher_t5";
 
+// [新增] 避免 AI 生成/預覽超過 15 秒造成前端 axios timeout（ECONNABORTED）
+const T5_TIMEOUT_MS = 120000; // 120s（只影響本頁 teacher_t5 相關請求）
+
+function _withT5Timeout(cfg = {}) {
+  const c = { ...(cfg || {}) };
+  if (c.timeout === undefined || c.timeout === null) c.timeout = T5_TIMEOUT_MS;
+  return c;
+}
+
 async function t5Get(path, config = {}) {
   try {
-    return await api.get(`${T5_BASE_PRIMARY}${path}`, config);
+    return await api.get(`${T5_BASE_PRIMARY}${path}`, _withT5Timeout(config));
   } catch (e) {
     const status = e?.response?.status;
-    if (status === 404) return await api.get(`${T5_BASE_FALLBACK}${path}`, config);
+    if (status === 404) return await api.get(`${T5_BASE_FALLBACK}${path}`, _withT5Timeout(config));
     throw e;
   }
 }
 
 async function t5Post(path, data = {}, config = {}) {
   try {
-    return await api.post(`${T5_BASE_PRIMARY}${path}`, data, config);
+    return await api.post(`${T5_BASE_PRIMARY}${path}`, data, _withT5Timeout(config));
   } catch (e) {
     const status = e?.response?.status;
-    if (status === 404) return await api.post(`${T5_BASE_FALLBACK}${path}`, data, config);
+    if (status === 404) return await api.post(`${T5_BASE_FALLBACK}${path}`, data, _withT5Timeout(config));
     throw e;
   }
 }
@@ -467,6 +571,38 @@ const selectedUnit = ref("");
 const selectedVideo = ref("");
 const selectedSubtitleVersion = ref("");
 
+// ===== [新增] D 區表格顯示 helper =====
+function getSourceType(q) {
+  return q?.source_type || q?.gen_source || "ai";
+}
+
+function getTaskCode(q) {
+  // 固定題優先顯示 task_code，沒有就顯示 FIXED-01
+  if (getSourceType(q) === "fixed") {
+    return q?.task_code || "FIXED-01";
+  }
+  // AI 題優先顯示 version，沒有就 fallback task_code
+  return q?.version || q?.task_code || "v1";
+}
+
+function getStatus(q) {
+  return q?.status || q?.review_status || "pending";
+}
+
+function getStatusZh(q) {
+  const s = getStatus(q);
+
+  if (s === "approved") return "已審核";
+  if (s === "published") return "已發布";
+  if (s === "rejected") return "已退回";
+  if (s === "draft") return "草稿";
+  return "待審核";
+}
+
+function isStudentVisible(q) {
+  // enabled=true 或 status=published 都視為學生可見
+  return !!q?.enabled || getStatus(q) === "published";
+}
 
 // [新增] ===== 後測開放控制（依單元） =====
 const testCycleId = computed(() => (selectedUnit.value || "default").toString().trim());
@@ -513,6 +649,9 @@ const loading = reactive({ units: false, videos: false, videoInfo: false, questi
 const busy = reactive({ regen: false });
 const err = reactive({ a: "", d: "", e: "" });
 
+// 穩定模式：降低 AI 生題隨機性（溫度 0.05），讓同一影片多次生題結果更一致
+const stableMode = ref(false);
+
 const videoInfo = reactive({
   enabled: true,
   subtitle_uploaded: false,
@@ -535,6 +674,88 @@ const modal = reactive({
   err: "",
   data: null
 });
+
+
+// [新增] ===== Traceability / RuleCheck helpers（論文證據呈現）=====
+// timecode regex (00:02:15 or 02:15)
+const _reTC = /^(\d{1,2}:)?\d{2}:\d{2}$/;
+
+function _secToTC(sec) {
+  if (sec === null || sec === undefined || sec === "") return "—";
+  if (typeof sec === "string") {
+    const s = sec.trim();
+    // 已是 timecode
+    if (_reTC.test(s)) return s;
+    const n = Number(s);
+    if (!Number.isNaN(n)) return _secToTC(n);
+    return s || "—";
+  }
+  if (typeof sec !== "number" || Number.isNaN(sec)) return "—";
+  const total = Math.max(0, Math.floor(sec));
+  const hh = Math.floor(total / 3600);
+  const mm = Math.floor((total % 3600) / 60);
+  const ss = total % 60;
+  const pad = (x) => String(x).padStart(2, "0");
+  return hh > 0 ? `${pad(hh)}:${pad(mm)}:${pad(ss)}` : `${pad(mm)}:${pad(ss)}`;
+}
+
+function getSubtitleRange(pd) {
+  // 支援多種欄位命名：subtitle_range / source_subtitle / subtitle_range 包在 source_subtitle 內
+  return (
+    pd?.subtitle_range ||
+    pd?.source_subtitle?.subtitle_range ||
+    pd?.source_subtitle ||
+    null
+  );
+}
+
+function getSubtitleText(pd) {
+  return (
+    pd?.subtitle_text_used ||
+    pd?.source_subtitle?.subtitle_text_used ||
+    pd?.source_subtitle?.text_used ||
+    pd?.source_subtitle?.text ||
+    pd?.text_used ||
+    ""
+  );
+}
+
+function fmtTimeRange(pd) {
+  const r = getSubtitleRange(pd);
+  if (!r) return "—";
+  const a = r.start_ts ?? r.start_time ?? r.start ?? r.start_sec;
+  const b = r.end_ts ?? r.end_time ?? r.end ?? r.end_sec;
+  const sa = _secToTC(a);
+  const sb = _secToTC(b);
+  if (sa === "—" && sb === "—") return "—";
+  return `${sa} – ${sb}`;
+}
+
+function fmtIndexRange(pd) {
+  const r = getSubtitleRange(pd);
+  if (!r) return "—";
+  const a = r.start_index ?? r.start_idx ?? r.start_i;
+  const b = r.end_index ?? r.end_idx ?? r.end_i;
+  if (a === undefined && b === undefined) return "—";
+  if (a !== undefined && b !== undefined) return `第 ${a} 句 – 第 ${b} 句`;
+  return a !== undefined ? `第 ${a} 句` : `第 ${b} 句`;
+}
+
+function fmtConstraints(pd) {
+  const c = pd?.constraints || {};
+  // loop_style / condition requirements
+  if (c.loop_style) return c.loop_style;
+  if (c.require_else) return "ifelse";
+  if (c.require_elif) return "elif";
+  if (c.require_if) return "if";
+  return "—";
+}
+
+function mark(v) {
+  if (v === true) return "✅";
+  if (v === false) return "❌";
+  return "—";
+}
 
 
 async function openPreview(row = null) {
@@ -710,13 +931,52 @@ function goSubtitleCheck() {
 
 // ===== helpers =====
 function fmtTime(iso) {
-  if (!iso) return "—";
-  // 簡單顯示，避免時區問題
-  return iso.replace("T", " ").slice(0, 16);
+  if (!iso) return "";
+
+  // ✅ 如果沒有 Z 或 +08:00，代表它是「假UTC」→ 補 Z
+  const fixedIso = /[zZ]|[+\-]\d{2}:\d{2}$/.test(iso)
+    ? iso
+    : iso + "Z";
+
+  const d = new Date(fixedIso);
+
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(d).replace(" ", " ");
 }
+
+
+// [新增] 將同一影片的題目依「生成時間（舊→新）」編號為 v1, v2, v3…（不改 DB schema）
+function applyVersionSeq(list) {
+  const arr = Array.isArray(list) ? [...list] : [];
+  // created_at 可能是 ISO 字串；用 Date 排序（舊→新）
+  arr.sort((a, b) => new Date(a?.created_at || 0) - new Date(b?.created_at || 0));
+  const id2v = {};
+  arr.forEach((q, i) => {
+    const v = `v${i + 1}`;
+    id2v[q.task_id] = v;
+    q.version = v;
+  });
+  // 若後端有 parent_task_id，但沒有 parent_version，這裡補上顯示用的 parent_version
+  arr.forEach((q) => {
+    if (!q.parent_version && q.parent_task_id && id2v[q.parent_task_id]) {
+      q.parent_version = id2v[q.parent_task_id];
+    }
+  });
+  return arr;
+}
+
 function dotClass(status) {
   return {
+    draft: "dot-gray",
     pending: "dot-yellow",
+    approved: "dot-blue",
     published: "dot-green",
     rejected: "dot-red"
   }[status] || "dot-yellow";
@@ -792,7 +1052,17 @@ async function fetchQuestions() {
         sort: sortOrder.value
       }
     });
-    questions.value = data.items || [];
+    questions.value = (data.items || []).map((q, idx) => ({
+      ...q,
+      source_type: q.source_type || q.gen_source || "ai",
+      review_status: q.review_status || q.status || "pending",
+      task_code: q.task_code || (q.gen_source === "fixed" ? "FIXED-01" : ""),
+      enabled: typeof q.enabled === "boolean" ? q.enabled : (q.status === "published")
+    }));
+
+// [新增] 套用版本序號 v1/v2…（依生成時間舊→新，不改 DB）
+questions.value = applyVersionSeq(questions.value);
+
   } catch {
     err.d = "伺服器連線失敗";
   } finally {
@@ -808,7 +1078,8 @@ async function regenerate() {
     await t5Post("/regenerate", {
       video_id: selectedVideo.value,
       level: "L1", // 不做適性化：固定
-      subtitle_version: selectedSubtitleVersion.value || null
+      subtitle_version: selectedSubtitleVersion.value || null,
+      stable: stableMode.value,
     });
     await fetchQuestions();
   } catch {
@@ -1034,6 +1305,10 @@ watch(selectedUnit, () => {
 
 /* ===== D ===== */
 .d-toolbar { display: flex; gap: 14px; align-items: center; margin-bottom: 10px; }
+
+.pin-badge { display: inline-block; background: #e0f0ff; color: #1a56db; font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: 700; white-space: nowrap; }
+.fixed-row { background: #f5faff; }
+.fixed-row td { border-left: 3px solid #93c5fd; }
 .d-filter { display: flex; gap: 8px; align-items: center; font-weight: 900; font-size: 13px; }
 .d-filter select { padding: 8px 10px; border-radius: 10px; border: 1px solid #d0d0d0; background: #fff; }
 
@@ -1506,6 +1781,91 @@ watch(selectedUnit, () => {
   align-items:center;
   gap:8px;
   flex-wrap:wrap;
+}
+
+/* ===== 穩定模式切換開關 ===== */
+.stable-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1.5px solid #d0d0d0;
+  background: #f7f8fa;
+  cursor: pointer;
+  user-select: none;
+  transition: background .15s ease, border-color .15s ease;
+  font-size: 13px;
+  font-weight: 700;
+}
+.stable-toggle:hover {
+  background: #eef0f5;
+}
+.stable-toggle.stable-on {
+  background: #eff6ff;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+}
+.stable-knob {
+  width: 30px;
+  height: 16px;
+  border-radius: 999px;
+  background: #d0d0d0;
+  position: relative;
+  flex-shrink: 0;
+  transition: background .15s ease;
+}
+.stable-knob::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .15s ease;
+}
+.stable-on .stable-knob {
+  background: #3b82f6;
+}
+.stable-on .stable-knob::after {
+  transform: translateX(14px);
+}
+.stable-label {
+  white-space: nowrap;
+}
+
+/* [新增] 題型 badge */
+.ai-badge {
+  display: inline-block;
+  background: #fff7d6;
+  color: #8a6500;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* [新增] 狀態顏色 */
+.dot-gray { background: #9ca3af; }
+.dot-blue { background: #3b82f6; }
+
+/* [新增] 學生可見 */
+.visible-yes {
+  color: #15803d;
+  font-weight: 900;
+}
+.visible-no {
+  color: #9ca3af;
+  font-weight: 900;
+}
+
+/* [新增] 固定題編輯按鈕 */
+.pillBtn.edit {
+  background: #dbeafe;
+  color: #1d4ed8;
 }
 
 </style>

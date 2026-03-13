@@ -7,10 +7,8 @@ import os
 import json
 import re
 from typing import Any, Dict, Optional, Tuple, List
-from dotenv import load_dotenv
 
-# ✅ 修正：load_dotenv() 必須在所有 os.getenv() 之前執行
-load_dotenv()
+from dotenv import load_dotenv
 
 # OpenAI SDK
 try:
@@ -18,9 +16,15 @@ try:
 except Exception:
     OpenAI = None
 
+print("[AI] start generate", {
+  "enabled": os.environ.get("AI_ENABLED"),
+  "model": os.environ.get("OPENAI_MODEL"),
+  "has_key": bool(os.environ.get("OPENAI_API_KEY")),
+})
 # =========================
 # (A) ENV / 開關
 # =========================
+load_dotenv()
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = (os.getenv(name, "") or "").strip().lower()
@@ -31,7 +35,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 AI_ENABLED = _env_bool("AI_ENABLED", default=False)
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 
 

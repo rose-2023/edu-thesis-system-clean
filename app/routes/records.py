@@ -1,19 +1,13 @@
-# app/routes/records.py
-from flask import Blueprint, request, jsonify
-from datetime import datetime, timezone
+from flask import Blueprint, request, jsonify, Response
 from app.db import db
-from bson import ObjectId
 
 records_bp = Blueprint("records", __name__)
 
-def _utc_now():
-    return datetime.now(timezone.utc)
-
+# =========================================================
+# Students (thesis_system.users)
+# =========================================================
 @records_bp.get("/students")
-def list_students():
-    """
-    GET /api/records/students?class_name=...&page=1&page_size=15
-    """
+def students():
     class_name = (request.args.get("class_name") or "").strip()
     page = int(request.args.get("page") or 1)
     page_size = int(request.args.get("page_size") or 15)
@@ -24,7 +18,7 @@ def list_students():
 
     total = db.users.count_documents(q)
     cursor = (
-        db.users.find(q, {"_id": 0, "password_hash": 0})
+        db.users.find(q, {"_id": 0, "student_id": 1, "name": 1, "class_name": 1, "created_at": 1})
         .sort("created_at", -1)
         .skip((page - 1) * page_size)
         .limit(page_size)
@@ -32,122 +26,107 @@ def list_students():
     students = list(cursor)
     return jsonify({"ok": True, "students": students, "total": total})
 
+
 @records_bp.post("/students/import_csv")
 def import_students_csv():
     """
-    POST /api/records/students/import_csv
-    form-data:
-      - file: CSV 檔
-      - default_password: (optional) 若 CSV 無 password 欄位，統一用這個密碼（可不傳）
-      - default_class_name: (optional) 若 CSV 無 class_name 或為空白，使用這個班級（可不傳）
-    CSV 欄位建議（最少 student_id 即可；其他可選）：
-      student_id,name(optional),class_name(optional),password(optional)
+    匯入 students CSV
+    欄位（最少）：student_id,name,class_name
+    password 可選
+    - 若 CSV 沒 password 且「預設密碼」也沒填：用 student_id 當密碼（避免空密碼）
     """
-    if "users" not in db.list_collection_names():
-        # [新增] 若尚未有 users collection，MongoDB 會在首次 insert 時自動建立
-        pass
+    import io
+    import csv
 
-    f = request.files.get("file")
-    default_password = (request.form.get("default_password") or "").strip()  # [新增]
-    default_class_name = (request.form.get("default_class_name") or "").strip()  # [新增]
-
-    if not f:
+    if "file" not in request.files:
         return jsonify({"ok": False, "message": "missing file"}), 400
 
-    try:
-        raw = f.read()
-        # 嘗試 utf-8-sig（Excel 常見）
-        try:
-            text = raw.decode("utf-8-sig")
-        except Exception:
-            text = raw.decode("utf-8")
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"ok": False, "message": "empty filename"}), 400
 
-        import csv, io
-        reader = csv.DictReader(io.StringIO(text))
+    # [修改] 允許不填（不強制預設密碼）
+    default_password = (request.form.get("default_password") or "").strip()  # [修改]
 
-        # [新增] 最少需要 student_id；class_name / name / password 允許缺
-        fieldnames = set([c.strip() for c in (reader.fieldnames or [])])
-        if "student_id" not in fieldnames:
-            return jsonify({"ok": False, "message": "CSV 欄位缺少：student_id"}), 400
+    raw = f.read()
+    # Excel 常見 UTF-8 BOM
+    text = raw.decode("utf-8-sig", errors="replace")
 
-        from werkzeug.security import generate_password_hash
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"student_id", "name", "class_name"}
+    if not required.issubset(set([h.strip() for h in (reader.fieldnames or [])])):
+        return jsonify({"ok": False, "message": "CSV 欄位需包含 student_id,name,class_name（password 可選）"}), 400
 
-        inserted = 0
-        updated = 0
-        errors = []
+    upserts = 0
+    for row in reader:
+        sid = (row.get("student_id") or "").strip()
+        name = (row.get("name") or "").strip()
+        class_name = (row.get("class_name") or "").strip()
 
-        for i, row in enumerate(reader, start=2):  # header=1
-            sid = (row.get("student_id") or "").strip()
-            name = (row.get("name") or "").strip()
-            cname = (row.get("class_name") or "").strip() or default_class_name  # [新增]
-            pw = (row.get("password") or "").strip()
+        if not sid:
+            continue
 
-            if not sid:
-                errors.append({"line": i, "student_id": sid, "message": "欄位空白（student_id）"})
-                continue
+        pw = (row.get("password") or "").strip()  # [修改]
+        if not pw:
+            pw = default_password or sid  # [新增] CSV 無 password 且未填預設密碼時 → 用 student_id 當密碼
 
-            # [新增] 班級可缺：若仍為空，給保底
-            if not cname:
-                cname = "資工系A"
+        doc = {
+            "student_id": sid,
+            "name": name,
+            "class_name": class_name,
+            "role": "student",
+            "password": pw,
+        }
 
-            # [新增] 密碼可缺：優先 CSV password，其次 default_password，再其次 student_id
-            if not pw:
-                pw = default_password or sid
+        db.users.update_one(
+            {"student_id": sid, "role": "student"},
+            {"$set": doc},
+            upsert=True
+        )
+        upserts += 1
 
-            doc = {
-                "student_id": sid,
-                "name": name or sid,  # [新增] name 可缺，保底用學號
-                "class_name": cname,
-                "role": "student",
-            }
+    return jsonify({"ok": True, "upserts": upserts})
 
-            # 若已存在就不重設密碼（避免覆蓋既有帳密）
-            existing = db.users.find_one({"student_id": sid})
-            if existing:
-                db.users.update_one({"_id": existing["_id"]}, {"$set": {**doc, "updated_at": _utc_now()}})
-                updated += 1
-            else:
-                doc["password_hash"] = generate_password_hash(pw, method="scrypt")
-                doc["created_at"] = _utc_now()
-                doc["updated_at"] = _utc_now()
-                db.users.insert_one(doc)
-                inserted += 1
-
-        return jsonify({"ok": True, "inserted": inserted, "updated": updated, "errors": errors})
-
-    except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 500
 
 @records_bp.get("/students/export_csv")
 def export_students_csv():
     """
-    GET /api/records/students/export_csv?class_name=...
+    匯出 students CSV（Excel 不亂碼）
     """
+    import io
+    import csv
+
     class_name = (request.args.get("class_name") or "").strip()
+
     q = {"role": "student"}
     if class_name:
         q["class_name"] = class_name
 
-    import csv, io
-    from flask import Response
-
-    rows = list(db.users.find(q, {"_id": 0, "password_hash": 0}).sort("created_at", 1))
+    rows = list(db.users.find(q, {"_id": 0, "student_id": 1, "name": 1, "class_name": 1}).sort("student_id", 1))
 
     output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["student_id", "name", "class_name"])
+    w = csv.writer(output)
+    w.writerow(["student_id", "name", "class_name"])
     for r in rows:
-        writer.writerow([r.get("student_id", ""), r.get("name", ""), r.get("class_name", "")])
+        w.writerow([r.get("student_id", ""), r.get("name", ""), r.get("class_name", "")])
 
     csv_text = output.getvalue()
     output.close()
 
+    csv_text = "\ufeff" + csv_text  # [修改] 加 BOM，Excel 開啟不亂碼
+
     return Response(
         csv_text,
         mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=students.csv"},
+        headers={
+            "Content-Disposition": "attachment; filename=students.csv; filename*=UTF-8''students.csv"
+        },
     )
 
+
+# =========================================================
+# Learning events (保留)
+# =========================================================
 @records_bp.get("/learning_events")
 def learning_events():
     participant_id = (request.args.get("participant_id") or "").strip()
@@ -164,80 +143,95 @@ def learning_events():
     events = list(cursor)
     return jsonify({"ok": True, "events": events})
 
-@records_bp.get("/rewatch_stats")
-def rewatch_stats():
-    # 依你專案既有邏輯（保留）
-    return jsonify({"ok": True, "items": []})
 
-@records_bp.get("/class_rewatch_analytics")
-def class_rewatch_analytics():
-    # 依你專案既有邏輯（保留）
-    return jsonify({"ok": True, "items": []})
-
-@records_bp.get("/rewatch_behavior_summary")
-def rewatch_behavior_summary():
-    # 依你專案既有邏輯（保留）
-    return jsonify({"ok": True, "items": []})
+@records_bp.get("/analytics")
+def analytics():
+    return jsonify({"ok": True, "completion_rate": 0, "avg_score": 0, "parsons_completed": 0})
 
 
-# =========================
-# [新增] Export parsons_test_attempts as CSV
-# GET /api/records/test_attempts.csv?class_name=資工系A&test_role=post&test_cycle_id=default
-# test_cycle_id 可留空（留空=不過濾）
-# =========================
-from flask import Response  # [新增]
-import csv  # [新增]
-import io  # [新增]
+# =========================================================
+# ✅ Parsons test attempts export (Excel 不亂碼 + 會補齊學生姓名/班級)
+# =========================================================
+@records_bp.get("/test_attempts.csv")
+def export_parsons_test_attempts_csv():
+    """
+    GET /api/records/test_attempts.csv?test_cycle_id=default&class_name=資工系A
+    匯出 parsons_test_attempts 成 CSV（Excel 不亂碼、含學生姓名/班級）
+    """
+    import io, csv
 
-@records_bp.get("/test_attempts.csv")  # [新增]
-def export_parsons_test_attempts_csv():  # [新增]
-    test_cycle_id = (request.args.get("test_cycle_id") or "").strip()  # [新增] 可空
-    class_name = (request.args.get("class_name") or "").strip()        # [新增] 可空
-    test_role = (request.args.get("test_role") or "").strip().lower()  # [新增] 可空
+    test_cycle_id = (request.args.get("test_cycle_id") or "").strip()
+    class_name = (request.args.get("class_name") or "").strip()
 
-    q = {}  # [新增]
-    if test_cycle_id:  # [新增]
-        q["test_cycle_id"] = test_cycle_id  # [新增]
-    if class_name:  # [新增]
-        q["class_name"] = class_name  # [新增]
-    if test_role in ("pre", "post"):  # [新增]
-        q["test_role"] = test_role  # [新增]
+    q = {}
+    if test_cycle_id:
+        q["test_cycle_id"] = test_cycle_id
 
-    rows = list(db.parsons_test_attempts.find(q).sort("submitted_at", 1))  # [新增]
+    # [新增] class_name 篩選：以 users 反查 student_id，再用 $in 篩選 attempts（因 attempts 可能沒存班級）
+    user_map = {}
+    if "users" in db.list_collection_names():
+        uq = {"role": "student"}
+        if class_name:
+            uq["class_name"] = class_name
+        for u in db.users.find(uq, {"_id": 0, "student_id": 1, "name": 1, "class_name": 1}):
+            sid = str(u.get("student_id") or "")
+            if sid:
+                user_map[sid] = {"name": u.get("name", ""), "class_name": u.get("class_name", "")}
 
-    output = io.StringIO()  # [新增]
-    writer = csv.writer(output)  # [新增]
+        if class_name:
+            ids = list(user_map.keys())
+            if not ids:
+                output = io.StringIO()
+                w = csv.writer(output)
+                w.writerow(["student_id", "class_name", "name", "test_role", "is_correct", "score", "duration_sec", "wrong_indices", "submitted_at"])
+                csv_text = "\ufeff" + output.getvalue()
+                output.close()
+                return Response(
+                    csv_text,
+                    mimetype="text/csv; charset=utf-8",
+                    headers={
+                        "Content-Disposition": "attachment; filename=test_attempts.csv; filename*=UTF-8''test_attempts.csv"
+                    },
+                )
+            q["student_id"] = {"$in": ids}
 
-    writer.writerow([  # [新增]
-        "student_id", "class_name", "name", "test_role",
-        "is_correct", "score", "duration_sec",
-        "wrong_indices", "submitted_at",
-        "test_cycle_id", "test_task_id", "source_task_id"
-    ])
+    cur = db.parsons_test_attempts.find(q).sort([("submitted_at", 1), ("student_id", 1)])
 
-    for r in rows:  # [新增]
-        writer.writerow([  # [新增]
-            r.get("student_id", ""),
-            r.get("class_name", ""),
-            r.get("name", ""),
-            r.get("test_role", ""),
-            r.get("is_correct", ""),
-            r.get("score", ""),
-            r.get("duration_sec", ""),
-            r.get("wrong_indices", ""),
-            r.get("submitted_at", ""),
-            r.get("test_cycle_id", ""),
-            r.get("test_task_id", ""),
-            r.get("source_task_id", ""),
-        ])
+    headers = ["student_id", "class_name", "name", "test_role", "is_correct", "score", "duration_sec", "wrong_indices", "submitted_at"]
+    output = io.StringIO()
+    w = csv.DictWriter(output, fieldnames=headers)
+    w.writeheader()
 
-    csv_text = output.getvalue()  # [新增]
-    output.close()  # [新增]
+    for a in cur:
+        sid = str(a.get("student_id") or "")
+        um = user_map.get(sid, {})
+        wrong = a.get("wrong_indices", [])
+        if isinstance(wrong, list):
+            wrong_str = ",".join([str(x) for x in wrong])
+        else:
+            wrong_str = str(wrong or "")
 
-    csv_text = "\ufeff" + csv_text        # [新增] ✅ Excel 需要 BOM 才不會中文亂碼
+        w.writerow({
+            "student_id": sid,
+            "class_name": a.get("class_name") or um.get("class_name", ""),
+            "name": a.get("name") or um.get("name", ""),
+            "test_role": a.get("test_role", ""),
+            "is_correct": a.get("is_correct", ""),
+            "score": a.get("score", ""),
+            "duration_sec": a.get("duration_sec", ""),
+            "wrong_indices": wrong_str,
+            "submitted_at": a.get("submitted_at", ""),
+        })
+
+    csv_text = output.getvalue()
+    output.close()
+
+    csv_text = "\ufeff" + csv_text  # [修改] BOM + utf-8，Excel 開啟不亂碼
 
     return Response(
         csv_text,
         mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=parsons_test_attempts.csv"}
+        headers={
+            "Content-Disposition": "attachment; filename=test_attempts.csv; filename*=UTF-8''test_attempts.csv"
+        },
     )

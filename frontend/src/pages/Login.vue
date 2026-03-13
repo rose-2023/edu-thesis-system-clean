@@ -13,65 +13,47 @@
       <form @submit.prevent="login" novalidate>
         <div class="field">
           <label for="studentId">學號</label>
-          <div class="inputWrap">
-            <span class="icon" aria-hidden="true">👤</span>
-            <input
-              id="studentId"
-              ref="studentIdInput"
-              v-model="studentId"
-              placeholder="例如：A123456789"
-              autocomplete="username"
-              inputmode="text"
-              :disabled="loading"
-              aria-label="學號"
-            />
-          </div>
-          <p class="hint">提示：可輸入測試帳號或你的學號</p>
+          <input
+            id="studentId"
+            ref="studentIdInput"
+            v-model="studentId"
+            type="text"
+            inputmode="numeric"
+            autocomplete="username"
+            placeholder="例如：11461102"
+            :disabled="loading"
+          />
         </div>
 
         <div class="field">
           <label for="password">密碼</label>
-          <div class="inputWrap">
-            <span class="icon" aria-hidden="true">🔒</span>
-
+          <div class="pwd">
             <input
               id="password"
               v-model="password"
               :type="showPwd ? 'text' : 'password'"
-              placeholder="請輸入密碼"
               autocomplete="current-password"
+              placeholder="請輸入密碼"
               :disabled="loading"
-              aria-label="密碼"
             />
-
-            <!-- ✅ 教學重點：可視化密碼（減少打錯） -->
-            <button
-              class="iconBtn"
-              type="button"
-              @click="showPwd = !showPwd"
-              :disabled="loading"
-              :aria-label="showPwd ? '隱藏密碼' : '顯示密碼'"
-              :title="showPwd ? '隱藏密碼' : '顯示密碼'"
-            >
-              {{ showPwd ? "🙈" : "👁️" }}
+            <button type="button" class="toggle" @click="showPwd = !showPwd" :disabled="loading">
+              {{ showPwd ? "隱藏" : "顯示" }}
             </button>
           </div>
         </div>
 
-        <!-- ✅ 教學重點：提交按鈕 disabled 條件要包含 loading + 欄位檢查 -->
+        <div v-if="error" class="error">{{ error }}</div>
+
         <button class="btn" type="submit" :disabled="loading || !canSubmit">
-          <span v-if="!loading">登入</span>
-          <span v-else>登入中…</span>
+          <span v-if="loading">登入中…</span>
+          <span v-else>登入</span>
         </button>
-
-        <!-- ✅ 教學重點：錯誤訊息用 role=alert（無障礙、也更顯眼） -->
-        <p class="error" v-if="error" role="alert">{{ error }}</p>
       </form>
-    </div>
 
-    <p class="copyright">
-      © {{ new Date().getFullYear() }} Thesis System
-    </p>
+      <div class="hint">
+        <p>提示：如果你忘記密碼，請聯絡老師。</p>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -90,6 +72,9 @@ const showPwd = ref(false);
 
 const studentIdInput = ref(null);
 
+// [新增] 測驗週期（你現在用 default）
+const DEFAULT_TEST_CYCLE_ID = "default"; // [新增]
+
 // ✅ 教學重點：可提交條件集中管理
 const canSubmit = computed(() => {
   const sid = (studentId.value || "").trim();
@@ -100,6 +85,27 @@ const canSubmit = computed(() => {
 function setError(msg) {
   error.value = msg || "";
 }
+
+// [新增] 登入成功後：若前測開放且未完成 → 強制導前測
+async function maybeRedirectToPretest(sid) { // [新增]
+  try { // [新增]
+    const sres = await api.get("/api/parsons/test/status", { // [新增]
+      params: { student_id: sid, test_cycle_id: DEFAULT_TEST_CYCLE_ID }, // [新增]
+    }); // [新增]
+    const sdata = sres?.data; // [新增]
+    if (sdata?.ok && sdata?.pre_open && !sdata?.pre_done) { // [新增]
+      router.replace({ // [新增]
+        path: "/posttest/parsons", // [新增]
+        query: { mode: "test", test_role: "pre", test_cycle_id: DEFAULT_TEST_CYCLE_ID }, // [新增]
+      }); // [新增]
+      return true; // [新增]
+    } // [新增]
+  } catch (e) { // [新增]
+    // 失敗就不要擋路，回到原本流程
+    console.warn("pretest status check failed:", e); // [新增]
+  } // [新增]
+  return false; // [新增]
+} // [新增]
 
 async function login() {
   setError("");
@@ -133,11 +139,16 @@ async function login() {
 
     const role = res.data?.role || "student";
 
-    // ✅ 只導一次：老師→admin dashboard；學生→precheck/home
+    // ✅ 只導一次：老師→admin dashboard；學生→（先檢查是否要前測）→home/precheck
     if (role === "teacher" || role === "admin") {
       router.replace("/admin/dashboard");
     } else {
-      router.replace("/precheck");
+      // [新增] 先導前測（若需要）
+      const redirected = await maybeRedirectToPretest(sid); // [新增]
+      if (redirected) return; // [新增]
+
+      // [修改] 原本固定 /precheck：你可以選擇要 /home 或 /precheck
+      router.replace("/precheck"); // [修改]
     }
   } catch (e) {
     // ✅ 教學重點：把常見錯誤變成「人看得懂」的訊息
@@ -169,145 +180,123 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.page{
+.page {
   min-height: 100vh;
   display: grid;
   place-items: center;
-  padding: 28px 16px;
+  background: #f6f7fb;
+  padding: 24px;
+  box-sizing: border-box;
 }
 
-.card{
-  width: 100%;
-  max-width: 420px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 22px 22px 18px;
-  backdrop-filter: blur(6px);
+.card {
+  width: min(520px, 100%);
+  background: #fff;
+  border: 1px solid #eee;
+  border-radius: 18px;
+  padding: 26px;
+  box-sizing: border-box;
 }
 
-.header{
+.header {
   display: flex;
-  gap: 12px;
+  gap: 14px;
   align-items: center;
   margin-bottom: 18px;
 }
 
-.logo{
-  width: 44px;
-  height: 44px;
+.logo {
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  background: #f0f3ff;
   display: grid;
   place-items: center;
-  border-radius: 12px;
-  background: rgba(99,102,241,.10);
-  border: 1px solid rgba(99,102,241,.18);
   font-size: 22px;
 }
 
-h1{
+h1 {
   margin: 0;
   font-size: 20px;
-  letter-spacing: .2px;
 }
 
-.header p{
-  margin: 2px 0 0;
-  font-size: 13px;
-  color: var(--muted);
+p {
+  margin: 6px 0 0;
+  color: #666;
+  font-size: 14px;
 }
 
-.field{ margin: 14px 0; }
+.field {
+  margin-top: 14px;
+}
 
-label{
+label {
   display: block;
-  font-size: 12px;
-  color: var(--muted);
+  font-size: 13px;
+  color: #333;
   margin-bottom: 6px;
 }
 
-.hint{
-  margin: 6px 2px 0;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.inputWrap{
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
+input {
+  width: 100%;
+  padding: 12px 12px;
+  border: 1px solid #ddd;
   border-radius: 12px;
-  border: 1px solid var(--border);
-  background: rgba(255,255,255,.65);
-  transition: border .15s, box-shadow .15s, transform .05s;
-}
-
-.inputWrap:focus-within{
-  border-color: rgba(99,102,241,.55);
-  box-shadow: 0 0 0 4px rgba(99,102,241,.12);
-}
-
-.icon{ opacity: .75; }
-
-input{
-  border: none;
+  font-size: 14px;
   outline: none;
-  width: 100%;
-  background: transparent;
-  font-size: 14px;
-  color: var(--text);
+  box-sizing: border-box;
 }
 
-.iconBtn{
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 16px;
-  opacity: .85;
-  padding: 2px 6px;
-  border-radius: 10px;
-}
-.iconBtn:hover{ background: rgba(0,0,0,.05); }
-.iconBtn:disabled{
-  cursor: not-allowed;
-  opacity: .5;
+input:focus {
+  border-color: #8fa8ff;
 }
 
-.btn{
-  width: 100%;
-  border: none;
-  border-radius: 12px;
-  padding: 11px 12px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 14px;
-  color: white;
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%);
-  box-shadow: 0 10px 18px rgba(99,102,241,.22);
-  transition: transform .06s, filter .15s, opacity .15s;
+.pwd {
+  display: flex;
+  gap: 10px;
+  align-items: center;
 }
 
-.btn:hover{ filter: brightness(1.02); }
-.btn:active{ transform: translateY(1px); }
-.btn:disabled{
-  opacity: .65;
-  cursor: not-allowed;
-}
-
-.error{
-  margin: 10px 0 0;
-  font-size: 13px;
-  color: #b91c1c;
-  background: rgba(185,28,28,.08);
-  border: 1px solid rgba(185,28,28,.18);
+.toggle {
   padding: 10px 12px;
   border-radius: 12px;
+  border: 1px solid #ddd;
+  background: #fff;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
-.copyright{
+.error {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #fff3f3;
+  border: 1px solid #ffd1d1;
+  color: #b00020;
+  font-size: 14px;
+}
+
+.btn {
+  width: 100%;
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: none;
+  background: linear-gradient(90deg, #7c8cff, #ff8ac5);
+  color: #fff;
+  font-weight: 800;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.hint {
   margin-top: 14px;
-  font-size: 12px;
-  color: var(--muted);
+  color: #777;
+  font-size: 13px;
 }
 </style>

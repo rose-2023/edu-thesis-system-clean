@@ -1,6 +1,7 @@
-from .parsons import create_task_for_video
+from .parsons_service import create_task_for_video
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timezone
+import re  # [新增] 用於 version 遞增解析
 from bson import ObjectId
 from ..db import db
 
@@ -116,29 +117,69 @@ def questions():
 
     q = {"video_id": vid}
 
-    # 狀態過濾
-    if status and status != "all":
-        # 前端可能傳 pending / published / rejected
-        q["status"] = status
-
     # 排序
     sort_dir = -1 if sort == "newest" else 1
 
     items = []
     for t in db.parsons_tasks.find(q).sort("created_at", sort_dir):
         enabled = bool(t.get("enabled", False))
-        st = (t.get("status") or ("published" if enabled else "pending")).strip().lower()
+
+        # ===== 統一來源 =====
+        source_type = (
+            (t.get("source_type") or "").strip().lower()
+            or (t.get("gen_source") or "").strip().lower()
+            or ("ai" if bool(t.get("ai_generated")) else "fixed")
+        )
+
+        # ===== 統一狀態 =====
+        raw_status = (
+            (t.get("status") or "").strip().lower()
+            or (t.get("review_status") or "").strip().lower()
+        )
+
+        # 固定題常見 draft / approved；AI 題常見 pending / published / rejected
+        if not raw_status:
+            raw_status = "published" if enabled else "pending"
+
+        # 前端狀態過濾（統一用 status 比）
+        # all / pending / published / rejected / approved / draft
+        if status != "all" and raw_status != status:
+            continue
+
+        # ===== 題目代號 =====
+        # 固定題優先 task_code，AI 題優先 version
+        if source_type == "fixed":
+            version = (t.get("task_code") or "FIXED-01").strip()
+        else:
+            version = (t.get("version") or t.get("task_code") or "v1").strip()
+
+        # ===== 顯示用中文狀態 =====
+        status_zh_map = {
+            "draft": "草稿",
+            "pending": "待審核",
+            "approved": "已審核",
+            "published": "已發布",
+            "rejected": "已退回",
+        }
+        status_zh = status_zh_map.get(raw_status, raw_status or "待審核")
 
         items.append({
             "task_id": str(t["_id"]),
-            "version": t.get("version", "v1"),
-            "status": st,
-            "status_zh": _status_zh(st),
-            "enabled": enabled,                  # 列表顯示用
-            "student_visible": enabled,          # 預覽用（跟前端一致）
+            "version": version,                         # 前端目前 D 區用這個欄位顯示題目代號
+            "task_code": t.get("task_code", ""),       # [新增] 給前端新表格用
+            "title": t.get("title") or t.get("video_title") or "",
+            "status": raw_status,
+            "status_zh": status_zh,
+            "enabled": enabled,
+            "student_visible": enabled,
             "created_at": _safe_iso(t.get("created_at")),
             "segment_label": t.get("segment_label", "—"),
             "has_note": bool((t.get("review_note") or "").strip()),
+            "gen_source": source_type,                 # 前端目前用 q.gen_source 判斷 fixed / ai
+            "source_type": source_type,                # [新增] 給新表格欄位直接用
+            "review_status": (t.get("review_status") or "").strip().lower(),
+            "parent_version": t.get("parent_version"),
+            "parent_task_id": str(t.get("parent_task_id")) if t.get("parent_task_id") else "",
         })
 
     return jsonify({"ok": True, "items": items})
@@ -279,6 +320,21 @@ def get_question():
         "distractor_blocks": distractor_blocks,
         "solution_order": solution_order,
 
+        # [新增] 可追溯/可控管
+        "unit_type": t.get("unit_type", None),
+        "constraints": t.get("constraints", None),
+        "rule_check": t.get("rule_check", None),
+        "source_subtitle": t.get("source_subtitle", None),
+        "subtitle_range": {
+            "start_index": (t.get("source_subtitle") or {}).get("start_index"),
+            "end_index": (t.get("source_subtitle") or {}).get("end_index"),
+        },
+        "subtitle_text_used": (t.get("source_subtitle") or {}).get("text_used", ""),
+        "subtitle_time_range": {
+            "start_ts": (t.get("source_subtitle") or {}).get("start_ts"),
+            "end_ts": (t.get("source_subtitle") or {}).get("end_ts"),
+        },
+
         "template_slots": template_slots,  # [新增] 方便老師端/除錯需要
         # 老師審核
         "review_tags": t.get("review_tags", []) or [],
@@ -410,24 +466,44 @@ def regenerate():
 
     try:
         # [修改] 呼叫 parsons.py 的核心邏輯，這會讀取字幕並送往 OpenAI
+        print(f"[teacher_t5.regenerate] video_id={video_id} unit={video_doc.get('unit')} level={level}")
         doc, gen_source, gen_error, env = create_task_for_video(
-            video_doc=video_doc, 
-            video_id_str=str(video_id), 
-            level=level
+            video_doc=video_doc,
+            video_id_str=str(video_id),
+            level=level,
         )
+        print(f"[teacher_t5.regenerate] gen_source={gen_source} gen_error={gen_error} task_id={doc.get('_id')}")
 
         # [新增] 為了配合老師端的預覽介面，統一狀態欄位
+        # [修正] version 不要固定 v1.AI，改為同影片同 level 的遞增序號 v1/v2/v3...
+        try:
+            cur = db.parsons_tasks.find({
+                "video_id": video_oid,
+                "level": level,
+            }, {"version": 1})
+            max_v = 0
+            for it in cur:
+                v = str(it.get("version") or "")
+                m = re.match(r"^v(\d+)", v)
+                if m:
+                    max_v = max(max_v, int(m.group(1)))
+            next_version = f"v{max_v + 1}" if max_v > 0 else "v1"
+        except Exception:
+            next_version = "v1"
         db.parsons_tasks.update_one({"_id": doc["_id"]}, {"$set": {
             "status": "pending",
-            "enabled": False, # 預設不發布，待老師審核
-            "version": "v1.AI",
-            "updated_at": _utc_now()
+            "enabled": False,  # 預設不發布，待老師審核
+            "version": next_version,
+            "updated_at": _utc_now(),
         }})
 
         return jsonify({
             "ok": True,
             "task_id": str(doc["_id"]),
-            "message": "AI 題目已生成為待審核版本"
+            "message": "AI 題目已生成為待審核版本",
+            "gen_source": gen_source,
+            "gen_error": gen_error,
+            "env": env,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": f"AI 生成失敗: {str(e)}"}), 500

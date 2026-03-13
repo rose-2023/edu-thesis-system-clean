@@ -1,5 +1,7 @@
 <template>
   <div class="page">
+    <TeacherSidebar active="upload" />
+
     <div class="card">
       <h2>老師端：上傳影片</h2>
 
@@ -194,6 +196,7 @@
 import { ref, computed, onMounted } from "vue";
 import { api } from "../api";
 import { useRoute, useRouter } from "vue-router";
+import TeacherSidebar from "../components/TeacherSidebar.vue";
 
 
 
@@ -572,8 +575,17 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f6f7fb; }
-.card { width: 100%; max-width: 90%; border: 1px solid #e6e6e6; border-radius: 16px; padding: 18px; background: #fff; box-shadow: 0 6px 26px rgba(0,0,0,.05); }
+.page {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 16px;
+  align-items: start;
+  padding: 0px;
+  background: #f6f7fb;
+}
+
+.card { width: 100%; border: 1px solid #e6e6e6; border-radius: 16px; padding: 18px; background: #fff; box-shadow: 0 6px 26px rgba(0,0,0,.05); }
 .row { margin: 12px 0; display: flex; flex-direction: column; gap: 6px; }
 input, textarea { padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
 .btn { width: 100%; padding: 10px; border: 0; border-radius: 10px; cursor: pointer; background: #111827; color: #fff; }
@@ -684,6 +696,16 @@ input, textarea { padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
 .subErrList{ margin: 0; padding-left: 18px; color:#991b1b; font-size: 13px; }
 
 @media (max-width: 860px) {
+  .page {
+    grid-template-columns: 1fr;
+    padding: 12px;
+  }
+
+  .sidebar {
+    min-height: auto;
+    position: static;
+  }
+
   .thead { display: none; }
   .rowItem { grid-template-columns: 1fr; }
   .thumbWrap{ height: 180px; }

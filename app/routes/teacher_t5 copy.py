@@ -164,13 +164,101 @@ def get_question():
 
     # 兼容多種欄位命名（你之前有 mock / 也可能是 AI 代理寫入）
     question = t.get("question", {}) or {}
-    prompt = question.get("prompt") or t.get("prompt") or ""
+    prompt = (question.get("prompt") or t.get("prompt") or t.get("question_text") or "")  # [新增] 支援 DB 的 question_text
 
     # solution_blocks / distractor_blocks / solution_order
     solution_blocks = t.get("solution_blocks", []) or t.get("blocks", []) or []
     distractor_blocks = t.get("distractor_blocks", []) or t.get("distractors", []) or []
     solution_order = t.get("solution_order", []) or t.get("solution_ids", []) or []
 
+    solution_order = t.get("solution_order", []) or t.get("solution_ids", []) or []
+
+
+    # =========================================================
+    # [新增] 若 DB 沒有 solution_order，則用 solution_blocks 的順序自動補上（老師端顯示解答順序用）
+    # =========================================================
+    if (not solution_order) and isinstance(solution_blocks, list):
+        _ids = []
+        for _b in solution_blocks:
+            if isinstance(_b, dict):
+                _bid = _b.get("id") or _b.get("_id")
+                if _bid is not None:
+                    _ids.append(str(_bid))
+        solution_order = _ids
+
+    # =========================================================
+    # [新增] 確保 template_slots 一定存在（老師端中文語意來源）
+    # - 有些舊題/部分生成流程可能缺少 template_slots
+    # - 這裡只做「回傳層」補齊，不寫回 DB，避免影響既有資料
+    # =========================================================
+    template_slots = t.get("template_slots", []) or []
+    if (not isinstance(template_slots, list)) or len(template_slots) == 0:
+        def _infer_label(code_line: str) -> str:
+            s = (code_line or "").strip().lower()
+            if "input(" in s:
+                if "int(" in s:
+                    return "讀入輸入並轉為整數"
+                if "float(" in s:
+                    return "讀入輸入並轉為浮點數"
+                return "讀入使用者輸入"
+            if s.startswith("for ") or " in range(" in s:
+                return "迴圈處理/重複運算"
+            if s.startswith("while ") or "while " in s:
+                return "迴圈直到條件成立"
+            if s.startswith("if ") or s.startswith("elif ") or s.startswith("else"):
+                return "條件判斷分支"
+            if "print(" in s:
+                return "輸出結果"
+            if any(op in s for op in ["+=", "-=", "*=", "/="]):
+                return "更新累加/計算結果"
+            if "=" in s:
+                return "設定/更新變數"
+            if "return " in s:
+                return "回傳結果"
+            return "完成此步驟"
+
+        _ts = []
+        if isinstance(solution_blocks, list) and len(solution_blocks) > 0:
+            for idx, b in enumerate(solution_blocks):
+                txt = b.get("text", "") if isinstance(b, dict) else ""
+                _ts.append({"slot": str(idx), "label": _infer_label(txt)})
+        template_slots = _ts
+
+    # =========================================================
+    # [新增] 把 template_slots 的 label 映射回 solution_blocks 的 semantic_zh（老師端顯示中文語意）
+    # - 依照 solution_order 的順序：slot 0 -> 第 1 個 block ...
+    # =========================================================
+    try:
+        slot_map = {}
+        if isinstance(solution_order, list) and isinstance(template_slots, list):
+            for idx, bid in enumerate(solution_order):
+                if idx >= len(template_slots):
+                    break
+                s = template_slots[idx] if isinstance(template_slots[idx], dict) else {}
+                label = (
+                    (s.get("label") if isinstance(s, dict) else None)
+                    or (s.get("meaning_zh") if isinstance(s, dict) else None)
+                    or (s.get("semantic_zh") if isinstance(s, dict) else None)
+                    or (s.get("zh") if isinstance(s, dict) else None)
+                    or ""
+                )
+                if label:
+                    slot_map[str(bid)] = label
+
+        if slot_map and isinstance(solution_blocks, list):
+            _new = []
+            for b in solution_blocks:
+                if not isinstance(b, dict):
+                    _new.append(b)
+                    continue
+                bid = str(b.get("id") or b.get("_id") or "")
+                if bid and bid in slot_map:
+                    if not (b.get("semantic_zh") or b.get("semantic") or b.get("zh") or b.get("meaning_zh")):
+                        b["semantic_zh"] = slot_map[bid]
+                _new.append(b)
+            solution_blocks = _new
+    except Exception:
+        pass
     return jsonify({
         "ok": True,
         "task_id": str(t["_id"]),
@@ -191,6 +279,7 @@ def get_question():
         "distractor_blocks": distractor_blocks,
         "solution_order": solution_order,
 
+        "template_slots": template_slots,  # [新增] 方便老師端/除錯需要
         # 老師審核
         "review_tags": t.get("review_tags", []) or [],
         "review_note": t.get("review_note", "") or "",

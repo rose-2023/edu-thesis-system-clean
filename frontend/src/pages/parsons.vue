@@ -81,28 +81,55 @@
       </button>
     </div>
 
-    <!-- 回饋 -->
-    <div v-if="result?.feedback" class="result" :class="{ ok: result?.is_correct }">
-      {{ result.feedback }}
-    </div>
+    <!-- 回饋（測驗模式不顯示） -->
+    <template v-if="!isTestMode">
+      <div v-if="state.err && !state.noTask" class="result">
+        {{ state.err }}
+      </div>
+    </template>
 
-    <div v-if="state.err && !state.noTask" class="result">
-      {{ state.err }}
+    <!-- 錯誤回饋 Modal（練習模式） -->
+    <div
+      v-if="feedbackModal.open"
+      class="fb-modal-backdrop"
+      @click.self="dismissFeedbackModal"
+    >
+      <div class="fb-modal" role="dialog" aria-modal="true" aria-label="作答回饋">
+        <div class="fb-title">❌ 你錯在：{{ feedbackModal.slotLabel }}</div>
+
+        <div class="fb-section">
+          <div class="fb-label">診斷結果</div>
+          <div class="fb-text">{{ feedbackModal.diagnosis }}</div>
+        </div>
+
+        <div class="fb-section">
+          <div class="fb-label">概念提示</div>
+          <div class="fb-text">{{ feedbackModal.conceptHint }}</div>
+        </div>
+
+        <div class="fb-section">
+          <div class="fb-label">請你反思</div>
+          <ol class="fb-list">
+            <li v-for="(q, i) in feedbackModal.reflectionQuestions" :key="`${i}-${q}`">{{ q }}</li>
+          </ol>
+        </div>
+
+        <div class="fb-section fb-review">
+          <div class="fb-label">建議回看影片時間軸</div>
+          <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
+        </div>
+
+        <div class="fb-actions">
+          <button class="btn ghost" @click="dismissFeedbackModal">稍後再看</button>
+          <button class="btn submit" @click="goReviewFromModal">前往複習片段</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-/**
- * 這支 script 主要做 5 件事：
- * 1) 從後端載入「已發布」的 parsons 題目與片段池
- * 2) 讓學生拖曳片段到左邊的格子（filled）
- * 3) 送出作答到 /api/parsons/submit，拿到對錯與錯誤位置
- * 4) 若答錯：跳出 confirm 問「要不要回 learning 看影片片段？」
- * 5) 若要回看：先把目前作答狀態存到 localStorage，回來能繼續做
- */
-
-import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } from "vue"; // [新增]
+import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 const API_BASE = "http://127.0.0.1:5000";
@@ -111,41 +138,43 @@ const route = useRoute();
 const router = useRouter();
 
 // ==============================
-// 新增：測驗計數器（不影響既有練習模式）
-
-const testStartedAt = ref(Date.now()); // 開始時間（毫秒）
-const durationSec = ref(0);            // 耗時（秒）
+// 測驗計數器
+const testStartedAt = ref(Date.now());
+const durationSec = ref(0);
 
 onMounted(() => {
   testStartedAt.value = Date.now();
 });
 
 // ==============================
-// ✅ [新增] V1.8：前/後測模式參數（不影響既有練習模式）
+// V1.8：前/後測模式參數
 // ==============================
-const isTestMode = computed(() => String(route.query.mode || "") === "test"); // [新增]
-const testRole = computed(() => String(route.query.test_role || "pre").toLowerCase()); // [新增]
-const testCycleId = computed(() => String(route.query.test_cycle_id || "default")); // [新增]
-const studentId = computed(() => String(localStorage.getItem("student_id") || "").trim()); // [新增]
+const isTestMode = computed(() => String(route.query.mode || "") === "test");
+const testRole = computed(() => String(route.query.test_role || "pre").toLowerCase());
+const testCycleId = computed(() => String(route.query.test_cycle_id || "default"));
+const studentId = computed(() => String(localStorage.getItem("student_id") || "").trim());
 
-const testMeta = reactive({ // [新增]
+// AI 回饋（練習模式用）
+const aiFeedbackDetail = ref(null);
+const aiConceptExplanation = ref("");
+const aiPossibleCauses = ref([]);
+const aiImpact = ref("");
+const aiGuidingQuestion = ref("");
+
+const testMeta = reactive({
   test_task_id: "",
   source_task_id: "",
   started_at_ms: 0,
-  total: 1, // [新增]
-  current_index: 1, // [新增]
-  request_index: 1, // [新增]
+  total: 1,
+  current_index: 1,
+  request_index: 1,
 });
 
-
-/** ✅【新增】兼容不同 router param 命名，避免 videoId 取不到導致白畫面 */
 const videoId = computed(() => {
   return String(route.params.videoId || route.params.id || route.params.video_id || "");
 });
 
-/** ✅【新增】從 learning 回來的回看 attempt id（用於 submit 時更新 followup） */
 const review_attempt_id = computed(() => {
-  // // [新增]
   const a = route.query.review_attempt_id ? String(route.query.review_attempt_id) : "";
   const b = route.query.attempt_id ? String(route.query.attempt_id) : "";
   return a || b;
@@ -157,76 +186,67 @@ const poolBlocks = ref([]);
 const templateSlots = ref([]);
 
 // ====== 拖曳狀態 ======
-const dragging = ref(null);   // { block, fromSlotKey }
-const overSlot = ref(null);   // slotKey（字串）
-const filled = reactive({});  // ✅【修正】key 統一用 slot.slot（字串） => filled[slotKey] = block
+const dragging = ref(null);
+const overSlot = ref(null);
+const filled = reactive({});
 
-// [新增] V1.4：固定顯示中文提示（slot.label），避免拖進去的 block.meaning_zh 覆蓋 slot.label
 function normalizeFilledBlock(block) {
   if (!block) return null;
   return { ...block, meaning_zh: "" };
 }
 
 // ==============================
-// ✅ [新增] V1.4：Tab / Space / Backspace 控制「框」縮排
-//   - Tab：退四格（INDENT_STEP_PX）
-//   - Space：退一格（INDENT_UNIT_PX）
-//   - Backspace：回退一格（INDENT_UNIT_PX）
-//   - 上限：最多 8 格（INDENT_MAX_PX = INDENT_STEP_PX * 2）
+// V1.4：Tab / Space / Backspace 控制縮排
 // ==============================
-const activeSlotKey = ref(null); // [新增]
+const activeSlotKey = ref(null);
+const slotIndentLevel = reactive({});
 
-// ⚠️ 不改既有變數名稱：slotIndentLevel 保留，但內部改存「px」
-// slotKey -> px
-const slotIndentLevel = reactive({}); // [修改]
+let _blankCleanupFns = [];
+let _docKeydownHandler = null;
 
-let _blankCleanupFns = [];     // [新增]
-let _docKeydownHandler = null; // [新增]
+const INDENT_STEP_PX = 24;
+const INDENT_UNIT_PX = Math.max(1, Math.round(INDENT_STEP_PX / 4));
+const INDENT_MAX_PX = INDENT_STEP_PX * 2;
+const INDENT_MAX_LEVEL = 2;
 
-const INDENT_STEP_PX = 24; // Tab：退四格（你可自行調整）
-const INDENT_UNIT_PX = Math.max(1, Math.round(INDENT_STEP_PX / 4)); // [新增] Space/Backspace：退一格
-const INDENT_MAX_PX = INDENT_STEP_PX * 2; // [新增] 最多退 2 次（8 格）
-// 保留舊常數（不破壞既有邏輯/相容性）
-const INDENT_MAX_LEVEL = 2; // [保留]
-
-function setActiveSlotKey(k) { // [新增]
+function setActiveSlotKey(k) {
   if (k == null) return;
   activeSlotKey.value = String(k);
 }
 
-function clampIndentPx(px) { // [新增]
+function clampIndentPx(px) {
   const n = Number(px || 0);
   return Math.max(0, Math.min(INDENT_MAX_PX, n));
 }
 
-async function applyIndentStylesToDOM() { // [修改]
+async function applyIndentStylesToDOM() {
   await nextTick();
   const blanks = Array.from(document.querySelectorAll(".cloze .blank"));
   const slots = templateSlots.value || [];
 
   blanks.forEach((el, idx) => {
     const slotKey = slots[idx]?.slot != null ? String(slots[idx].slot) : null;
-    const pxRaw = slotKey != null ? Number(slotIndentLevel[slotKey] || 0) : 0; // [修改]
-    const px = clampIndentPx(pxRaw); // [修改]
+    const pxRaw = slotKey != null ? Number(slotIndentLevel[slotKey] || 0) : 0;
+    const px = clampIndentPx(pxRaw);
 
     el.style.marginLeft = px ? `${px}px` : "";
     el.style.width = px ? `calc(100% - ${px}px)` : "";
   });
 }
 
-function indentBoxPx(slotKey, deltaPx) { // [新增]
+function indentBoxPx(slotKey, deltaPx) {
   const k = slotKey != null ? String(slotKey) : null;
   if (!k) return false;
 
-  const cur = clampIndentPx(slotIndentLevel[k]); // [修改]
-  const next = clampIndentPx(cur + Number(deltaPx || 0)); // [新增]
+  const cur = clampIndentPx(slotIndentLevel[k]);
+  const next = clampIndentPx(cur + Number(deltaPx || 0));
   if (next === cur) return false;
 
-  slotIndentLevel[k] = next; // [修改]
+  slotIndentLevel[k] = next;
   return true;
 }
 
-function pickTargetSlotKey() { // [新增]
+function pickTargetSlotKey() {
   const a = activeSlotKey.value != null ? String(activeSlotKey.value) : "";
   if (a) return a;
 
@@ -235,12 +255,9 @@ function pickTargetSlotKey() { // [新增]
   return null;
 }
 
-async function bindBlankFocusHandlers() { // [新增]
-  // 清掉舊綁定
+async function bindBlankFocusHandlers() {
   try {
-    (_blankCleanupFns || []).forEach((fn) => {
-      try { fn(); } catch (_) {}
-    });
+    (_blankCleanupFns || []).forEach((fn) => { try { fn(); } catch (_) {} });
   } catch (_) {}
   _blankCleanupFns = [];
 
@@ -250,7 +267,7 @@ async function bindBlankFocusHandlers() { // [新增]
   if (!blanks.length) return;
 
   blanks.forEach((el, idx) => {
-    el.setAttribute("tabindex", "0"); // 讓框可 focus
+    el.setAttribute("tabindex", "0");
 
     const onFocus = () => {
       const slot = (templateSlots.value || [])[idx];
@@ -282,30 +299,41 @@ const state = reactive({
   err: "",
 });
 
+const feedbackModal = reactive({
+  open: false,
+  slotLabel: "",
+  diagnosis: "",
+  conceptHint: "",
+  reflectionQuestions: [],
+  reviewRange: "（未提供）",
+  start: null,
+  end: null,
+  jumpVideoId: "",
+  attemptId: "",
+  reviewAttemptId: "",
+  taskId: "",
+});
+
 // ========= localStorage 暫存 =========
 const PRACTICE_STATE_KEY = "parsons_practice_state_v1";
 const RESTORE_ONCE_KEY = "parsons_restore_once_v1";
 const RESTORE_MSG_KEY = "parsons_restore_msg_v1";
 
-/** ✅【修正】清空作答（filled 的 key 是 slotKey，不是 idx） */
 function resetFilled() {
   for (const k of Object.keys(filled)) delete filled[k];
   wrongIndices.value = [];
   result.value = null;
   state.err = "";
 
-  // [新增] 清掉縮排狀態
-  for (const k of Object.keys(slotIndentLevel)) delete slotIndentLevel[k]; // [新增]
-  activeSlotKey.value = null; // [新增]
+  for (const k of Object.keys(slotIndentLevel)) delete slotIndentLevel[k];
+  activeSlotKey.value = null;
 }
 
-/** ✅【修正】右側某個 block 是否已被使用 */
 function isUsed(blockId) {
   return Object.values(filled).some((b) => String(b?.id) === String(blockId));
 }
 
-/** ✅【新增】找出某個 block 目前被放在哪一格（用於避免同一塊出現兩次） */
-function findSlotKeyByBlockId(blockId) { 
+function findSlotKeyByBlockId(blockId) {
   const id = String(blockId);
   for (const [k, v] of Object.entries(filled)) {
     if (String(v?.id) === id) return k;
@@ -333,24 +361,20 @@ function onDrop(slotKey) {
   const payload = dragging.value;
   if (!payload?.block) return;
 
-  // findSlotKeyByBlockId：如果這塊已經在某格了，先清掉（避免同一塊出現兩次）
-  // 判斷：「如果它已經在格子裡，且那個位置不是我現在正要放進去的位置。
   const existedKey = findSlotKeyByBlockId(payload.block.id);
   if (existedKey != null && existedKey !== slotKey) {
-    delete filled[existedKey];  // 舊位置的紀錄刪除
+    delete filled[existedKey];
   }
 
-  // 把積木放進新家（B）時，就把舊家（A）的紀錄清空。
   if (payload.fromSlotKey != null && payload.fromSlotKey !== slotKey) {
     delete filled[payload.fromSlotKey];
   }
 
   filled[slotKey] = normalizeFilledBlock(payload.block);
-  setActiveSlotKey(slotKey); // [新增]
+  setActiveSlotKey(slotKey);
   dragging.value = null;
 }
 
-/** ✅【新增】點 X 移除 */
 function removeFromSlot(slotKey) {
   if (slotKey == null) return;
   delete filled[String(slotKey)];
@@ -360,62 +384,39 @@ function removeFromSlot(slotKey) {
     wrongIndices.value = (wrongIndices.value || []).filter(i => i !== idx);
   }
 
-  // [新增] 移除該格縮排（框回到原位）
-  delete slotIndentLevel[String(slotKey)]; // [新增]
-  if (String(activeSlotKey.value || "") === String(slotKey)) activeSlotKey.value = null; // [新增]
-  applyIndentStylesToDOM(); // [新增]
+  delete slotIndentLevel[String(slotKey)];
+  if (String(activeSlotKey.value || "") === String(slotKey)) activeSlotKey.value = null;
+  applyIndentStylesToDOM();
 }
 
-/** ✅【修正】answer_ids 必須依 templateSlots 的順序，用 slot.slot 取值 */
 const answer_ids = computed(() => {
   return (templateSlots.value || []).map((s) => filled[String(s.slot)]?.id || null);
 });
 
-// ====== 秒數轉 mm:ss ======
-
 // ==============================
-// ✅ [新增] V1.8：測驗模式 - 送出後自動跳下一題（或結束）
+// V1.8：測驗模式 - 送出後自動跳下一題（或結束）
 // ==============================
-// [新增] V1.8：測驗模式 - 送出後自動跳下一題（或結束）
-//      請確保全檔只有一個 advanceTestAfterSubmit 的實作
-async function advanceTestAfterSubmit() { // // [新增]
+async function advanceTestAfterSubmit() {
   try {
-    // 如果後端有提供 total / current_index，則自動跳下一題
     const total = Number(testMeta.total || 1);
     const cur = Number(testMeta.current_index || 1);
 
-    // 如果只有一題或已經是最後一題 -> 結束測驗（導回 home 或完成頁）
     if (total <= 1 || cur >= total) {
-      // 結束行為：導回 home（或改成你要的完成頁 route）
-      // router.push("/home");
-      // [新增] 若你想導到 PreCheck 完成頁，請改成 router.push("/precheck_done")
-      try { // [新增]
-        if (window?.history?.length > 1) router.back(); // [新增]
-        else router.push("/home"); // [新增]
-      } catch (_) { // [新增]
-        try { // [新增]
-          if (window?.history?.length > 1) router.back(); // [新增]
-          else router.push("/home"); // [新增]
-        } catch (_) { // [新增]
-          try { // [新增]
-      if (window?.history?.length > 1) router.back(); // [新增]
-      else router.push("/home"); // [新增]
-    } catch (_) { // [新增]
-      router.push("/home"); // [新增]
-    } // [新增] // [新增]
-        } // [新增] // [新增]
-      } // [新增]
+      const role = String(testRole.value || "");
+      if (role === "pre") {
+        alert("前測已完成！系統將帶您回首頁。");
+      } else if (role === "post") {
+        alert("後測已完成！感謝您的作答。");
+      }
+      router.replace("/home");
       return;
     }
 
-    // 若還有下一題，嘗試從後端取得下一題資訊（若後端支援）
-    // 範例：呼叫 test/task 並更新 testMeta、task/pool/templateSlots
     try {
       const url = `${API_BASE}/api/parsons/test/task?student_id=${encodeURIComponent(studentId.value)}&test_role=${encodeURIComponent(testRole.value)}&test_cycle_id=${encodeURIComponent(testCycleId.value)}&next_index=${cur + 1}`;
       const resp = await fetch(url);
       if (resp.ok) {
         const j = await resp.json();
-        // 若後端回新的 test_task，更新 meta 與畫面
         testMeta.test_task_id = String(j?.test_task_id || testMeta.test_task_id || "");
         testMeta.source_task_id = String(j?.source_task_id || testMeta.source_task_id || "");
         testMeta.total = j?.total || total;
@@ -426,64 +427,34 @@ async function advanceTestAfterSubmit() { // // [新增]
         poolBlocks.value = norm.pool;
         templateSlots.value = norm.slots;
 
-        // reset state for next question
         resetFilled();
         wrongIndices.value = [];
         result.value = null;
         state.err = "";
         await bindBlankFocusHandlers();
         return;
-      } else {
-        // 後端不支援直接拉下一題 → 轉為結束流程
-        try { // [新增]
-        if (window?.history?.length > 1) router.back(); // [新增]
-        else router.push("/home"); // [新增]
-      } catch (_) { // [新增]
-        try { // [新增]
-          if (window?.history?.length > 1) router.back(); // [新增]
-          else router.push("/home"); // [新增]
-        } catch (_) { // [新增]
-          try { // [新增]
-      if (window?.history?.length > 1) router.back(); // [新增]
-      else router.push("/home"); // [新增]
-    } catch (_) { // [新增]
-      router.push("/home"); // [新增]
-    } // [新增] // [新增]
-        } // [新增] // [新增]
-      } // [新增]
-        return;
       }
     } catch (innerErr) {
-      // 取下一題失敗 → 安全回 home
       console.warn("advanceTestAfterSubmit: fetch next failed", innerErr);
-      try { // [新增]
-        if (window?.history?.length > 1) router.back(); // [新增]
-        else router.push("/home"); // [新增]
-      } catch (_) { // [新增]
-        try { // [新增]
-          if (window?.history?.length > 1) router.back(); // [新增]
-          else router.push("/home"); // [新增]
-        } catch (_) { // [新增]
-          try { // [新增]
-      if (window?.history?.length > 1) router.back(); // [新增]
-      else router.push("/home"); // [新增]
-    } catch (_) { // [新增]
-      router.push("/home"); // [新增]
-    } // [新增] // [新增]
-        } // [新增] // [新增]
-      } // [新增]
-      return;
+    }
+
+    // 後端不支援或失敗 → 回 home
+    try {
+      if (window?.history?.length > 1) router.back();
+      else router.push("/home");
+    } catch (_) {
+      router.push("/home");
     }
   } catch (e) {
     console.error("advanceTestAfterSubmit error", e);
-    try { // [新增]
-      if (window?.history?.length > 1) router.back(); // [新增]
-      else router.push("/home"); // [新增]
-    } catch (_) { // [新增]
-      router.push("/home"); // [新增]
-    } // [新增]
+    try {
+      if (window?.history?.length > 1) router.back();
+      else router.push("/home");
+    } catch (_) {
+      router.push("/home");
+    }
   }
-} // end advanceTestAfterSubmit
+}
 
 function fmtTime(sec) {
   const s = Math.max(0, Math.floor(Number(sec) || 0));
@@ -492,43 +463,128 @@ function fmtTime(sec) {
   return `${mm}:${ss}`;
 }
 
-// 設定「單一時間點」或「時間區段」的回看提示文字，fmtTime轉成【分:秒】
-function fmtReview(r) {
-  if (r?.review_t != null && r?.review_t !== "") {
-    return `${fmtTime(r.review_t)}（${Number(r.review_t)} 秒）`;
-  }
-  if (r?.jump && (r.jump.start != null || r.jump.end != null)) {
-    const s = r.jump.start ?? 0;
-    const e = r.jump.end ?? 0;
-    return `${fmtTime(s)}–${fmtTime(e)}（${Number(s)}–${Number(e)} 秒）`;
-  }
-  return "（未提供）";
+function buildWrongFeedbackParts(r) {
+  const slotLabel = r?.slot_label ? String(r.slot_label) : "（未提供格數）";
+  const startSec = r?.jump?.start ?? r?.review_t ?? null;
+  const endSec = r?.jump?.end ?? null;
+  const reviewRange = (startSec != null && endSec != null)
+    ? `${fmtTime(startSec)}-${fmtTime(endSec)}`
+    : "（未提供）";
+
+  const possibleCauses = Array.isArray(r?.ai_feedback_detail?.possible_causes)
+    ? r.ai_feedback_detail.possible_causes
+        .map((x) => String(x || "").trim())
+        .filter(Boolean)
+    : [];
+
+  const reflectionQuestions = Array.isArray(r?.ai_feedback_detail?.reflection_questions)
+    ? r.ai_feedback_detail.reflection_questions
+        .map((x) => String(x || "").trim())
+        .filter(Boolean)
+        .slice(0, 3)
+    : [];
+
+  const diagnosis =
+    (r?.ai_diagnosis_summary && String(r.ai_diagnosis_summary).trim()) ||
+    (r?.ai_feedback_detail?.concept_explanation && String(r.ai_feedback_detail.concept_explanation).trim()) ||
+    `這一格的程式片段與題目需要的處理方式不完全一致，請再檢查此格在流程中的角色。`;
+
+  const conceptHint =
+    (r?.ai_feedback_detail?.concept_hint && String(r.ai_feedback_detail.concept_hint).trim()) ||
+    (r?.hint && String(r.hint).trim()) ||
+    (r?.ai_feedback_detail?.concept_explanation && String(r.ai_feedback_detail.concept_explanation).trim()) ||
+    (r?.ai_feedback_detail?.guiding_question && String(r.ai_feedback_detail.guiding_question).trim()) ||
+    "請重新檢查這一格在整體程式流程中的角色。";
+
+  const guidingQuestion = reflectionQuestions[0]
+    || ((r?.ai_feedback_detail?.guiding_question && String(r.ai_feedback_detail.guiding_question).trim()) || "這一格的目的，是接收輸入，還是設定初始值？");
+
+  const reflectQ2 = reflectionQuestions[1]
+    || (possibleCauses[0] ? `你覺得這次是否出現這個狀況：${possibleCauses[0]}？` : "這個值在後面會如何被使用？");
+
+  const reflectQ3 = reflectionQuestions[2]
+    || (possibleCauses[1] ? `如果改掉「${possibleCauses[1]}」，目前流程會更接近正確解法嗎？` : "用目前的寫法，能順利完成運算嗎？");
+
+  return {
+    slotLabel,
+    diagnosis,
+    conceptHint,
+    reflectionQuestions: [guidingQuestion, reflectQ2, reflectQ3],
+    reviewRange,
+    startSec,
+    endSec,
+  };
 }
 
 function buildWrongFeedback(r) {
-  const slotLabel = r?.slot_label ? String(r.slot_label) : "（未提供格數）";
-  const actual = (r?.actual_text != null && String(r.actual_text).trim() !== "")
-    ? String(r.actual_text)
-    : "（空白）";
-  const hint = r?.hint ? String(r.hint) : "（未提供）";
-  const review = fmtReview(r);
-  // slotLabel（錯在哪）
-  // actual（你放了什麼）
-  // hint（提示）
-  // review（建議回看時間）
+  const parts = buildWrongFeedbackParts(r);
   return (
-    `❌ 你錯在：${slotLabel}
-` + 
-    `你原先放的是：${actual}
-` +
-    `建議提示：${hint}
-` +
-    `建議回看時間軸：${review}`
+    `❌ 你錯在：${parts.slotLabel}\n\n` +
+    `診斷結果：\n` +
+    `${parts.diagnosis}\n\n` +
+    `概念提示：\n` +
+    `${parts.conceptHint}\n\n` +
+    `反思建議：\n\n` +
+    `${parts.reflectionQuestions[0]}\n\n` +
+    `${parts.reflectionQuestions[1]}\n\n` +
+    `${parts.reflectionQuestions[2]}\n\n` +
+    `建議回看影片時間軸：\n` +
+    `${parts.reviewRange}`
   );
 }
 
-// 身分證 (attempt_id) 以及學生的選擇 (choice)。
-// fetch 傳送到後端 API 路由 /api/parsons/review_choice。
+function openFeedbackModal(r, taskId) {
+  const parts = buildWrongFeedbackParts(r || {});
+  feedbackModal.open = true;
+  feedbackModal.slotLabel = parts.slotLabel;
+  feedbackModal.diagnosis = parts.diagnosis;
+  feedbackModal.conceptHint = parts.conceptHint;
+  feedbackModal.reflectionQuestions = parts.reflectionQuestions;
+  feedbackModal.reviewRange = parts.reviewRange;
+  feedbackModal.start = parts.startSec;
+  feedbackModal.end = parts.endSec;
+  feedbackModal.jumpVideoId = String(r?.jump?.video_id || "");
+  feedbackModal.attemptId = String(r?.attempt_id || "");
+  feedbackModal.reviewAttemptId = String(r?.review_attempt_id || r?.attempt_id || "");
+  feedbackModal.taskId = String(taskId || "");
+}
+
+async function dismissFeedbackModal() {
+  if (feedbackModal.attemptId) {
+    await sendChoice(feedbackModal.attemptId, "no");
+  }
+  feedbackModal.open = false;
+}
+
+async function goReviewFromModal() {
+  if (!feedbackModal.jumpVideoId) {
+    feedbackModal.open = false;
+    return;
+  }
+
+  await sendChoice(feedbackModal.attemptId, "yes");
+  savePracticeState({ attempt_id: feedbackModal.attemptId || "" });
+
+  const start = feedbackModal.start ?? 0;
+  const end = feedbackModal.end ?? 0;
+  const jumpVideoId = feedbackModal.jumpVideoId;
+  const attemptId = feedbackModal.reviewAttemptId;
+  const taskId = feedbackModal.taskId;
+
+  feedbackModal.open = false;
+
+  router.push({
+    path: `/learn/video/${jumpVideoId}`,
+    query: {
+      start,
+      end,
+      attempt_id: String(attemptId || ""),
+      task_id: String(taskId || ""),
+      level: route.query.level ? String(route.query.level) : "L1",
+    },
+  });
+}
+
 async function sendChoice(attempt_id, choice) {
   if (!attempt_id) return;
   try {
@@ -537,15 +593,12 @@ async function sendChoice(attempt_id, choice) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         attempt_id,
-        student_id: (localStorage.getItem("student_id") || ""), // 或你目前存的 key
+        student_id: (localStorage.getItem("student_id") || ""),
         student_choice: choice
       }),
     });
   } catch (_) {}
 }
-// 儲存學生的作答狀態到 localStorage，extra 可額外帶入 attempt_id 或其他資訊，讓回來後能繼續做或顯示提示訊息
-// filled 記錄作答內容
-// wrong_indices 記錄錯誤位置（讓回來後能高亮錯誤格子）
 
 function savePracticeState(extra = {}) {
   try {
@@ -554,12 +607,34 @@ function savePracticeState(extra = {}) {
       level: String(route.query.level || "L1"),
       task_id: task.value?.task_id || task.value?._id || "",
       filled_map: (templateSlots.value || []).map((s) => filled[String(s.slot)]?.id || null),
+      slot_indent_map: JSON.parse(JSON.stringify(slotIndentLevel || {})),
       wrong_indices: Array.isArray(wrongIndices.value) ? wrongIndices.value : [],
       saved_at: Date.now(),
       ...extra,
     };
     localStorage.setItem(PRACTICE_STATE_KEY, JSON.stringify(stateObj));
   } catch (_) {}
+}
+
+function buildAnswerLines() {
+  try {
+    const slots = templateSlots.value || [];
+    const lines = [];
+    slots.forEach((s) => {
+      const slotKey = s?.slot != null ? String(s.slot) : null;
+      const block = slotKey != null ? filled[String(slotKey)] : null;
+      const rawText = String(block?.text || "").replace(/\r\n/g, "\n");
+      const text = rawText.replace(/^[ \t]+/, "");
+      const pxRaw = slotKey != null ? Number(slotIndentLevel[String(slotKey)] || 0) : 0;
+      const px = clampIndentPx(pxRaw);
+      const spaces = Math.max(0, Math.round(px / INDENT_UNIT_PX));
+      const prefix = spaces ? " ".repeat(spaces) : "";
+      lines.push(prefix + text);
+    });
+    return lines;
+  } catch (_) {
+    return [];
+  }
 }
 
 function restorePracticeStateIfMatch(loadedTask) {
@@ -570,7 +645,6 @@ function restorePracticeStateIfMatch(loadedTask) {
 
     const loadedTaskId = loadedTask?.task_id || loadedTask?._id || "";
     if (!loadedTaskId) return false;
-
     if (String(st.videoId) !== String(videoId.value)) return false;
     if (String(st.task_id) !== String(loadedTaskId)) return false;
 
@@ -588,12 +662,30 @@ function restorePracticeStateIfMatch(loadedTask) {
 
     wrongIndices.value = Array.isArray(st.wrong_indices) ? st.wrong_indices : [];
 
+    try {
+      const m = st.slot_indent_map || {};
+      for (const k of Object.keys(slotIndentLevel)) delete slotIndentLevel[k];
+      for (const k of Object.keys(m)) slotIndentLevel[String(k)] = Number(m[k] || 0);
+      applyIndentStylesToDOM();
+    } catch (_) {}
+
     localStorage.setItem(RESTORE_ONCE_KEY, "1");
     localStorage.setItem(RESTORE_MSG_KEY, "已恢復上一題作答");
     return true;
   } catch (_) {
     return false;
   }
+}
+
+// ==============================
+// 清空 AI 回饋狀態
+// ==============================
+function clearAiFeedback() {
+  aiFeedbackDetail.value = null;
+  aiConceptExplanation.value = "";
+  aiPossibleCauses.value = [];
+  aiImpact.value = "";
+  aiGuidingQuestion.value = "";
 }
 
 // ====== 送出作答 ======
@@ -603,44 +695,44 @@ async function submit() {
   result.value = null;
   wrongIndices.value = [];
 
+  // 每次送出前先清空 AI 回饋
+  aiFeedbackDetail.value = null;
+  aiConceptExplanation.value = "";
+  aiPossibleCauses.value = [];
+  aiImpact.value = "";
+  aiGuidingQuestion.value = "";
+
   try {
     // ==============================
-    // ✅ [新增] V1.8：測驗模式（前測/後測）送出
-    // - 前測不要顯示中文提示 / 不要顯示「答案不完全正確」訊息
-    // - 只要按送出就跳下一題（或結束）
+    // 前/後測模式：不顯示任何回饋，直接下一題/結束
     // ==============================
-    if (isTestMode.value) { // [新增]
-      if (!studentId.value) { // [新增]
-        // 測驗模式：不顯示黃條，直接回上一頁/首頁
-        state.err = ""; // [新增]
-        result.value = null; // [新增]
-        try { // [新增]
-          if (window?.history?.length > 1) router.back(); // [新增]
-          else router.push("/home"); // [新增]
-        } catch (_) { // [新增]
-          router.push("/home"); // [新增]
-        } // [新增]
-        return; // [新增]
-      } // [新增]
+    if (isTestMode.value) {
+      if (!studentId.value) {
+        state.err = "";
+        result.value = null;
+        try {
+          if (window?.history?.length > 1) router.back();
+          else router.push("/home");
+        } catch (_) {
+          router.push("/home");
+        }
+        return;
+      }
 
-        const duration_sec = testMeta.started_at_ms
-          ? Math.max(0, Math.round((Date.now() - Number(testMeta.started_at_ms)) / 1000))
-          : 0;
+      const duration_sec = testMeta.started_at_ms
+        ? Math.max(0, Math.round((Date.now() - Number(testMeta.started_at_ms)) / 1000))
+        : 0;
 
-        // ✅【修正】組送出 body（source_task_id 一定要有值）
       const body = {
         student_id: String(studentId.value || ""),
         test_cycle_id: String(testCycleId.value || ""),
         test_role: String(testRole.value || ""),
         test_task_id: String(testMeta.test_task_id || ""),
-        source_task_id: String(testMeta.source_task_id || ""), // ✅ 必須是 parsons_tasks 的 _id
-
-        // ✅【修正】answer_ids 不能是 null
+        source_task_id: String(testMeta.source_task_id || ""),
+        answer_lines: buildAnswerLines(),
         answer_ids: Array.isArray(answer_ids.value)
           ? answer_ids.value.filter(Boolean)
           : [],
-
-        // ✅【修正】duration_sec 直接用上面算好的數字（不要 durationSec.value）
         duration_sec,
       };
 
@@ -648,52 +740,54 @@ async function submit() {
       console.log("answer_ids raw =", answer_ids.value);
       console.log("SUBMIT BODY =", body);
       console.log("API_BASE =", API_BASE);
-      const res = await fetch(`${API_BASE}/api/parsons/test/submit`, { // [新增]
+
+      const res = await fetch(`${API_BASE}/api/parsons/test/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      
 
-      if (res.status === 403) { // [新增]
-        window.alert("後測尚未開放，請等待老師開放後再作答。"); // [新增]
-        router.push("/home"); // [新增]
-        return; // [新增]
-      } // [新增]
+      if (res.status === 403) {
+        window.alert("後測尚未開放，請等待老師開放後再作答。");
+        router.push("/home");
+        return;
+      }
 
       const r = await res.json();
 
-      // 已做過就導回（不顯示 ❌ 訊息）
-      if (r?.ok && r?.already_submitted) { // [新增]
-        window.alert("你已經完成本次測驗，無法重複作答。"); // [新增]
-        router.push("/home"); // [新增]
-        return; // [新增]
-      } // [新增]
+      // 前後測：完全不顯示任何回饋
+      aiFeedbackDetail.value = null;
+      aiConceptExplanation.value = "";
+      aiPossibleCauses.value = [];
+      aiImpact.value = "";
+      aiGuidingQuestion.value = "";
 
-      // 測驗模式：不顯示回饋、不高亮錯誤，直接跳下一題
-      result.value = null; // [新增]
-      wrongIndices.value = []; // [新增]
+      result.value = null;
+      wrongIndices.value = [];
+      state.err = "";
 
-      if (r?.ok) { // [新增]
-        // 測驗模式：不顯示任何黃條訊息，直接前進
-        state.err = ""; // [新增]
-        result.value = null; // [新增]
-        wrongIndices.value = []; // [新增]
-        await advanceTestAfterSubmit(); // [新增]
-      } else { // [新增]
-        // 測驗模式：送出失敗也不顯示黃條，直接回上一頁/首頁
-        state.err = ""; // [新增]
-        result.value = null; // [新增]
-        wrongIndices.value = []; // [新增]
-        try { // [新增]
-          if (window?.history?.length > 1) router.back(); // [新增]
-          else router.push("/home"); // [新增]
-        } catch (_) { // [新增]
-          router.push("/home"); // [新增]
-        } // [新增]
-      } // [新增]
-      return; // [新增]
+      if (r?.ok && r?.already_submitted) {
+        window.alert("你已經完成本次測驗，無法重複作答。");
+        router.push("/home");
+        return;
+      }
+
+      if (r?.ok) {
+        await advanceTestAfterSubmit();
+      } else {
+        try {
+          if (window?.history?.length > 1) router.back();
+          else router.push("/home");
+        } catch (_) {
+          router.push("/home");
+        }
+      }
+      return;
     }
+
+    // ==============================
+    // 一般練習模式：顯示 AI 回饋 + 回看影片
+    // ==============================
     const task_id = task.value?.task_id || task.value?._id;
     if (!task_id) {
       state.err = "尚未載入題目，無法送出。";
@@ -704,9 +798,11 @@ async function submit() {
     const body = {
       task_id,
       answer_ids: answer_ids.value,
+      answer_lines: buildAnswerLines(),
       video_id: String(videoId.value || ""),
       level: route.query.level ? String(route.query.level) : "L1",
       review_attempt_id: review_attempt_id.value,
+      student_id: String(studentId.value || ""),
     };
 
     const res = await fetch(`${API_BASE}/api/parsons/submit`, {
@@ -716,6 +812,24 @@ async function submit() {
     });
 
     const r = await res.json();
+
+    // AI 回饋優先覆蓋 hint
+    if (r?.ai_feedback_detail) {
+      r.hint =
+        r.ai_feedback_detail.concept_explanation ||
+        r.ai_feedback_detail.guiding_question ||
+        r.hint ||
+        "";
+    }
+
+    // 一般練習模式：保留 AI 回饋內容
+    aiFeedbackDetail.value = r?.ai_feedback_detail || null;
+    aiConceptExplanation.value = r?.ai_feedback_detail?.concept_explanation || "";
+    aiPossibleCauses.value = Array.isArray(r?.ai_feedback_detail?.possible_causes)
+      ? r.ai_feedback_detail.possible_causes
+      : [];
+    aiImpact.value = r?.ai_feedback_detail?.impact || "";
+    aiGuidingQuestion.value = r?.ai_feedback_detail?.guiding_question || "";
 
     if (r?.ok && r?.is_correct === false) {
       r.feedback = buildWrongFeedback(r);
@@ -734,52 +848,33 @@ async function submit() {
     }
 
     if (r?.ok && r?.is_correct === false && r?.jump?.video_id) {
-      const start = r.jump.start ?? 0;
-      const end = r.jump.end ?? 0;
-
-      window.alert(
-        (r?.feedback || buildWrongFeedback(r)) +
-        `
-
-即將帶你回到 learning 複習影片片段：${fmtTime(start)}–${fmtTime(end)}`
-      );
-
-      await sendChoice(r?.attempt_id, "yes");
-      savePracticeState({ attempt_id: r?.attempt_id || "" });
-
-      router.push({
-        path: `/learn/video/${r.jump.video_id}`,
-        query: {
-          start,
-          end,
-          attempt_id: String(r.review_attempt_id || r.attempt_id || ""),
-          task_id: String(task_id || ""),
-          level: route.query.level ? String(route.query.level) : "L1",
-        },
-      });
+      openFeedbackModal(r, task_id);
+      return;
     }
   } catch (e) {
     state.err = e?.message || "送出失敗";
     result.value = { is_correct: false, feedback: state.err };
+
+    aiFeedbackDetail.value = null;
+    aiConceptExplanation.value = "";
+    aiPossibleCauses.value = [];
+    aiImpact.value = "";
+    aiGuidingQuestion.value = "";
   } finally {
     state.submitting = false;
   }
 }
 
-
 // ==============================
-// ✅ [新增] V1.5：相容後端回傳格式（task 可能是扁平或缺欄位）
-// 目的：避免 template_slots 缺失導致左側「題目作答程式區」空白
+// V1.5：相容後端回傳格式
 // ==============================
-function normalizeTaskPayload(apiJson) { // [新增]
+function normalizeTaskPayload(apiJson) {
   if (!apiJson) return { taskObj: null, pool: [], slots: [] };
 
-  // 後端可能回：{ ok, task: {...} } 或直接把 task 攤平在最外層
-  const t = apiJson.task ? apiJson.task : apiJson; // [新增]
+  const t = apiJson.task ? apiJson.task : apiJson;
   if (!t) return { taskObj: null, pool: [], slots: [] };
 
-  // --- 題目文字相容 ---
-  if (!t.question_text) { // [新增]
+  if (!t.question_text) {
     if (t.question && typeof t.question === "object" && t.question.prompt) {
       t.question_text = String(t.question.prompt);
     } else if (t.prompt) {
@@ -787,18 +882,15 @@ function normalizeTaskPayload(apiJson) { // [新增]
     }
   }
 
-  // --- pool 相容（後端可能沒有 pool 欄位） ---
-  let pool = Array.isArray(t.pool) ? t.pool : []; // [新增]
-  if (!pool.length) { // [新增]
+  let pool = Array.isArray(t.pool) ? t.pool : [];
+  if (!pool.length) {
     const core = Array.isArray(t.solution_blocks) ? t.solution_blocks : [];
     const dist = Array.isArray(t.distractor_blocks) ? t.distractor_blocks : [];
     const blocks = Array.isArray(t.blocks) ? t.blocks : [];
-    // 優先：solution_blocks + distractor_blocks，其次：blocks
     pool = (core.length || dist.length) ? [...core, ...dist] : blocks;
   }
 
-  // 統一每塊至少有 {id,text,type}
-  pool = (pool || []).map((b, i) => ({ // [新增]
+  pool = (pool || []).map((b, i) => ({
     id: b?.id != null ? String(b.id) : `b${i + 1}`,
     text: b?.text != null ? String(b.text) : "",
     type: b?.type ? String(b.type) : (b?.is_distractor ? "distractor" : "core"),
@@ -806,34 +898,28 @@ function normalizeTaskPayload(apiJson) { // [新增]
     ...b,
   }));
 
-  // --- template_slots 相容 ---
-  let slots = Array.isArray(t.template_slots) ? t.template_slots : []; // [新增]
-  if (!slots.length) { // [新增]
-    // 以 solution_order 或 solution_blocks 長度推導格數
+  let slots = Array.isArray(t.template_slots) ? t.template_slots : [];
+  if (!slots.length) {
     const order = Array.isArray(t.solution_order) ? t.solution_order : [];
     const core = Array.isArray(t.solution_blocks) ? t.solution_blocks : [];
     const n = order.length || core.length || 0;
-
-    slots = Array.from({ length: n }, (_, idx) => ({ // [新增]
+    slots = Array.from({ length: n }, (_, idx) => ({
       slot: `s${idx + 1}`,
       label: `第 ${idx + 1} 格`,
     }));
   } else {
-    // 確保 slot / label 存在
-    slots = slots.map((s, idx) => ({ // [新增]
+    slots = slots.map((s, idx) => ({
       slot: s?.slot != null ? String(s.slot) : `s${idx + 1}`,
       label: s?.label != null ? String(s.label) : `第 ${idx + 1} 格`,
       ...s,
     }));
   }
 
-  // 把補齊後的 slots 放回 taskObj，讓後面流程一致
-  t.template_slots = slots; // [新增]
-
-  return { taskObj: t, pool, slots }; // [新增]
+  t.template_slots = slots;
+  return { taskObj: t, pool, slots };
 }
 
-// ====== 載入題目（學生端只拿「已發布」） ======
+// ====== 載入題目 ======
 async function loadTask() {
   state.loading = true;
   state.err = "";
@@ -842,71 +928,62 @@ async function loadTask() {
   resetFilled();
 
   try {
-    // ==============================
-    // ✅ [新增] V1.8：測驗模式（前測/後測）載入題目
-    // ==============================
-    if (isTestMode.value) { // [新增]
-      if (!studentId.value) { // [新增]
-        // 測驗模式：不顯示黃條，直接回上一頁/首頁
-        state.noTask = true; // [新增]
-        state.err = ""; // [新增]
-        task.value = null; // [新增]
-        poolBlocks.value = []; // [新增]
-        templateSlots.value = []; // [新增]
-        try { // [新增]
-          if (window?.history?.length > 1) router.back(); // [新增]
-          else router.push("/home"); // [新增]
-        } catch (_) { // [新增]
-          router.push("/home"); // [新增]
-        } // [新增]
-        return; // [新增]
-      } // [新增]
+    if (isTestMode.value) {
+      if (!studentId.value) {
+        state.noTask = true;
+        state.err = "";
+        task.value = null;
+        poolBlocks.value = [];
+        templateSlots.value = [];
+        try {
+          if (window?.history?.length > 1) router.back();
+          else router.push("/home");
+        } catch (_) {
+          router.push("/home");
+        }
+        return;
+      }
 
-      // [新增] 測驗計時起點（每題進來重置）
-      testMeta.started_at_ms = Date.now(); // [新增]
+      testMeta.started_at_ms = Date.now();
 
-      // [新增] 支援多題：從 query.test_index 讀取想要的題號（後端可忽略）
-      const idxQ = route.query.test_index ? Number(route.query.test_index) : null; // [新增]
-      testMeta.request_index = Number.isFinite(idxQ) && idxQ > 0 ? idxQ : Number(testMeta.request_index || 1); // [新增]
+      const idxQ = route.query.test_index ? Number(route.query.test_index) : null;
+      testMeta.request_index = Number.isFinite(idxQ) && idxQ > 0 ? idxQ : Number(testMeta.request_index || 1);
 
-      const url = `${API_BASE}/api/parsons/test/task?student_id=${encodeURIComponent(studentId.value)}&test_role=${encodeURIComponent(testRole.value)}&test_cycle_id=${encodeURIComponent(testCycleId.value)}&index=${encodeURIComponent(String(testMeta.request_index))}`; // [新增]
-      const res = await fetch(url); // [新增]
+      const url = `${API_BASE}/api/parsons/test/task?student_id=${encodeURIComponent(studentId.value)}&test_role=${encodeURIComponent(testRole.value)}&test_cycle_id=${encodeURIComponent(testCycleId.value)}&index=${encodeURIComponent(String(testMeta.request_index))}`;
+      const res = await fetch(url);
 
-      if (!res.ok) { // [新增]
-        state.noTask = true; // [新增]
-        task.value = null; // [新增]
-        poolBlocks.value = []; // [新增]
-        templateSlots.value = []; // [新增]
-        try { // [新增]
-          const rr = await res.json(); // [新增]
-          state.err = rr?.message || "測驗題目載入失敗"; // [新增]
-        } catch (_) { // [新增]
-          state.err = "測驗題目載入失敗"; // [新增]
-        } // [新增]
-        return; // [新增]
-      } // [新增]
+      if (!res.ok) {
+        state.noTask = true;
+        task.value = null;
+        poolBlocks.value = [];
+        templateSlots.value = [];
+        try {
+          const rr = await res.json();
+          state.err = rr?.message || "測驗題目載入失敗";
+        } catch (_) {
+          state.err = "測驗題目載入失敗";
+        }
+        return;
+      }
 
-      const r = await res.json(); // [新增]
+      const r = await res.json();
 
-      // [新增] 讀取題序資訊（後端若提供）
-      testMeta.total = Number(r?.total || 1); // [新增]
-      testMeta.current_index = Number(r?.current_index || testMeta.request_index || 1); // [新增]
+      testMeta.total = Number(r?.total || 1);
+      testMeta.current_index = Number(r?.current_index || testMeta.request_index || 1);
+      testMeta.test_task_id = String(r?.test_task_id || "");
+      testMeta.source_task_id = String(r?.source_task_id || "");
 
-      // [新增] 記錄 test_task_id / source_task_id
-      testMeta.test_task_id = String(r?.test_task_id || "");     // ✅ 只吃 test_task_id
-      testMeta.source_task_id = String(r?.source_task_id || ""); // ✅ 只吃 source_task_id
+      const norm = normalizeTaskPayload(r);
+      task.value = norm.taskObj;
+      poolBlocks.value = norm.pool;
+      // 前後測不顯示中文提示：清空 label
+      templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
 
-      const norm = normalizeTaskPayload(r); // [新增]
-      task.value = norm.taskObj; // [新增]
-      poolBlocks.value = norm.pool; // [新增]
-
-      // [新增] ✅前測不顯示中文提示：清空每格 label（template 不改）
-      templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" })); // [新增]
-
-      // ✅【新增】讓 blank 可 focus + 套用縮排（沿用既有機制）
-      await bindBlankFocusHandlers(); // [新增]
-      return; // [新增]
+      await bindBlankFocusHandlers();
+      return;
     }
+
+    // 練習模式
     const level = route.query.level ? String(route.query.level) : "L1";
     const url = `${API_BASE}/api/parsons/task?video_id=${encodeURIComponent(String(videoId.value || ""))}&level=${encodeURIComponent(level)}`;
     const res = await fetch(url);
@@ -921,16 +998,14 @@ async function loadTask() {
 
     const r = await res.json();
 
-    const norm = normalizeTaskPayload(r); // [新增]
+    const norm = normalizeTaskPayload(r);
     task.value = norm.taskObj;
-
     poolBlocks.value = norm.pool;
     templateSlots.value = norm.slots;
 
-    const restored = restorePracticeStateIfMatch(task.value); // [修改]
+    const restored = restorePracticeStateIfMatch(task.value);
 
-    // ✅【新增】讓 blank 可 focus + 套用縮排
-    await bindBlankFocusHandlers(); // [新增]
+    await bindBlankFocusHandlers();
 
     if (restored) {
       const once = localStorage.getItem(RESTORE_ONCE_KEY);
@@ -950,42 +1025,36 @@ async function loadTask() {
 // ====== 生命週期 ======
 onMounted(loadTask);
 
-// ✅ [新增] 全域鍵盤：Tab / Space / Backspace 控制「框」縮排
-onMounted(() => { // [新增]
+onMounted(() => {
   _docKeydownHandler = (e) => {
     const tag = String(e.target?.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea") return;
 
-    // Tab：退四格
     if (e.key === "Tab") {
       const k = pickTargetSlotKey();
       if (!k) return;
       e.preventDefault();
-      const changed = indentBoxPx(k, +INDENT_STEP_PX); // [新增]
+      const changed = indentBoxPx(k, +INDENT_STEP_PX);
       if (changed) applyIndentStylesToDOM();
       return;
     }
 
-    // Space：退一格
-    if (e.key === " ") { // [新增]
+    if (e.key === " ") {
       const k = pickTargetSlotKey();
       if (!k) return;
-      e.preventDefault(); // 避免頁面捲動
-      const changed = indentBoxPx(k, +INDENT_UNIT_PX); // [新增]
+      e.preventDefault();
+      const changed = indentBoxPx(k, +INDENT_UNIT_PX);
       if (changed) applyIndentStylesToDOM();
       return;
     }
 
-    // Backspace：回退一格（回到 0 就停止）
     if (e.key === "Backspace") {
       const k = pickTargetSlotKey();
       if (!k) return;
-
-      const cur = clampIndentPx(slotIndentLevel[String(k)] || 0); // [新增]
-      if (cur <= 0) return; // 沒縮排就不吃掉 Backspace（避免影響其他行為）
-
+      const cur = clampIndentPx(slotIndentLevel[String(k)] || 0);
+      if (cur <= 0) return;
       e.preventDefault();
-      const changed = indentBoxPx(k, -INDENT_UNIT_PX); // [新增]
+      const changed = indentBoxPx(k, -INDENT_UNIT_PX);
       if (changed) applyIndentStylesToDOM();
       return;
     }
@@ -994,58 +1063,135 @@ onMounted(() => { // [新增]
   document.addEventListener("keydown", _docKeydownHandler, true);
 });
 
-onBeforeUnmount(() => { // [新增]
+onBeforeUnmount(() => {
   if (_docKeydownHandler) document.removeEventListener("keydown", _docKeydownHandler, true);
   try {
-    (_blankCleanupFns || []).forEach((fn) => {
-      try { fn(); } catch (_) {}
-    });
+    (_blankCleanupFns || []).forEach((fn) => { try { fn(); } catch (_) {} });
   } catch (_) {}
   _blankCleanupFns = [];
 });
 
 watch(
-  () => [videoId.value, route.query.level, route.query.mode, route.query.test_role, route.query.test_cycle_id, route.query.test_index], // [新增]
+  () => [videoId.value, route.query.level, route.query.mode, route.query.test_role, route.query.test_cycle_id, route.query.test_index],
   () => loadTask()
 );
 </script>
 
 <style scoped>
-.page{ padding: 18px; max-width: 1200px; margin: 0 auto; }
-.qbox{ border:3px solid #000; border-radius:14px; padding:16px; }
-.qtitle{ font-size: 18px; font-weight: 900; margin-bottom: 6px; }
-.qtext{ font-size: 18px; font-weight: 800; }
+:global(body) {
+  background: radial-gradient(circle at 15% 12%, #fff7db 0%, rgba(255, 247, 219, 0) 34%),
+    radial-gradient(circle at 88% 10%, #dff2ff 0%, rgba(223, 242, 255, 0) 30%),
+    linear-gradient(180deg, #f7fafc 0%, #f2f6fb 100%);
+}
 
-.board{ display:grid; grid-template-columns: 1.2fr 1fr; gap:16px; margin-top:16px; }
-.panel{ border:3px solid #000; border-radius:14px; padding:14px; min-height: 460px; min-width: 0; overflow: hidden; }
-.panel-title{ font-size:20px; font-weight:900; margin-bottom:10px; }
+.page{
+  --ink: #1f2937;
+  --line: #d3deea;
+  --paper: rgba(255, 255, 255, 0.94);
+  --paper-strong: #ffffff;
+  --primary: #0f5c84;
+  --accent: #f59e0b;
+  --ok: #2f855a;
+  --danger: #b91c1c;
+  --radius-lg: 18px;
+  --radius-md: 12px;
+  --shadow-soft: 0 12px 30px rgba(15, 23, 42, 0.08);
+
+  position: relative;
+  padding: 22px;
+  max-width: 1420px;
+  margin: 0 auto;
+  color: var(--ink);
+  font-family: "Noto Sans TC", "Segoe UI", "PingFang TC", sans-serif;
+}
+
+.qbox{
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 18px;
+  background: var(--paper);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(3px);
+}
+
+.qtitle{
+  font-size: 15px;
+  font-weight: 900;
+  color: #4b5563;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+
+.qtext{
+  font-size: 22px;
+  line-height: 1.45;
+  font-weight: 900;
+  color: #0f172a;
+}
+
+.board{
+  display: grid;
+  grid-template-columns: 1.25fr 1fr;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.panel{
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  min-height: 460px;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--paper);
+  box-shadow: var(--shadow-soft);
+  animation: rise-in .32s ease both;
+}
+
+.panel-title{
+  font-size: 18px;
+  font-weight: 900;
+  margin-bottom: 10px;
+  color: #0f172a;
+}
 
 .emptyBox{
   padding: 12px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fff3cd;
   font-weight: 900;
 }
 
 .cloze{ display:grid; gap:12px; min-width:0; }
 .cloze-row{ display:grid; gap:8px; min-width:0; }
-.hint{ font-weight: 900; background:#e2c25a; padding:6px 8px; border-radius:6px; }
+.hint{
+  font-weight: 900;
+  background: linear-gradient(90deg, #ffe3a1 0%, #ffd57a 100%);
+  padding: 7px 10px;
+  border-radius: 10px;
+  color: #5b4105;
+}
 
 .blank{
   position: relative;
-  border: 2px dashed #999;
+  border: 2px dashed #8da2b8;
   border-radius: 14px;
   padding: 12px 44px 12px 12px;
-  background: #fff;
+  background: var(--paper-strong);
   min-height: 48px;
   display:flex;
   align-items:center;
   box-sizing: border-box;
   max-width: 100%;
   min-width: 0;
+  transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
 }
-.blank.over { border-color: #0c5e86; background: #eef9ff; }
-.blank.filled{ border-style: solid; border-color: #6b5bff; background: #f1f0ff; }
+.blank:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.08);
+}
+.blank.over { border-color: var(--primary); background: #eef9ff; }
+.blank.filled{ border-style: solid; border-color: #4f46e5; background: #eef0ff; }
 .placeholder{ color:#777; font-weight: 800; }
 
 .remove{
@@ -1057,34 +1203,163 @@ watch(
   border:0;
   cursor:pointer;
   font-weight: 900;
+  background: #fee2e2;
+  color: #7f1d1d;
 }
 
-/* ✅ 錯誤格子高亮 */
 .cloze-row.wrong .hint{
-  background:#ffb3b3;
+  background: linear-gradient(90deg, #ffc8c8 0%, #ffb2b2 100%);
 }
 .cloze-row.wrong .blank{
-  border-color:#d61f1f !important;
-  box-shadow: 0 0 0 2px rgba(214,31,31,.15);
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 2px rgba(185, 28, 28, .12);
 }
 
 .pool{ display:grid; gap:10px; }
 .pill{
-  padding:14px 16px;
-  border-radius:999px;
-  background:#f2f2f2;
+  padding: 13px 16px;
+  border-radius: 14px;
+  border: 1px solid #d7e1eb;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
   font-weight:800;
-  text-align:center;
+  text-align:left;
   cursor:grab;
   user-select:none;
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.pill:not(.used):hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 20px rgba(15, 23, 42, 0.1);
 }
 .pill.used { opacity: 0.35; cursor: not-allowed; }
 
 .actions{ display:flex; justify-content:center; gap:16px; margin-top:18px; }
-.btn{ min-width: 160px; padding: 12px 16px; border-radius:999px; border:0; font-weight:900; cursor:pointer; }
-.submit{ background:#4e9b6a; color:#fff; }
+.btn{
+  min-width: 160px;
+  padding: 12px 16px;
+  border-radius: 999px;
+  border: 0;
+  font-weight: 900;
+  cursor: pointer;
+  transition: transform .15s ease, box-shadow .15s ease, filter .15s ease;
+}
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.2);
+}
+.submit{ background: linear-gradient(90deg, #2f855a 0%, #2a9d8f 100%); color:#fff; }
 .btn:disabled{ opacity:.6; cursor:not-allowed; }
 
-.result{ margin-top:12px; padding: 12px 14px; border-radius: 12px; background:#fff3cd; font-weight:800; }
-.result.ok{ background:#d1e7dd; }
+.result{
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid #f5d98e;
+  background: #fff8de;
+  font-weight: 800;
+}
+.result.ok{ background:#e8fff2; border-color: #b6e5c8; }
+
+.fb-modal-backdrop{
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.38);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 1000;
+}
+
+.fb-modal{
+  width: min(760px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  border-radius: 18px;
+  border: 1px solid #d9e2ee;
+  background: linear-gradient(180deg, #fffdf8 0%, #ffffff 100%);
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+  padding: 18px;
+  animation: modal-pop .2s ease-out both;
+}
+
+.fb-title{
+  font-size: 22px;
+  font-weight: 900;
+  color: #b91c1c;
+  margin-bottom: 10px;
+}
+
+.fb-section{
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 12px;
+  background: #ffffff;
+  margin-top: 10px;
+}
+
+.fb-label{
+  font-size: 13px;
+  font-weight: 900;
+  color: #334155;
+  margin-bottom: 6px;
+}
+
+.fb-text{
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.6;
+}
+
+.fb-list{
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.fb-review{
+  background: #f0f9ff;
+  border-color: #bae6fd;
+}
+
+.fb-time{
+  font-size: 18px;
+  font-weight: 900;
+  color: #0c4a6e;
+  letter-spacing: 0.4px;
+}
+
+.fb-actions{
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.btn.ghost{
+  background: #e8edf3;
+  color: #1f2937;
+}
+
+@media (max-width: 900px) {
+  .page { padding: 14px; }
+  .qtext { font-size: 20px; }
+  .panel { min-height: 0; }
+  .board{ grid-template-columns: 1fr; }
+}
+
+@keyframes rise-in {
+  from { transform: translateY(6px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes modal-pop {
+  from { transform: scale(.97); opacity: .65; }
+  to { transform: scale(1); opacity: 1; }
+}
 </style>

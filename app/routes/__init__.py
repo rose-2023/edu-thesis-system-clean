@@ -9,6 +9,7 @@ from .records import records_bp
 from .events import events_bp
 from .teacher_t5 import teacher_t5_bp
 from .parsons import parsons_bp
+
 # from .quiz import quiz_bp
 
 def register_blueprints(app):
@@ -16,7 +17,6 @@ def register_blueprints(app):
     app.register_blueprint(student_bp, url_prefix="/api/student")
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(admin_upload_bp, url_prefix="/api/admin_upload")
-    # 新增
     app.register_blueprint(subtitle_bp, url_prefix="/api/subtitle")
     app.register_blueprint(teacher_dashboard_bp, url_prefix="/api/teacher_dashboard")
     app.register_blueprint(parsons_admin_bp, url_prefix="/api/parsons_admin")

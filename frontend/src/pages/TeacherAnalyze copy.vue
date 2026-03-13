@@ -1,7 +1,22 @@
 <template>
   <div class="layout">
     <!-- ===== 左側 Sidebar ===== -->
-    <TeacherSidebar active="analyze" />
+    <aside class="sidebar">
+      <div class="profile">
+        <div class="avatar">👩‍🏫</div>
+        <div class="hello">
+          <div class="hi">您好，老師</div>
+          <div class="sub">分析儀表板</div>
+        </div>
+      </div>
+
+      <nav class="menu">
+        <a class="item" href="/admin/dashboard">總覽</a>
+        <a class="item" href="/admin/videos">影片管理</a>
+        <a class="item" href="/admin/t5">AI管理生成紀錄檢視</a>
+        <a class="item active" href="/admin/analyze">分析</a>
+      </nav>
+    </aside>
 
     <!-- ===== 右側內容 ===== -->
     <main class="content">
@@ -14,60 +29,31 @@
       <section class="panel">
         <div class="panelTitle">測驗資料（parsons_test_attempts）</div>
 
-        <!-- [新增] 分析模式切換：測驗 / 練習 -->
-        <div class="modeTabs">
-          <button class="btn" :class="{ primary: analyzeMode === 'test' }" @click="setAnalyzeMode('test')">測驗（前/後測）</button>
-          <button class="btn" :class="{ primary: analyzeMode === 'practice' }" @click="setAnalyzeMode('practice')">練習（平時）</button>
-        </div>
-
-
-        
         <div class="controls">
-          <!-- [新增] 測驗分析控制項 -->
-          <template v-if="analyzeMode==='test'">
-            <div class="field">
-              <div class="label">test_cycle_id</div>
-              <input class="input" v-model="testCycleId" placeholder="default" />
-            </div>
+          <div class="field">
+            <div class="label">test_cycle_id</div>
+            <input class="input" v-model="testCycleId" placeholder="default" />
+          </div>
 
-            <div class="field">
-              <div class="label">班級（class_name）</div>
-              <input class="input" v-model="className" placeholder="例如：資工系 A班" />
-            </div>
+          <div class="field">
+            <div class="label">班級（class_name）</div>
+            <input class="input" v-model="className" placeholder="例如：資工系 A班" />
+          </div>
 
-            <div class="field">
-              <div class="label">顯示</div>
-              <select class="input" v-model="viewMode">
-                <option value="attempts">作答明細</option>
-                <option value="summary">每位學生彙總</option>
-              </select>
-            </div>
+          <div class="field">
+            <div class="label">顯示</div>
+            <select class="input" v-model="viewMode">
+              <option value="attempts">作答明細</option>
+              <option value="summary">每位學生彙總</option>
+            </select>
+          </div>
 
-            <div class="actions">
-              <button class="btn primary" @click="downloadAttemptsCsv">下載作答 CSV</button>
-            </div>
-          </template>
-
-          <!-- [新增] 練習分析控制項（V1） -->
-          <template v-else>
-            <div class="field">
-              <div class="label">班級（class_name）</div>
-              <input class="input" v-model="className" placeholder="例如：資工系 A班" />
-            </div>
-
-            <div class="actions">
-              <button class="btn primary" @click="fetchPracticeAnalysis" :disabled="practiceLoading">載入練習分析</button>
-            </div>
-
-            <div class="subhint" style="margin-top:8px;">
-              目前 V1 只顯示：每位學生練習總覽、最常錯格子排行（後端 API 完成後即可使用）。
-            </div>
-          </template>
+          <div class="actions">
+            <button class="btn primary" @click="downloadAttemptsCsv">下載作答 CSV</button>
+          </div>
         </div>
 
         <div class="hint" v-if="errorMsg">{{ errorMsg }}</div>
-        <div class="hint" v-if="practiceError">{{ practiceError }}</div>
-
       </section>
 
       <!-- ===== 學生帳號匯入/匯出 ===== -->
@@ -98,15 +84,14 @@
       <!-- ===== 表格 ===== -->
       <section class="panel">
         <div class="panelTitle">
-          <span v-if="analyzeMode==='test'">
-            <span v-if="viewMode==='attempts'">作答明細</span>
-            <span v-else>每位學生彙總</span>
-          </span>
-          <span v-else>練習分析（Practice）</span>
+          <span v-if="viewMode==='attempts'">作答明細</span>
+          
+          <span v-else>每位學生彙總</span>
+          <button @click="mode='test'">測驗分析</button>
+          <button @click="mode='practice'">練習分析</button>
         </div>
 
-        <template v-if="analyzeMode==='test'">
-<div class="tableWrap" v-if="viewMode==='attempts'">
+        <div class="tableWrap" v-if="viewMode==='attempts'">
           <table class="table">
             <thead>
               <tr>
@@ -167,69 +152,14 @@
             </tbody>
           </table>
         </div>
-        </template>
-
-
-        <template v-if="analyzeMode==='practice'">
-          <div class="practiceGrid">
-            <div class="tableWrap">
-              <div class="subTitle">每位學生練習總覽</div>
-              <table class="table">
-                <thead>
-                  <tr>
-                    <th>student_id</th>
-                    <th>practice_attempts</th>
-                    <th>avg_duration_sec</th>
-                    <th>total_review_yes</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(r, idx) in practiceStudents" :key="idx">
-                    <td>{{ r.student_id }}</td>
-                    <td>{{ r.practice_attempts }}</td>
-                    <td>{{ r.avg_duration_sec }}</td>
-                    <td>{{ r.total_review_yes }}</td>
-                  </tr>
-                  <tr v-if="!practiceLoading && practiceStudents.length===0">
-                    <td colspan="4" class="muted">尚無資料 / 尚未載入</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div class="tableWrap">
-              <div class="subTitle">最常錯格子排行（Top 10）</div>
-              <table class="table">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>slot</th>
-                    <th>wrong_count</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(r, idx) in practiceSlotRanking.slice(0,10)" :key="idx">
-                    <td>{{ idx + 1 }}</td>
-                    <td>{{ r.slot }}</td>
-                    <td>{{ r.wrong_count }}</td>
-                  </tr>
-                  <tr v-if="!practiceLoading && practiceSlotRanking.length===0">
-                    <td colspan="3" class="muted">尚無資料 / 尚未載入</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </template>
-
       </section>
     </main>
   </div>
 </template>
 
 <script setup>
+
 import { ref, computed, onMounted } from "vue";
-import TeacherSidebar from "../components/TeacherSidebar.vue";
 
 // [新增] 統一後端 API Base（避免打到 Vite 5173 回傳 index.html 造成 JSON/CSV 解析錯誤）
 const API_BASE = (import.meta?.env?.VITE_API_BASE || "http://127.0.0.1:5000").replace(/\/$/, ""); // [新增]
@@ -245,18 +175,11 @@ const testCycleId = ref(""); // [新增] 允許留空（留空=不以 test_cycle
 const className = ref("資工系A"); // [新增] 預設班級（模板不改，用值做預設）
 
 const viewMode = ref("attempts");
-const analyzeMode = ref("test"); // [新增] test | practice
-
-// [新增] 練習分析資料（V1）
-const practiceLoading = ref(false); // [新增]
-const practiceError = ref(""); // [新增]
-const practiceStudents = ref([]); // [新增] [{student_id, practice_attempts, avg_duration_sec, total_review_yes}]
-const practiceSlotRanking = ref([]); // [新增] [{slot, wrong_count}]
-
 
 const defaultPassword = ref("");
 const studentCsvFile = ref(null);
-
+// 測驗資料
+const mode = ref("test")  // test | practice
 // 資料
 const users = ref([]); // {student_id,name,class_name}
 const attempts = ref([]); // raw csv rows
@@ -503,36 +426,6 @@ async function downloadStudentsCsv() {
   }
 }
 
-
-async function fetchPracticeAnalysis() { // [新增]
-  try {
-    practiceLoading.value = true;
-    practiceError.value = "";
-    const qs = new URLSearchParams();
-    if ((className.value || "").trim()) qs.set("class_name", (className.value || "").trim());
-    const res = await fetch(`${API_BASE}/api/teacher/analysis/practice?${qs.toString()}`);
-    if (!res.ok) {
-      // 後端尚未加入(B)時，這裡會 404；不影響既有測驗功能
-      throw new Error(`practice analysis failed: ${res.status}`);
-    }
-    const data = await res.json();
-    practiceStudents.value = Array.isArray(data?.students) ? data.students : [];
-    practiceSlotRanking.value = Array.isArray(data?.slot_ranking) ? data.slot_ranking : [];
-  } catch (e) {
-    practiceError.value = e?.message || String(e);
-    practiceStudents.value = [];
-    practiceSlotRanking.value = [];
-  } finally {
-    practiceLoading.value = false;
-  }
-}
-
-function setAnalyzeMode(mode) { // [新增]
-  analyzeMode.value = mode;
-  // 切到練習分析時才載入（避免影響原本 refreshAll）
-  if (mode === "practice") fetchPracticeAnalysis();
-}
-
 async function refreshAll() {
   try {
     loading.value = true;
@@ -552,15 +445,65 @@ onMounted(() => {
 
 <style scoped>
 .layout {
-  display: grid;
-  grid-template-columns: 240px 1fr;
+  display: flex;
   min-height: 100vh;
-  background: #f5f6f8;
+  background: #f5f5f5;
 }
-
+.sidebar {
+  width: 260px;
+  background: #caa74a;
+  color: #1b1b1b;
+  padding: 18px 14px;
+  box-sizing: border-box;
+}
+.profile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.15);
+  margin-bottom: 14px;
+}
+.avatar {
+  width: 46px;
+  height: 46px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.35);
+  font-size: 20px;
+}
+.hello .hi {
+  font-weight: 800;
+  font-size: 16px;
+}
+.hello .sub {
+  font-size: 12px;
+  opacity: 0.9;
+  margin-top: 2px;
+}
+.menu {
+  display: grid;
+  gap: 10px;
+}
+.item {
+  display: block;
+  text-decoration: none;
+  color: #1b1b1b;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.15);
+  font-weight: 700;
+}
+.item:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+.item.active {
+  background: rgba(255, 255, 255, 0.35);
+}
 .content {
   flex: 1;
-  padding: 20px 22px 26px;
+  padding: 18px 18px 26px;
   box-sizing: border-box;
 }
 .pageTitleRow {
@@ -572,15 +515,13 @@ onMounted(() => {
 }
 .pageTitle {
   margin: 0;
-  font-size: 30px;
-  font-weight: 900;
+  font-size: 24px;
 }
 .panel {
   background: #fff;
-  border-radius: 16px;
-  padding: 16px;
-  border: 1px solid #d4dae5;
-  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.04);
+  border-radius: 14px;
+  padding: 14px;
+  border: 2px solid #000;
   margin-bottom: 14px;
 }
 .panelTitle {
@@ -590,7 +531,7 @@ onMounted(() => {
 }
 .controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(220px, 1fr)) auto;
+  grid-template-columns: 1fr 1fr 1fr auto;
   gap: 12px;
   align-items: end;
 }
@@ -602,7 +543,7 @@ onMounted(() => {
 .input {
   width: 100%;
   padding: 10px 10px;
-  border: 1px solid #cfd6e3;
+  border: 2px solid #000;
   border-radius: 10px;
   box-sizing: border-box;
   outline: none;
@@ -616,12 +557,11 @@ onMounted(() => {
 .actions {
   display: flex;
   gap: 10px;
-  justify-content: flex-end;
 }
 .btn {
   padding: 10px 14px;
   border-radius: 10px;
-  border: 1px solid #cfd6e3;
+  border: 2px solid #000;
   background: #fff;
   font-weight: 900;
   cursor: pointer;
@@ -631,15 +571,14 @@ onMounted(() => {
   cursor: not-allowed;
 }
 .btn.primary {
-  background: #111827;
-  border-color: #111827;
+  background: #111;
   color: #fff;
 }
 .hint {
   margin-top: 10px;
   padding: 10px 12px;
   border-radius: 10px;
-  border: 1px dashed #a7b2c8;
+  border: 2px dashed #000;
   background: #fff9db;
   font-weight: 800;
 }
@@ -652,69 +591,12 @@ onMounted(() => {
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 12px;
 }
 .table th,
 .table td {
-  border: 1px solid #d7ddeb;
+  border: 2px solid #000;
   padding: 8px 10px;
   white-space: nowrap;
-}
-.table th {
-  background: #f3f6fb;
-  font-weight: 800;
-}
-
-
-/* [新增] 測驗/練習切換 */
-.modeTabs{
-  display:flex;
-  gap:10px;
-  margin:10px 0 12px;
-  flex-wrap:wrap;
-}
-.practiceGrid{
-  display:grid;
-  grid-template-columns: 1fr 1fr;
-  gap:16px;
-}
-
-@media (max-width: 1200px) {
-  .controls {
-    grid-template-columns: repeat(2, minmax(220px, 1fr));
-  }
-
-  .actions {
-    justify-content: flex-start;
-  }
-}
-
-@media (max-width: 980px){
-  .layout {
-    grid-template-columns: 1fr;
-  }
-
-  .content {
-    padding: 14px;
-  }
-
-  .pageTitle {
-    font-size: 24px;
-  }
-
-  .controls {
-    grid-template-columns: 1fr;
-  }
-
-  .practiceGrid{ grid-template-columns: 1fr; }
-}
-.subTitle{
-  font-weight:700;
-  margin: 0 0 10px;
-  color: #222;
-}
-.muted{
-  color:#777;
-  text-align:center;
 }
 </style>

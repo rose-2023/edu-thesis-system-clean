@@ -1,23 +1,8 @@
 <template>
   <div class="t2">
-    <!-- Top bar -->
-    <div class="topbar">
-      <div class="left">老師：{{ teacher?.name || "—" }}</div>
-      <div class="right">
-        <button class="btn" @click="openCreateUnit">新增單元</button>
-        <button class="btn ghost" @click="logout">登出</button>
-      </div>
-    </div>
-
     <div class="layout">
       <!-- Sidebar -->
-      <aside class="sidebar">
-        <div class="navitem active">總覽</div>
-        <div class="navitem" @click="goUpload()">📁 影片管理</div>
-        <div class="navitem" @click="go('/admin/subtitles')">字幕/逐字稿</div>
-        <div class="navitem" @click="go('/admin/bank')">題庫</div>
-        <div class="navitem" @click="go('/admin/analytics')">分析</div>
-      </aside>
+      <TeacherSidebar active="dashboard" />
 
       <!-- Main -->
       <main class="main">
@@ -30,18 +15,18 @@
               <div class="qdesc">上傳影片、啟用/停用、管理縮圖與字幕</div>
             </button>
 
-            <button class="qcard" type="button" @click="go('/admin/subtitles')">
+            <button class="qcard" type="button" @click="goSubtitle()">
               <div class="qtitle">📝 字幕/逐字稿</div>
               <div class="qdesc">檢查時間軸、修正後再上傳</div>
             </button>
 
-            <button class="qcard" type="button" @click="go('/admin/bank')">
-              <div class="qtitle">🧩 題庫</div>
-              <div class="qdesc">管理 Parsons 題目與干擾片段</div>
+            <button class="qcard" type="button" @click="goAgentlog()">
+              <div class="qtitle">🧩 AI 管理生成紀錄檢視</div>
+              <div class="qdesc">管理 AI 生成的 Parsons 題目與干擾片段</div>
             </button>
 
-            <button class="qcard" type="button" @click="go('/admin/analytics')">
-              <div class="qtitle">📊 分析</div>
+            <button class="qcard" type="button" @click="goAnalyze()">
+              <div class="qtitle">📊 學生作答紀錄分析</div>
               <div class="qdesc">學習成效、常見錯誤概念與趨勢</div>
             </button>
           </div>
@@ -117,44 +102,19 @@
       </main>
     </div>
 
-    <!-- Create Unit Modal (簡易版) -->
-    <div v-if="showCreate" class="modal-mask" @click.self="showCreate=false">
-      <div class="modal">
-        <div class="modal-title">新增單元</div>
-        <div class="form">
-          <label>Unit（例如 U3）</label>
-          <input v-model="form.unit" placeholder="U3" />
-          <label>標題</label>
-          <input v-model="form.title" placeholder="條件判斷" />
-          <label>描述（可選）</label>
-          <textarea v-model="form.description" rows="3"></textarea>
-        </div>
-        <div class="modal-actions">
-          <button class="btn ghost" @click="showCreate=false">取消</button>
-          <button class="btn" @click="createUnit">建立</button>
-        </div>
-        <div v-if="err" class="err">{{ err }}</div>
-      </div>
-    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted } from "vue";
-import { useRouter, useRoute } from "vue-router";
+import { useRouter } from "vue-router";
+import TeacherSidebar from "../components/TeacherSidebar.vue";
 
 const API_BASE = "http://127.0.0.1:5000";
 const router = useRouter();
-const route = useRoute();
 
-const teacher = ref(null);
 const overview = reactive({ weekly_sessions: 0, avg_accuracy: 0, top_misconceptions: [] });
 const units = ref([]);
-
-const showCreate = ref(false);
-const form = reactive({ unit: "", title: "", description: "" });
-const err = ref("");
-const selectedUnit = computed(() => route.query.unit || "");
 
 // ✅ 你原本註解掉的 watch / fetchVideos 我不動（照你的要求）
 // watch(
@@ -176,14 +136,20 @@ function mapTag(tag) {
 
 function go(path) { router.push(path); }
 
-function goUnitDetail(unit) {
-  router.push(`/admin/units/${unit}`);
+function goSubtitle() {
+  router.push("/admin/subtitle");
 }
 
-function openCreateUnit() {
-  err.value = "";
-  form.unit = ""; form.title = ""; form.description = "";
-  showCreate.value = true;
+function goAgentlog() {
+  router.push("/admin/agentlog");
+}
+
+function goAnalyze() {
+  router.push("/admin/analyze");
+}
+
+function goUnitDetail(unit) {
+  router.push({ path: "/admin/upload", query: { unit } });
 }
 
 async function loadDashboard() {
@@ -191,7 +157,6 @@ async function loadDashboard() {
   const data = await res.json();
   if (!data.ok) return;
 
-  teacher.value = data.teacher;
   overview.weekly_sessions = data.overview.weekly_sessions || 0;
   overview.avg_accuracy = data.overview.avg_accuracy || 0;
   overview.top_misconceptions = data.overview.top_misconceptions || [];
@@ -209,27 +174,6 @@ const totalPractices = computed(() =>
   units.value.reduce((sum, u) => sum + Number(u.practices_count || 0), 0)
 );
 
-async function createUnit() {
-  err.value = "";
-  const res = await fetch(`${API_BASE}/api/teacher_dashboard/units`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(form),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    err.value = data.message || "建立失敗";
-    return;
-  }
-  showCreate.value = false;
-  await loadDashboard();
-}
-
-function logout() {
-  localStorage.removeItem("user");
-  router.push("/login");
-}
-
 onMounted(loadDashboard);
 
 function goVideos() {
@@ -246,15 +190,15 @@ function goUploadUnit(unit) {
 }
 
 function goBankUnit(unit) {
-  router.push({ path: "/admin/bank", query: { unit } });
+  router.push({ path: "/admin/agentlog", query: { unit } });
 }
 
 /** ✅ 保留你 template 的 manageUnit(u.unit) 呼叫：提供預設實作避免報錯
  * 你如果原本有自己的「單元管理頁」，把這裡改成你的路徑即可。
  */
 function manageUnit(unit) {
-  // 最保守：先導到單元詳細頁（你已有 goUnitDetail 的概念）
-  router.push({ path: `/admin/units/${unit}` });
+  // 導向影片管理並帶入單元，避免跳到不存在的路由
+  router.push({ path: "/admin/upload", query: { unit } });
 }
 
 // async function fetchVideos() {
@@ -270,96 +214,258 @@ function manageUnit(unit) {
 </script>
 
 <style scoped>
-.t2 { padding: 16px; }
-.topbar{
-  display:flex; justify-content:space-between; align-items:center;
-  border:2px solid #000; border-radius:12px; padding:12px 14px;
-}
-.layout{ display:grid; grid-template-columns: 220px 1fr; gap:14px; margin-top:14px; }
-.sidebar{
-  border:2px solid #000; border-radius:12px; padding:10px;
-  height: calc(100vh - 120px); position: sticky; top: 14px;
-}
-.navitem{ padding:10px 12px; border-radius:10px; cursor:pointer; font-weight:800; }
-.navitem:hover{ background:#f3f3f3; }
-.navitem.active{ background:#e9f3ff; }
-.main{ display:grid; gap:14px; }
-
-.card{ border:2px solid #000; border-radius:12px; padding:14px; }
-.card-title{ font-size:18px; font-weight:900; margin-bottom:10px; }
-
-.kpis{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
-.kpi{ border:1px solid #ddd; border-radius:12px; padding:12px; }
-.kpi.wide{ grid-column: 1 / -1; }
-.kpi-label{ color:#666; font-weight:700; }
-.kpi-value{ font-size:26px; font-weight:900; margin-top:4px; }
-.chips{ display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
-.chip{ background:#f2f2f2; border-radius:999px; padding:6px 10px; font-weight:800; }
-.muted{ color:#777; font-weight:700; }
-
-.unit-row{
-  display:grid; grid-template-columns: 1.6fr .8fr .8fr .6fr;
-  gap:10px; align-items:center;
-  padding:10px 0; border-top:1px solid #eee;
-}
-.unit-row.header{ border-top:0; color:#666; font-weight:900; }
-.unit-name{ font-weight:900; }
-
-.btn{ padding:8px 12px; border:0; border-radius:10px; cursor:pointer; font-weight:900; background:#3b82f6; color:#fff; }
-.btn.ghost{ background:#f2f2f2; color:#111; }
-.btn.small{ padding:6px 10px; border-radius:10px; }
-
-/* ✅ 新增：單元操作區排版 */
-.unit-actions{
-  display:flex;
-  gap:8px;
-  justify-content:flex-end;
-  flex-wrap:wrap;
+.t2 {
+  min-height: 100vh;
+  background: #f5f6f8;
+  padding: 0;
 }
 
-/* ✅ 新增：小按鈕 ghost 版 */
-.btn.ghost2{
-  background:#fff;
-  color:#111;
-  border:1px solid #ddd;
+.layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 16px;
+  margin: 0px;
+  padding: 0px;
 }
 
-/* ✅ ① 快速功能區 */
-.quick{
-  display:grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+.navitem {
+  padding: 11px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 800;
+  color: #1b1b1b;
+  transition: background 0.15s ease;
+}
+
+.navitem:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.navitem.active {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.main {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+}
+
+.card {
+  background: #fff;
+  border-radius: 18px;
+  border: 1px solid #e4e4e4;
+  padding: 16px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.05);
+}
+
+.card-title {
+  margin: 0 0 12px;
+  font-size: 16px;
+  font-weight: 900;
+  color: #111;
+}
+
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.kpi {
+  border: 1px solid #e6e6e6;
+  border-radius: 12px;
+  padding: 12px;
+  background: #fafafa;
+}
+
+.kpi.wide {
+  grid-column: 1 / -1;
+}
+
+.kpi-label {
+  color: #666;
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.kpi-value {
+  font-size: 24px;
+  font-weight: 900;
+  margin-top: 6px;
+  color: #0f172a;
+}
+
+.chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.chip {
+  background: #fff7d6;
+  border: 1px solid #f0d27a;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-weight: 800;
+  font-size: 12px;
+  color: #7a5600;
+}
+
+.muted {
+  color: #777;
+  font-weight: 700;
+}
+
+.unit-row {
+  display: grid;
+  grid-template-columns: 1.6fr 0.8fr 0.8fr 0.8fr;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 0;
+  border-top: 1px solid #ededed;
+}
+
+.unit-row.header {
+  border-top: 0;
+  color: #666;
+  font-weight: 900;
+  padding-top: 0;
+}
+
+.unit-name {
+  font-weight: 900;
+}
+
+.btn {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  background: #f2c266;
+  color: #1c1c1c;
+  padding: 9px 13px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 900;
+  transition: background 0.15s ease;
+}
+
+.btn:hover {
+  background: #ebb447;
+}
+
+.btn.ghost {
+  background: #fff;
+  color: #111;
+}
+
+.btn.ghost:hover {
+  background: #f3f4f6;
+}
+
+.btn.small {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.unit-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.btn.ghost2 {
+  background: #fff;
+  color: #111;
+  border: 1px solid #ddd;
+}
+
+.btn.ghost2:hover {
+  background: #f7f7f7;
+}
+
+.quick {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
-.qcard{
-  text-align:left;
-  border:1px solid #e5e7eb;
-  background:#fff;
-  border-radius:14px;
-  padding:12px;
-  cursor:pointer;
-}
-.qcard:hover{ background:#f9fafb; }
-.qtitle{ font-weight: 900; font-size: 16px; }
-.qdesc{ color:#6b7280; font-weight:700; margin-top:6px; font-size: 13px; }
 
-@media (max-width: 1100px){
-  .quick{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 640px){
-  .quick{ grid-template-columns: 1fr; }
+.qcard {
+  text-align: left;
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  border-radius: 14px;
+  padding: 12px;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
 }
 
-.modal-mask{
-  position:fixed; inset:0; background:rgba(0,0,0,.35);
-  display:flex; align-items:center; justify-content:center;
+.qcard:hover {
+  background: #fafafa;
+  transform: translateY(-1px);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.06);
 }
-.modal{
-  width:420px; background:#fff; border-radius:14px;
-  padding:14px; border:2px solid #000;
+
+.qtitle {
+  font-weight: 900;
+  font-size: 15px;
+  color: #111827;
 }
-.modal-title{ font-weight:900; font-size:18px; margin-bottom:10px; }
-.form{ display:grid; gap:8px; }
-input, textarea{ padding:10px; border-radius:10px; border:1px solid #ddd; }
-.modal-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
-.err{ margin-top:8px; color:#c00; font-weight:800; }
+
+.qdesc {
+  color: #6b7280;
+  font-weight: 700;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #ddd;
+  font-size: 14px;
+}
+
+@media (max-width: 1180px) {
+  .kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    height: auto;
+    position: static;
+    display: flex;
+    gap: 10px;
+  }
+}
+
+@media (max-width: 760px) {
+  .layout {
+    margin-left: 12px;
+    margin-right: 12px;
+  }
+
+  .quick,
+  .kpis {
+    grid-template-columns: 1fr;
+  }
+
+  .unit-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .unit-actions {
+    justify-content: flex-start;
+  }
+}
 </style>

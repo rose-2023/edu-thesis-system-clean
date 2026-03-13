@@ -1,5 +1,6 @@
 import os
 import re
+_re = re  # [新增] 統一使用 _re，避免未定義
 import json
 import threading
 from datetime import datetime, timezone
@@ -12,39 +13,38 @@ from bson.errors import InvalidId
 from ..db import db
 
 from . import parsons_ai  # [新增] 統一管理 OpenAI 呼叫（方案1）
-
-# OpenAI SDK
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
+from .parsons_service import (
+    now_utc,
+    maybe_oid,
+    normalize_video_id,
+    log_event,
+    read_subtitle_text,
+    env_snapshot,
+    ai_enabled,
+    safe_json_loads,
+    parse_srt_segments,
+    compact_segments_for_prompt,
+    extract_context_around,
+    pick_latest_subtitle_path,
+    simple_fallback_generate,
+    resolve_unit_constraints,
+    ai_generate_condition_from_subtitle,
+    ai_generate_io_from_subtitle,
+    ai_generate_parsons_from_subtitle,
+    create_task_for_video,
+)
 
 parsons_bp = Blueprint("parsons", __name__)
 
-
 # =========================
-# Utils
+# UTC time helper
 # =========================
-def now_utc() -> datetime:
+def _utc_now():
+    """
+    Return current UTC datetime.
+    Used by AI feedback / subtitle alignment / regenerate timestamps.
+    """
     return datetime.now(timezone.utc)
-
-
-def maybe_oid(s: str) -> Optional[ObjectId]:
-    try:
-        return ObjectId(str(s))
-    except Exception:
-        return None
-
-
-def normalize_video_id(x) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, ObjectId):
-        return str(x)
-    return str(x).strip()
-
-
 
 # =========================
 # ✅ V1.8 Test (Pre/Post) Utils
@@ -62,9 +62,39 @@ def ensure_test_indexes():
             unique=True,
             name="uniq_student_cycle_role",
         )
-    except Exception:
-        pass
-    _TEST_INDEX_READY = True
+    except Exception as e:
+        import traceback
+        print("\n========== AI HINT AND SEGMENT ERROR ==========")
+        print("error =", repr(e))
+        traceback.print_exc()
+        print("==============================================\n")
+
+
+# =========================================
+# [新增] 取得題目正確 block 順序
+# =========================================
+def _get_expected_ids_from_task(task_doc: dict) -> list:
+    """
+    從 task_doc 取得正確 block id 順序
+    """
+    try:
+        parsed = t5doc_to_parsons_task(task_doc)
+
+        slots = parsed.get("template_slots") or []
+
+        expected_ids = []
+
+        for s in slots:
+            eid = s.get("expected_id")
+            if eid:
+                expected_ids.append(str(eid))
+
+        return expected_ids
+
+    except Exception as e:
+        print("ERROR _get_expected_ids_from_task:", e)
+        return []
+
 
 
 def get_default_test_cycle_id() -> str:
@@ -77,183 +107,9 @@ def is_posttest_open(test_cycle_id: str) -> bool:
     doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
     return bool(doc.get("post_open", False))
 
-def log_event(event: str, **kwargs):
-    try:
-        doc = {"event": event, "created_at": now_utc()}
-        doc.update(kwargs)
-        db.events.insert_one(doc)
-    except Exception:
-        pass
 
-
-def read_subtitle_text(path: str) -> str:
-    if not path:
-        return ""
-    path = path.strip()
-    full = path
-    if not os.path.isabs(path):
-        full = os.path.join(os.getcwd(), path)
-
-    if not os.path.exists(full):
-        return ""
-    try:
-        with open(full, "r", encoding="utf-8-sig", errors="ignore") as f:
-            return f.read()
-    except Exception:
-        try:
-            with open(full, "r", encoding="cp950", errors="ignore") as f:
-                return f.read()
-        except Exception:
-            return ""
-
-
-def env_snapshot() -> Dict[str, Any]:
-    return {
-        "AI_ENABLED": os.getenv("AI_ENABLED"),
-        "OPENAI_MODEL": os.getenv("OPENAI_MODEL"),
-        "OPENAI_API_KEY_exists": bool(os.getenv("OPENAI_API_KEY")),
-    }
-
-
-def ai_enabled() -> bool:
-    v = (os.getenv("AI_ENABLED") or "").strip().lower()
-    return v in ["1", "true", "yes", "y", "on"]
-
-
-def get_openai_client() -> "OpenAI":
-    if OpenAI is None:
-        raise RuntimeError("openai 套件未安裝，請先 pip install openai")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY 未設定（請在 .env 設定 OPENAI_API_KEY=...）")
-    return OpenAI(api_key=api_key)
-
-
-def safe_json_loads(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-# =========================
-# subtitles / parsing helpers
-# =========================
-SRT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
-
-
-def srt_time_to_seconds(t: str) -> float:
-    m = SRT_TIME_RE.search(t or "")
-    if not m:
-        return 0.0
-    hh, mm, ss, ms = m.groups()
-    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
-
-
-def strip_srt_noise(srt_text: str) -> str:
-    if not srt_text:
-        return ""
-    lines = []
-    for ln in srt_text.splitlines():
-        t = ln.strip()
-        if not t:
-            continue
-        if t.isdigit():
-            continue
-        if "-->" in t:
-            continue
-        lines.append(t)
-    return "\n".join(lines).strip()
-
-
-def parse_srt_segments(srt_text: str) -> list:
-    if not srt_text:
-        return []
-    lines = [ln.rstrip("\n") for ln in srt_text.splitlines()]
-    segs = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.isdigit():
-            i += 1
-            if i >= len(lines):
-                break
-            time_line = lines[i].strip()
-            if "-->" not in time_line:
-                continue
-            parts = [p.strip() for p in time_line.split("-->")]
-            start = srt_time_to_seconds(parts[0])
-            end = srt_time_to_seconds(parts[1]) if len(parts) > 1 else start
-            i += 1
-            text_buf = []
-            while i < len(lines) and lines[i].strip() != "":
-                text_buf.append(lines[i].strip())
-                i += 1
-            txt = " ".join(text_buf).strip()
-            if txt:
-                segs.append({"start": start, "end": end, "text": txt})
-        i += 1
-    return segs
-
-
-def compact_segments_for_prompt(segs: list, max_chars: int = 12000) -> str:
-    out = []
-    total = 0
-    for s in segs:
-        st = int(float(s.get("start", 0)))
-        ed = int(float(s.get("end", 0)))
-        txt = (s.get("text") or "").strip()
-        line = f"[{st}-{ed}] {txt}"
-        if total + len(line) + 1 > max_chars:
-            break
-        out.append(line)
-        total += len(line) + 1
-    return "\n".join(out)
-
-
-def extract_context_around(segs: list, start: float, end: float, window: int = 5) -> str:
-    picked = []
-    for s in segs:
-        st = float(s.get("start", 0))
-        ed = float(s.get("end", 0))
-        if ed < start:
-            continue
-        if st > end:
-            continue
-        picked.append(s)
-    if not picked:
-        return ""
-    picked = picked[: max(1, window)]
-    return "\n".join([f"[{int(p.get('start', 0))}-{int(p.get('end', 0))}] {p.get('text','')}" for p in picked])
-
-
-def pick_latest_subtitle_path(video_doc: dict, video_id_str: str) -> str:
-    try:
-        vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
-        if vid_oid:
-            sub_doc = db.subtitles.find_one(
-                {"video_id": vid_oid},
-                sort=[("version", -1), ("created_at", -1)]
-            )
-            if sub_doc and (sub_doc.get("path") or "").strip():
-                return (sub_doc.get("path") or "").strip()
-
-        if vid_oid:
-            sub_doc2 = db.subtitles.find_one(
-                {"video_id": str(vid_oid)},
-                sort=[("version", -1), ("created_at", -1)]
-            )
-            if sub_doc2 and (sub_doc2.get("path") or "").strip():
-                return (sub_doc2.get("path") or "").strip()
-    except Exception:
-        pass
-
-    return (video_doc.get("subtitle_path", "") or "").strip()
-
-
-# =========================
-# t5doc_to_parsons_task (teacher->student normalize)
-# =========================
+# ========================
+# [新增] 將資料庫的 task doc 轉成前端 Parsons.vue 期待的格式
 def t5doc_to_parsons_task(doc: dict) -> dict:
     """
     將 parsons_tasks / parsons_test_tasks 來源任務（doc）轉成前端 Parsons.vue 期待的格式。
@@ -281,6 +137,18 @@ def t5doc_to_parsons_task(doc: dict) -> dict:
 
     solution_blocks = _norm_blocks(solution_blocks)
     distractor_blocks = _norm_blocks(distractor_blocks)
+
+    # [新增] 若干擾區塊沒有 enabled 欄位，預設視為保留（True），避免學生端看不到干擾題
+    try:
+        _dbs = []
+        for _b in (distractor_blocks or []):
+            if isinstance(_b, dict) and ('enabled' not in _b):
+                _b['enabled'] = True
+            _dbs.append(_b)
+        distractor_blocks = _dbs
+    except Exception:
+        pass
+
 
     # --- Normalize template_slots ---
     # 期望是 list[dict]：{slot, label, expected_id}
@@ -326,729 +194,349 @@ def t5doc_to_parsons_task(doc: dict) -> dict:
 # =========================
 # Fallback generator
 # =========================
-def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: str = "L1") -> Dict[str, Any]:
-    question_text = "（備援題目）請完成一段程式：根據題目需求輸入資料並輸出結果。"
-    solution_lines = ["x = int(input())", "y = int(input())", "print(x + y)"]
-    distractor_lines = ["x = input()", "y = input()", "print(x - y)", "print(x * y)"]
 
-    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core"} for i, line in enumerate(solution_lines)]
-    distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
-    pool = distractor_blocks + solution_blocks
-    template_slots = [{"label": f"請放入正確的第{i+1}行", "slot": str(i)} for i in range(len(solution_lines))]
 
-    return {
+# =========================
+# 固定題：老師手動建立 / 更新
+# POST /fixed_task/save
+# =========================
+@parsons_bp.post("/fixed_task/save")
+def save_fixed_task():
+    """
+    老師在前端填寫題目後儲存。
+    同一支影片只保留一筆 gen_source=fixed 的題目（upsert）。
+    """
+    data = request.get_json(silent=True) or {}
+    video_id = (data.get("video_id") or "").strip()
+    if not video_id:
+        return jsonify({"ok": False, "message": "missing video_id"}), 400
+
+    question_text = (data.get("question_text") or "").strip()
+    if not question_text:
+        return jsonify({"ok": False, "message": "question_text is required"}), 400
+
+    solution_lines = data.get("solution_lines") or []
+    distractor_lines = data.get("distractor_lines") or []
+
+    if not isinstance(solution_lines, list) or len(solution_lines) < 2:
+        return jsonify({"ok": False, "message": "solution_lines must have at least 2 items"}), 400
+
+    # 轉成 blocks 格式（與 AI 題一致，學生端 parsons.vue 直接可用）
+    def _to_blocks(lines, prefix=""):
+        blocks = []
+        for i, ln in enumerate(lines):
+            text = str(ln).rstrip()
+            if not text:
+                continue
+            indent = len(text) - len(text.lstrip())
+            blocks.append({
+                "id": f"{prefix}{i}",
+                "text": text,
+                "indent": indent // 4,
+                "semantic_zh": "",
+            })
+        return blocks
+
+    solution_blocks = _to_blocks(solution_lines, prefix="s")
+    distractor_blocks = _to_blocks(distractor_lines, prefix="d")
+    pool = solution_blocks + distractor_blocks
+
+    # template_slots：用 solution_blocks 的 text 做中文標籤（空白，老師可以事後補）
+    template_slots = [
+        {"slot": str(i), "label": b["text"]}
+        for i, b in enumerate(solution_blocks)
+    ]
+
+    vid_oid = maybe_oid(video_id)
+    unit = (data.get("unit") or "").strip()
+    level = (data.get("level") or "L1").strip()
+    # [新增] 先整理字幕範圍，避免 start_ts / end_ts 未定義
+    source_subtitle = data.get("source_subtitle") or {}
+    raw_subtitle_range = data.get("subtitle_range") or {}
+
+    subtitle_range = {
+        "start": source_subtitle.get("start_ts", raw_subtitle_range.get("start")),
+        "end": source_subtitle.get("end_ts", raw_subtitle_range.get("end")),
+    }
+    now = now_utc()
+    doc_set = {
+        "video_id_str": video_id,
+        "gen_source": "fixed",
         "question_text": question_text,
         "solution_blocks": solution_blocks,
         "distractor_blocks": distractor_blocks,
         "pool": pool,
         "template_slots": template_slots,
-        "ai_feedback": {"general": "（AI 生成失敗，使用系統備援題目）", "common_mistakes": [], "hints": []},
+        "unit": unit,
+        "level": level,
+        "unit_type": data.get("unit_type") or "loop",
+        "enabled": False,
+        "status": "pending",
+        "review_status": "draft",
+        "updated_at": now,
+        "ai_generated": False, # 固定題預設不是 AI 生成
+        "ai_segment_map": {}, # AI 推估的 slot -> segment（start/end/evidence）
+        "ai_slot_hints": {}, # AI 推估的 slot -> 中文提示
+        "ai_segments_compact": "", # AI 生成時用的字幕精簡版（冗長，先不存）
+        "subtitle_range": subtitle_range,
+        "version": "fixed",
     }
+    print("data keys =", list(data.keys()))
+    print("source_subtitle =", data.get("source_subtitle"))
+    print("subtitle_range =", data.get("subtitle_range"))
+
+    if vid_oid:
+        doc_set["video_id"] = vid_oid
+
+    # upsert：同影片只保留一筆 fixed
+    q = {"gen_source": "fixed"}
+    if vid_oid:
+        q["video_id"] = vid_oid
+    else:
+        q["video_id_str"] = video_id
+
+    existing = db.parsons_tasks.find_one(q)
+    if existing:
+        db.parsons_tasks.update_one({"_id": existing["_id"]}, {"$set": doc_set})
+        task_id = str(existing["_id"])
+    else:
+        doc_set["created_at"] = now
+        result = db.parsons_tasks.insert_one(doc_set)
+        task_id = str(result.inserted_id)
+
+    return jsonify({"ok": True, "task_id": task_id})
+
+# ========================
+# GET /fixed_task/get 供前端載入已儲存的固定題
+@parsons_bp.get("/fixed_task/get")
+def get_fixed_task():
+    """取得這支影片的固定題（供前端載入已儲存內容）"""
+    video_id = (request.args.get("video_id") or "").strip()
+    if not video_id:
+        return jsonify({"ok": False, "message": "missing video_id"}), 400
+
+    vid_oid = maybe_oid(video_id)
+    q = {"gen_source": "fixed"}
+    if vid_oid:
+        q["$or"] = [{"video_id": vid_oid}, {"video_id_str": video_id}]
+    else:
+        q["video_id_str"] = video_id
+
+    task = db.parsons_tasks.find_one(q)
+    if not task:
+        return jsonify({"ok": True, "found": False})
+
+    sol_lines = [b.get("text", "") for b in (task.get("solution_blocks") or [])]
+    dis_lines = [b.get("text", "") for b in (task.get("distractor_blocks") or [])]
+
+    return jsonify({
+        "ok": True,
+        "found": True,
+        "task_id": str(task["_id"]),
+        "question_text": task.get("question_text") or "",
+        "solution_lines": sol_lines,
+        "distractor_lines": dis_lines,
+        "enabled": bool(task.get("enabled", False)),
+        "status": task.get("status") or "pending",
+    })
+
+# ========================
 
 
-# =========================
-# OpenAI generator
-# =========================
-def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title: str, level: str = "L1") -> Dict[str, Any]:
-    """
-    V1.6-goClass-lite（Parsons 低 token + 閉環驗收 + 回看片段）
-    - Parsons 題（非選擇題）
-    - 低 token：AI 只生「question_text + solution_lines」，干擾題/中文語意用本地規則（0 token）
-    - goClass 風：本地驗收確保 solution_lines 可執行且符合題意（閉環），縮排錯也算錯（透過干擾題 + 本地檢查）
-    - B：額外用 AI 產出 segment_map（含 evidence）+ slot_hints（每格一句），用於錯誤回看影片片段
-    """
-    if not ai_enabled():
-        raise RuntimeError("AI_ENABLED is false -> skip OpenAI")
-    if not subtitle_text:
-        raise RuntimeError("subtitle_text is empty")
+# ========================
+# [新增] POST /fixed_task/align_subtitle  手動觸發固定題字幕對齊
+# 直接從 prompt_source.subtitle_preview 或 ai_segments_compact 取字幕，不需要找檔案路徑
+# ========================
+@parsons_bp.post("/fixed_task/align_subtitle")
+def align_fixed_task_subtitle():
+    data = request.get_json(silent=True) or {}
+    task_id_str = (data.get("task_id") or "").strip()
+    video_id = (data.get("video_id") or "").strip()
 
-    # --- subtitles ---
-    segs = parse_srt_segments(subtitle_text)
-    cleaned = strip_srt_noise(subtitle_text)
+    task = None
+    if task_id_str:
+        try:
+            task = db.parsons_tasks.find_one({"_id": ObjectId(task_id_str)})
+        except Exception:
+            pass
+    if not task and video_id:
+        vid_oid = maybe_oid(video_id)
+        q = {"gen_source": "fixed"}
+        if vid_oid:
+            q["$or"] = [{"video_id": vid_oid}, {"video_id_str": video_id}]
+        else:
+            q["video_id_str"] = video_id
+        task = db.parsons_tasks.find_one(q)
 
-    # [新增] 低 token：字幕壓縮（只提供必要片段給 AI）
-    segs_compact = compact_segments_for_prompt(segs, max_chars=4000)
+    if not task:
+        return jsonify({"ok": False, "message": "找不到固定題（gen_source=fixed）"}), 404
+
+    real_task_id = str(task["_id"])
+
+    # ① 取字幕文字：優先 subtitle_preview，其次 ai_segments_compact，其次 subtitle_text_used
+    prompt_source = task.get("prompt_source") or {}
+    subtitle_raw = (
+        prompt_source.get("subtitle_preview")
+        or prompt_source.get("subtitle_text")
+        or task.get("subtitle_text_used")
+        or task.get("ai_segments_compact")
+        or ""
+    ).strip()
+
+    # ② 如果還是空的，嘗試從影片的 subtitle_preview 欄位取
+    if not subtitle_raw:
+        vid_oid = task.get("video_id")
+        vid_str = task.get("video_id_str") or (str(vid_oid) if vid_oid else "")
+        video_doc = {}
+        if vid_oid:
+            try:
+                video_doc = db.videos.find_one({"_id": vid_oid}) or {}
+            except Exception:
+                pass
+        subtitle_raw = (
+            video_doc.get("subtitle_preview")
+            or video_doc.get("subtitle_text")
+            or ""
+        ).strip()
+
+    if not subtitle_raw:
+        return jsonify({
+            "ok": False,
+            "message": "找不到字幕內容，請確認此固定題的影片有字幕資料",
+            "task_id": real_task_id,
+            "prompt_source_keys": list(prompt_source.keys()),
+        }), 404
+
+    # ③ 解析字幕成時間段
+    # 判斷是 SRT 格式還是已經是 [start-end] text 格式
+    if "-->" in subtitle_raw:
+        segs = parse_srt_segments(subtitle_raw)
+        segs_compact = compact_segments_for_prompt(segs, max_chars=12000)
+    else:
+        # 已經是 compact 格式，直接用
+        segs_compact = subtitle_raw[:12000]
+        segs = []
+
     if not segs_compact:
-        # 仍允許無字幕，但 segment_map 會走 fallback
-        segs_compact = ""
+        return jsonify({"ok": False, "message": "字幕解析結果為空"}), 400
 
-    import random, hashlib, ast, io, contextlib
+    solution_blocks = task.get("solution_blocks") or []
+    if not solution_blocks:
+        return jsonify({"ok": False, "message": "此固定題沒有 solution_blocks"}), 400
+
+    blocks_lines_list = []
+    for i, b in enumerate(solution_blocks):
+        blocks_lines_list.append("slot \"%d\" (id=%s): %s" % (i, b.get("id", ""), b.get("text", "")))
+    blocks_text = "\n".join(blocks_lines_list)
+
+    if not ai_enabled():
+        return jsonify({"ok": False, "message": "AI_ENABLED=false"}), 503
 
     model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
 
-    # ===============================
-    # [新增] 0 token：用字幕關鍵字挑情境（看不出來就 seed 隨機）
-    # ===============================
-    def _kw_hit(*kws: str) -> bool:
-        t = (cleaned or "").lower()
-        return any((kw.lower() in t) for kw in kws if kw)
-
-    scenarios = [
-        {
-            "name": "avg_scores",
-            "desc": "成績平均：持續輸入成績直到輸入 -1（-1 不納入），最後輸出平均與筆數。",
-            "tests": [["10", "20", "-1"]],
-            "check": "nums>=2",  # avg + count
-            "keywords": ["平均", "成績", "分數", "mean", "average"],
-        },
-        {
-            "name": "sum_prices",
-            "desc": "購物累計：重複輸入價格直到輸入 0 結束，最後輸出總金額與筆數。",
-            "tests": [["30", "70", "0"]],
-            "check": "nums>=2",
-            "keywords": ["金額", "價格", "總和", "sum", "total"],
-        },
-        {
-            "name": "menu_loop",
-            "desc": "選單迴圈：反覆輸入 1/2/0，1=新增一筆、2=顯示筆數、0=離開，最後輸出總筆數。",
-            "tests": [["1", "1", "2", "0"]],
-            "check": "nums>=1",
-            "keywords": ["選單", "功能", "menu", "選項"],
-        },
-        {
-            "name": "validate_range",
-            "desc": "資料驗證：反覆輸入數值直到介於指定範圍內才結束，最後輸出有效數值。",
-            "tests": [["-5", "200", "18"]],
-            "check": "nums>=1",
-            "keywords": ["驗證", "範圍", "合法", "valid"],
-        },
-        {
-            "name": "sentinel_ok",
-            "desc": "資料輸入：反覆輸入文字直到輸入 'ok' 結束，最後輸出輸入筆數。",
-            "tests": [["a", "b", "ok"]],
-            "check": "nums>=1",
-            "keywords": ["直到", "結束", "停止", "ok"],
-        },
-        {
-            "name": "guess_game",
-            "desc": "猜數字：反覆輸入猜測直到猜中答案（可在程式中寫死答案），輸出猜測次數。",
-            "tests": [["3", "7"]],
-            "check": "nums>=1",
-            "keywords": ["猜", "猜數字", "guess"],
-        },
-    ]
-
-    # keyword pick
-    picked = None
-    for sc in scenarios:
-        if _kw_hit(*sc.get("keywords", [])):
-            picked = sc
-            break
-
-    if not picked:
-        seed_src = (unit or "") + "|" + (video_title or "") + "|" + ((cleaned or "")[:1500])
-        seed_int = int(hashlib.md5(seed_src.encode("utf-8")).hexdigest(), 16)
-        rnd = random.Random(seed_int ^ random.randint(0, 10**9))  # regenerate 可變化
-        picked = rnd.choice(scenarios)
-    else:
-        # 若字幕命中，仍讓 regenerate 有變化：用影片資訊做微隨機
-        seed_src = (unit or "") + "|" + (video_title or "") + "|" + picked["name"] + "|" + ((cleaned or "")[:800])
-        seed_int = int(hashlib.md5(seed_src.encode("utf-8")).hexdigest(), 16)
-        rnd = random.Random(seed_int ^ random.randint(0, 10**9))
-        # 同一情境下也可能變體（例如換 sentinel 值/輸出格式），交給 AI
-        # 這裡不更換情境，僅保留 rnd 供後續使用
-
-    scenario_desc = picked["desc"]
-    scenario_tests = picked["tests"]
-    scenario_check = picked["check"]
-
-    # ===============================
-    # [新增] 本地 0 token：安全驗收（閉環）
-    # ===============================
-    import re as _re
-
-    _cjk_re = _re.compile(r"[\u4e00-\u9fff]")
-    _python_token_re = _re.compile(r"\b(while|for|if|elif|else|break|continue|input|print|int|float|str|len|range)\b|[=:+\-*/()<>]")
-
-    def _looks_like_code(line: str) -> bool:
-        s = (line or "").rstrip("\n")
-        if not s.strip():
-            return False
-        if _cjk_re.search(s):
-            return False
-        return bool(_python_token_re.search(s))
-
-    def _compile_ok(lines: list) -> bool:
-        try:
-            compile("\n".join(lines), "<parsons_ai>", "exec")
-            return True
-        except Exception:
-            return False
-
-    def _has_loop(lines: list) -> bool:
-        joined = "\n".join(lines).lower()
-        return ("while " in joined) or ("for " in joined)
-
-    def _loop_has_body_indent(lines: list) -> bool:
-        for i, ln in enumerate(lines):
-            if ln.strip().startswith("while ") or ln.strip().startswith("for "):
-                if i + 1 < len(lines):
-                    nxt = lines[i + 1]
-                    if nxt.startswith("    "):  # 你要的縮排檢查
-                        return True
-        return False
-
-    def _has_print(lines: list) -> bool:
-        return "print(" in ("\n".join(lines).lower())
-
-    def _has_input(lines: list) -> bool:
-        return "input(" in ("\n".join(lines).lower())
-
-    def _has_end_control(lines: list) -> bool:
-        joined = "\n".join(lines).lower()
-        return ("break" in joined) or any(ln.strip().startswith("while ") and ("true" not in ln.lower()) for ln in lines)
-
-    # AST sandbox
-    ALLOWED_NODES = (
-        ast.Module, ast.Assign, ast.AugAssign, ast.Expr, ast.Call,
-        ast.Name, ast.Load, ast.Store, ast.Constant,
-        ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
-        ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-        ast.If, ast.While, ast.For, ast.Break, ast.Continue, ast.Pass,
-        ast.List, ast.Tuple,
+    system_prompt = (
+        "你是字幕對齊助教。為每個程式區塊，從字幕中找出老師「邊輸入程式碼、邊口頭講解」該段程式的片段。"
+        "判斷標準：1.字幕出現程式關鍵字（變數名/函式名） 2.字幕有「輸入」「打」「寫」「這行」「進到同步編輯器」等操作詞 3.概念解釋句。"
+        "start/end 必須是字幕實際時間戳，不可捏造。找不到則省略。只輸出純 JSON。"
     )
-    ALLOWED_FUNCS = {"input", "print", "int", "float", "str", "len", "range"}
 
-    def _ast_safe(code: str) -> bool:
-        try:
-            tree = ast.parse(code, mode="exec")
-        except Exception:
-            return False
-        for node in ast.walk(tree):
-            if not isinstance(node, ALLOWED_NODES):
-                return False
-            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Attribute, ast.Subscript, ast.Lambda, ast.With, ast.Try, ast.FunctionDef, ast.ClassDef)):
-                return False
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    if node.func.id not in ALLOWED_FUNCS:
-                        return False
-                else:
-                    return False
-        return True
+    user_prompt = "\n".join([
+        "請為以下每個程式區塊，找出老師邊輸入程式碼邊講解的字幕片段。",
+        "",
+        "【程式區塊】",
+        blocks_text,
+        "",
+        "【字幕（格式：[start-end] text）】",
+        segs_compact,
+        "",
+        "輸出格式（slot key 用 \"0\",\"1\"... 字串）：",
+        "{\"ai_segment_map\":{\"0\":{\"start\":120.0,\"end\":150.0,\"evidence\":\"字幕句\"},\"1\":{\"start\":155.0,\"end\":180.0,\"evidence\":\"字幕句\"}},\"subtitle_range\":{\"start\":120.0,\"end\":180.0}}",
+    ])
 
-    def _run_with_inputs(code: str, inputs: list) -> str:
-        it = iter(inputs)
+    try:
+        ai_resp = parsons_ai.call_openai_json(
+            model=model,
+            system=system_prompt,
+            user=user_prompt
+        ) or {}
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"AI 呼叫失敗: {e}"}), 500
 
-        def _fake_input(prompt=""):
+    update = {}
+    seg_map = ai_resp.get("ai_segment_map")
+    if isinstance(seg_map, dict):
+        valid_map = {}
+        for k, v in seg_map.items():
             try:
-                return next(it)
-            except StopIteration:
-                return ""
-
-        out = io.StringIO()
-        safe_globals = {"__builtins__": {}}
-        safe_locals = {
-            "input": _fake_input,
-            "print": lambda *args, **kwargs: print(*args, file=out, **{k: v for k, v in kwargs.items() if k in ("sep", "end")}),
-            "int": int,
-            "float": float,
-            "str": str,
-            "len": len,
-            "range": range,
-        }
-        with contextlib.redirect_stdout(out):
-            exec(code, safe_globals, safe_locals)
-        return out.getvalue().strip()
-
-    def _output_check(check: str, out: str) -> bool:
-        if not out:
-            return False
-        nums = _re.findall(r"-?\d+\.?\d*", out)
-        if check.startswith("nums>="):
-            try:
-                need = int(check.split(">=")[1])
+                s = float(v.get("start"))
+                e = float(v.get("end"))
+                if e > s:
+                    valid_map[k] = {"start": s, "end": e, "evidence": str(v.get("evidence", ""))}
             except Exception:
-                need = 1
-            return len(nums) >= need
-        return True
+                pass
+        if valid_map:
+            update["ai_segment_map"] = valid_map
 
-    def _auto_grade(solution_lines: list) -> str:
-        if not _compile_ok(solution_lines):
-            return "compile failed"
-        if any(not _looks_like_code(x) for x in solution_lines):
-            return "solution_lines contains Chinese or non-code"
-        if any(_re.search(r"^\s*def\s+", x) for x in solution_lines):
-            return "contains def"
-        if any(_re.search(r"^\s*class\s+", x) for x in solution_lines):
-            return "contains class"
-        if not _has_loop(solution_lines):
-            return "missing loop"
-        if not _loop_has_body_indent(solution_lines):
-            return "loop body indentation missing"
-        if not _has_input(solution_lines):
-            return "missing input"
-        if not _has_print(solution_lines):
-            return "missing print output"
-        if not _has_end_control(solution_lines):
-            return "missing end condition/break"
-
-        code = "\n".join(solution_lines)
-        if not _ast_safe(code):
-            return "AST rejected"
-
-        # [新增] 低 token：只跑 1 組測資
-        test_inputs = (scenario_tests[:1] or [[]])
-        for inputs in test_inputs:
-            try:
-                out = _run_with_inputs(code, inputs)
-            except Exception as e:
-                return f"exec failed: {e}"
-            if not _output_check(scenario_check, out):
-                return "output check failed"
-        return ""
-
-    # ===============================
-    # [新增] AI 生成（最小輸出）+ 失敗只修一次（省 token）
-    # ===============================
-    system_msg = "你是Python程式設計助教。請嚴格只輸出『合法 JSON』，不要輸出 Markdown 或多餘文字。"
-
-    banned_patterns = """
-請避免以下過度常見模板與禁止項：
-- 直到輸入 'ok' 為止（除非情境就是 ok sentinel）
-- def / class
-- 中文註解或中文程式碼
-"""
-
-    base_prompt = f"""
-你要產生一題 Parsons 程式重組題（不是選擇題）。
-題型固定：迴圈（while 或 for），不得使用 def/class。
-
-【情境】
-{scenario_desc}
-
-【硬性規則（必須遵守）】
-- 只輸出合法 JSON（不要 Markdown、不要多餘文字）
-- 只輸出以下欄位：question_text、solution_lines
-- question_text：繁體中文，描述要做什麼（不要直接透露程式碼）
-- solution_lines：英文 Python code 4~10 行，且必須包含：
-  1) 迴圈
-  2) 迴圈內至少一行縮排（4 spaces）
-  3) 結束條件（可用 break）
-  4) 最後要輸出結果（print）
-- solution_lines 禁止中文與註解
-{banned_patterns}
-
-輸出 JSON 格式：
-{{
-  "question_text": "題目敘述（繁中）",
-  "solution_lines": ["python code line 1", "..."]
-}}
-
-字幕（含時間戳）（格式：[start-end] text）：
-{segs_compact}
-""".strip()
-
-    MAX_RETRY = 2
-    data = None
-    last_error = ""
-    last_candidate = None
-
-    for attempt in range(MAX_RETRY):
-        if attempt == 0:
-            user_msg = base_prompt
-        else:
-            prev = last_candidate or {}
-            prev_q = (prev.get("question_text") or "").strip()
-            prev_sol = prev.get("solution_lines") or []
-            user_msg = f"""
-你上一版未通過自動驗收：{last_error}
-
-【只修正 solution_lines】（保持同一情境方向）
-- 修正縮排/缺少結束條件/缺少輸出/缺少更新等問題
-- 仍需 while/for、仍需迴圈內縮排、仍需 print、仍需可執行
-- solution_lines 禁止中文與註解
-- 不得 def/class
-- 只輸出合法 JSON（欄位仍是 question_text + solution_lines）
-
-上一版 question_text（參考）：{prev_q}
-上一版 solution_lines：{prev_sol}
-""".strip()
-
-        text = (parsons_ai.call_openai_output_text(system=system_msg, user=user_msg, model=model, max_output_tokens=900) or "").strip()
-        cand = safe_json_loads(text)
-        if not cand:
-            last_error = "non-JSON"
-            last_candidate = None
-            continue
-
-        q = (cand.get("question_text") or "").strip()
-        sol = cand.get("solution_lines") or []
-        last_candidate = cand
-
-        if not q:
-            last_error = "missing question_text"
-            continue
-        if not isinstance(sol, list) or len(sol) < 4 or len(sol) > 10:
-            last_error = "solution_lines length not 4~10"
-            continue
-
-        sol = [str(x) for x in sol]
-        cand["solution_lines"] = sol
-
-        grade_err = _auto_grade(sol)
-        if grade_err:
-            last_error = grade_err
-            continue
-
-        data = cand
-        break
-
-    if not data:
-        raise RuntimeError(f"AI generation failed: {last_error}")
-
-    question_text = (data.get("question_text") or "").strip()
-    solution_lines = data["solution_lines"]
-
-    # ===============================
-    # [新增] B：segment_map + slot_hints（含 evidence）— 低 token 對齊任務
-    # ===============================
-    seg_map = {}
-    slot_hints = {}
-
-    if ai_enabled() and segs_compact:
+    sub_range = ai_resp.get("subtitle_range")
+    if isinstance(sub_range, dict):
         try:
-            align_system = (
-                "你是Python教學助教。你要把『每一行程式（slot）』對齊到字幕時間戳。\n"
-                "請嚴格只輸出合法 JSON，不要輸出 Markdown 或多餘文字。\n"
-                "必須包含：segment_map、slot_hints。\n"
-                "segment_map 每格都要有，並含 evidence（引用字幕關鍵句，可短）。"
-            )
-            align_user = f"""
-請根據題目與字幕，為每一格（slot_index）提供最相關的回看片段時間（start/end，秒），並給一句短提示（hint）。
-
-輸出 JSON 格式：
-{{
-  "segment_map": [
-    {{"slot_index": 0, "start": 12.3, "end": 24.8, "evidence": "字幕關鍵句（繁中，可短）"}},
-    ...
-  ],
-  "slot_hints": [
-    {{"slot_index": 0, "hint": "如果第1格錯，提醒學生什麼（繁中，1句）"}},
-    ...
-  ]
-}}
-
-限制：
-- slot_index 必須從 0 開始，數量要等於 solution_lines 行數
-- start/end 必須是字幕時間戳合理區間（秒數）
-- evidence 必須是字幕中的關鍵句（可短，不要超過 15 字）
-- hint 每格 1 句，繁體中文，不要直接給出程式碼或變數名
-
-題目：{question_text}
-solution_lines：{solution_lines}
-
-字幕（含時間戳）（格式：[start-end] text）：
-{segs_compact}
-""".strip()
-
-            align = parsons_ai.call_openai_json(
-                system=align_system,
-                user=align_user,
-                model=model,
-                temperature=0.2,
-                max_output_tokens=900,
-            ) or {}
-
-            seg_map_in = align.get("segment_map") or []
-            hint_in = align.get("slot_hints") or []
-
-            for it in seg_map_in:
-                try:
-                    si = int(it.get("slot_index"))
-                    s = float(it.get("start"))
-                    e = float(it.get("end"))
-                    if si < 0 or si >= len(solution_lines) or e <= s:
-                        continue
-                    seg_map[str(si)] = {
-                        "start": s,
-                        "end": e,
-                        "evidence": (it.get("evidence") or "").strip(),
-                    }
-                except Exception:
-                    continue
-
-            for it in hint_in:
-                try:
-                    si = int(it.get("slot_index"))
-                    if si < 0 or si >= len(solution_lines):
-                        continue
-                    slot_hints[str(si)] = (it.get("hint") or "").strip()
-                except Exception:
-                    continue
-        except Exception:
-            seg_map = {}
-            slot_hints = {}
-
-    # [新增] 若 AI 對齊失敗：用字幕片段平均分配 fallback（0 token）
-    if not seg_map:
-        if segs:
-            n = len(solution_lines)
-            picked_segs = segs[: max(n, 1)]
-            for i in range(n):
-                s = picked_segs[min(i, len(picked_segs)-1)]
-                seg_map[str(i)] = {
-                    "start": float(s.get("start", 0.0)),
-                    "end": float(s.get("end", float(s.get("start", 0.0)) + 5.0)),
-                    "evidence": (s.get("text", "") or "").strip()[:15],
-                }
-        else:
-            for i in range(len(solution_lines)):
-                seg_map[str(i)] = {"start": 0.0, "end": 5.0, "evidence": ""}
-
-    if not slot_hints:
-        for i in range(len(solution_lines)):
-            slot_hints[str(i)] = "請確認此步驟是否在正確的流程位置與縮排層級。"
-
-    # ===============================
-    # [新增] 干擾題 mutation（0 token，含縮排錯）
-    # ===============================
-    def _normalize_line(s: str) -> str:
-        return _re.sub(r"\s+", "", (s or "").strip()).lower()
-
-    def _tokenize(s: str):
-        return _re.findall(r"[A-Za-z_]+|\d+|==|!=|<=|>=|\+=|-=|\*=|/=|[=:+\-*/()<>]", (s or ""))
-
-    def _diff_score(a: str, b: str) -> int:
-        sa, sb = set(_tokenize(a)), set(_tokenize(b))
-        return len(sa.symmetric_difference(sb))
-
-    def _mutate_line(line: str) -> list:
-        variants = []
-        s = line
-        if "+=" in s:
-            variants.append(s.replace("+=", "="))
-        if "==" in s:
-            variants.append(s.replace("==", "!="))
-        if "!=" in s:
-            variants.append(s.replace("!=", "=="))
-        if "<=" in s:
-            variants.append(s.replace("<=", ">="))
-        if ">=" in s:
-            variants.append(s.replace(">=", "<="))
-        if s.strip() == "break":
-            variants.append("continue")
-        if "int(input(" in s:
-            variants.append(s.replace("int(input(", "input("))
-        if "float(input(" in s:
-            variants.append(s.replace("float(input(", "input("))
-        if _re.search(r"\bcount\s*\+=\s*1\b", s):
-            variants.append(_re.sub(r"\bcount\s*\+=\s*1\b", "count += 0", s))
-        return variants
-
-    def _make_indent_wrong(line: str) -> str:
-        if line.startswith("    "):
-            return line[4:]
-        return "    " + line
-
-    def _distractor_semantic_zh(line: str) -> str:
-        s = (line or "").strip().lower()
-        if not (line or "").startswith("    ") and ("+=" in s or "=" in s):
-            return "此行可能不在正確縮排層級，導致流程不符合預期"
-        if "==" in s or "!=" in s or "<" in s or ">" in s:
-            return "條件判斷可能寫反，導致提早結束或無法結束"
-        if "break" in s or "continue" in s:
-            return "迴圈控制語句可能使用不當，造成流程錯誤"
-        if "+=" in s or "=" in s:
-            return "統計更新方式可能錯誤，導致結果不正確"
-        if "input" in s:
-            return "資料處理方式可能不一致，導致判斷或計算出錯"
-        return "此行邏輯可能與題目需求不一致"
-
-    distractor_lines = []
-    sol_norm = {_normalize_line(x) for x in solution_lines}
-
-    candidates = []
-    for ln in solution_lines:
-        for v in _mutate_line(ln):
-            if v and _looks_like_code(v):
-                candidates.append(v)
-
-    # 強制加入至少一個縮排錯版本
-    indented = [x for x in solution_lines if x.startswith("    ")]
-    if indented:
-        candidates.append(_make_indent_wrong(indented[0]))
-    else:
-        candidates.append(_make_indent_wrong(solution_lines[-1]))
-
-    uniq = []
-    seen = set()
-    for c in candidates:
-        cn = _normalize_line(c)
-        if cn in sol_norm:
-            continue
-        if cn in seen:
-            continue
-        seen.add(cn)
-        uniq.append(c)
-
-    def _best_diff_to_solution(c: str) -> int:
-        return min((_diff_score(c, s) for s in solution_lines), default=0)
-
-    uniq.sort(key=_best_diff_to_solution, reverse=True)
-    for c in uniq:
-        if len(distractor_lines) >= 3:
-            break
-        distractor_lines.append(c)
-
-    if len(distractor_lines) < 2:
-        fallback = ["count = 1", "total = score", "if score != -1: break", "continue"]
-        for f in fallback:
-            fn = _normalize_line(f)
-            if fn in sol_norm or fn in {_normalize_line(x) for x in distractor_lines}:
-                continue
-            distractor_lines.append(f)
-            if len(distractor_lines) >= 3:
-                break
-
-    # ===============================
-    # [新增] 中文語意 template_slots（0 token，不洩漏答案/不出現 input）
-    # ===============================
-    def _label_for_solution_line(line: str) -> str:
-        raw = (line or "").strip()
-        low = raw.lower()
-        if _re.search(r"=\s*0\b", low):
-            return "設定統計所需的起始狀態"
-        if raw.endswith(":") and (low.startswith("while ") or low.startswith("for ")):
-            return "建立重複處理的流程架構"
-        if "input" in low:
-            return "取得新資料並準備後續處理"
-        if low.startswith("if ") and "break" in low:
-            return "判斷是否達到結束條件並結束流程"
-        if low.startswith("if "):
-            return "根據條件決定下一步處理"
-        if "+=" in low:
-            return "更新統計或累積的結果"
-        if "print" in low:
-            return "輸出整理後的結果"
-        if "=" in low:
-            return "更新流程中需要記錄的狀態"
-        if low.strip() == "break":
-            return "在適當時機結束重複流程"
-        return "完成此步驟所需的處理"
-
-    labels = [_label_for_solution_line(x) for x in solution_lines]
-    template_slots = [{"label": labels[i], "slot": str(i)} for i in range(len(solution_lines))]
-
-    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core"} for i, line in enumerate(solution_lines)]
-    distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
-
-    for i in range(len(distractor_blocks)):
-        try:
-            distractor_blocks[i]["semantic_zh"] = _distractor_semantic_zh(distractor_blocks[i]["text"])
+            rs = float(sub_range.get("start"))
+            re2 = float(sub_range.get("end"))
+            if re2 > rs:
+                update["subtitle_range"] = {"start": rs, "end": re2}
         except Exception:
             pass
 
-    pool = distractor_blocks + solution_blocks
+    update["ai_segments_compact"] = segs_compact
+    db.parsons_tasks.update_one({"_id": task["_id"]}, {"$set": update})
 
-    ai_feedback = {
-        "general": "請注意結束條件、統計更新與縮排層級是否正確。",
-        "common_mistakes": [
-            "結束條件寫反導致無法停止或提早停止",
-            "忘記更新統計值（總和/次數）",
-            "縮排錯誤導致程式流程不在迴圈內",
-        ],
-        "hints": [
-            "確認結束條件是在迴圈內判斷",
-            "確認統計更新行也在迴圈內",
-            "最後要輸出題目要求的結果",
-        ],
-    }
-
-    return {
-        "question_text": question_text,
-        "solution_blocks": solution_blocks,
-        "distractor_blocks": distractor_blocks,
-        "pool": pool,
-        "template_slots": template_slots,
-        "ai_feedback": ai_feedback,
-        "ai_segment_map": seg_map,
-        "ai_slot_hints": slot_hints,
-        "ai_segments_compact": segs_compact,
-    }
+    return jsonify({
+        "ok": True,
+        "task_id": real_task_id,
+        "subtitle_chars": len(segs_compact),
+        "slots_aligned": list(update.get("ai_segment_map", {}).keys()),
+        "ai_segment_map": update.get("ai_segment_map", {}),
+        "message": "對齊完成，共 %d 個 slot" % len(update.get("ai_segment_map", {})),
+    })
 
 
-# =========================
-# Create task
-# =========================
-def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_fallback: bool = False) -> Tuple[dict, str, Optional[str], dict]:
-    unit = video_doc.get("unit", "") or ""
-    video_title = video_doc.get("title", "") or ""
+# ========================
+# [新增] GET /fixed_task/debug
+# ========================
+@parsons_bp.get("/fixed_task/debug")
+def debug_fixed_task():
+    video_id = (request.args.get("video_id") or "").strip()
+    task_id_str = (request.args.get("task_id") or "").strip()
+    task = None
+    if task_id_str:
+        try:
+            task = db.parsons_tasks.find_one({"_id": ObjectId(task_id_str)})
+        except Exception:
+            pass
+    if not task and video_id:
+        vid_oid = maybe_oid(video_id)
+        q = {"gen_source": "fixed"}
+        if vid_oid:
+            q["$or"] = [{"video_id": vid_oid}, {"video_id_str": video_id}]
+        else:
+            q["video_id_str"] = video_id
+        task = db.parsons_tasks.find_one(q)
+    if not task:
+        return jsonify({"ok": False, "message": "找不到固定題（gen_source=fixed）"})
+    prompt_source = task.get("prompt_source") or {}
+    return jsonify({
+        "ok": True,
+        "task_id": str(task["_id"]),
+        "prompt_source_keys": list(prompt_source.keys()),
+        "has_subtitle_preview": bool(prompt_source.get("subtitle_preview")),
+        "subtitle_preview_len": len(prompt_source.get("subtitle_preview") or ""),
+        "ai_segments_compact_len": len(task.get("ai_segments_compact") or ""),
+        "subtitle_range": task.get("subtitle_range") or {},
+        "ai_segment_map": task.get("ai_segment_map") or {},
+        "solution_blocks": [b.get("text") for b in (task.get("solution_blocks") or [])],
+    })
 
-    subtitle_path = pick_latest_subtitle_path(video_doc, video_id_str)
-    sub_text = read_subtitle_text(subtitle_path)
-
-    gen_source = None
-    gen_error = None
-    env = env_snapshot()
-
-    vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
-    video_id_match = {"$or": [{"video_id": video_id_str}] + ([{"video_id": vid_oid}] if vid_oid else [])}
-
-    db.parsons_tasks.update_many({**video_id_match, "level": level, "active": True}, {"$set": {"active": False}})
-
-    try:
-        if force_fallback:
-            raise RuntimeError("force_fallback")
-        ai = ai_generate_parsons_from_subtitle(sub_text, unit, video_title, level=level)
-        gen_source = "openai"
-    except Exception as e:
-        ai = simple_fallback_generate(sub_text, unit, video_title, level=level)
-        gen_source = "fallback"
-        gen_error = str(e)
-
-    doc = {
-        "video_id": vid_oid if vid_oid else video_id_str,
-        "video_id_str": video_id_str,
-
-        "unit": unit,
-        "video_title": video_title,
-        "level": level,
-
-        "enabled": False,
-        "review_status": "draft",
-
-        "prompt_source": {"subtitle_path": subtitle_path},
-        "question_text": ai.get("question_text"),
-        "solution_blocks": ai.get("solution_blocks", []),
-        "distractor_blocks": ai.get("distractor_blocks", []),
-        "pool": ai.get("pool", []),
-        "template_slots": ai.get("template_slots", []),
-        "ai_feedback": ai.get("ai_feedback", {}),
-
-        "ai_generated": True if gen_source == "openai" else False,
-        "ai_segment_map": ai.get("ai_segment_map", {}) or {},
-        "ai_slot_hints": ai.get("ai_slot_hints", {}) or {},
-        "ai_segments_compact": ai.get("ai_segments_compact", "") or "",
-
-        "created_at": now_utc(),
-        "active": True,
-
-        "gen_source": gen_source,
-        "gen_error": gen_error,
-        "env": env,
-    }
-
-    inserted = db.parsons_tasks.insert_one(doc)
-    doc["_id"] = inserted.inserted_id
-
-    log_event(
-        "parsons_task_generated",
-        video_id=video_id_str,
-        task_id=str(inserted.inserted_id),
-        gen_source=gen_source,
-        gen_error=gen_error,
-        unit=unit,
-        title=video_title,
-        level=level,
-    )
-
-    return doc, gen_source, gen_error, env
-
-
-# =========================
-# (A) GET /task  取得學生端題目（只取 enabled=True 最新）
-# =========================
+# GET /task 供學生端載入題目
 @parsons_bp.get("/task")
 def get_task():
     video_id = request.args.get("video_id", "").strip()
@@ -1191,7 +679,7 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
 你是一位 Python 程式設計助教。學生在 Parsons 題目中把某一格放錯了。
 請你做兩件事：
 1) 給「繁體中文」提示（1~2句，針對該格錯誤）
-2) 從字幕時間戳中選出最適合回看的片段 start/end（秒數，必須是字幕裡存在的合理範圍）
+2) 從字幕時間戳中找出老師「邊輸入程式碼、邊口頭講解」該程式區塊的片段（start/end 必須是字幕裡實際存在的時間戳，不可捏造）
 
 請輸出「純 JSON」，不要多餘文字：
 {{
@@ -1212,7 +700,11 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
 """.strip()
 
             # [新增] OpenAI 呼叫改由 parsons_ai 統一管理（不改既有 prompt/解析）
-            data = parsons_ai.call_openai_json(model=model, prompt=prompt) or {}
+            data = parsons_ai.call_openai_json(
+                model=model,
+                system="你是一位 Python 程式設計助教，協助分析 Parsons 錯誤並找出老師講解程式碼的字幕時間戳。只輸出 JSON。",
+                user=prompt
+            ) or {}
 
             ai_hint = (data.get("hint") or "").strip()
             ai_s = data.get("start", None)
@@ -1285,10 +777,18 @@ def test_status():
         "ok": True,
         "student_id": student_id,
         "test_cycle_id": test_cycle_id,
+        "pre_open": is_pretest_open(test_cycle_id),
         "pre_done": pre_done,
         "post_done": post_done,
         "post_open": is_posttest_open(test_cycle_id),
     })
+
+def is_pretest_open(test_cycle_id: str) -> bool:
+    test_cycle_id = (test_cycle_id or "default").strip() or "default"
+    doc = db.test_control.find_one({"_id": f"pre_open:{test_cycle_id}"})
+    if not doc:
+        return True  # ✅ 預設開放前測
+    return bool(doc.get("pre_open", True))
 
 
 @parsons_bp.get("/test/task")
@@ -1314,7 +814,8 @@ def get_test_task():
         return jsonify({"ok": False, "message": "test task not configured"}), 404
 
     # 取得原始題目
-    source_task_id = (tt.get("source_task_id") or "").strip()
+    raw_source = tt.get("source_task_id")
+    source_task_id = str(raw_source).strip() if raw_source else ""
     try:
         task_doc = db.parsons_tasks.find_one({"_id": ObjectId(source_task_id)})
     except:
@@ -1386,10 +887,33 @@ def submit_test_answer():
     if len(aligned) < len(expected_ids):
         aligned = aligned + [None] * (len(expected_ids) - len(aligned))
 
+    # [新增] 允許「文字相同但 block_id 不同」視為同一行（避免干擾題與解答文字相同導致誤判）
+    def _norm_line_for_compare(s: str) -> str:
+        try:
+            s = (s or "").replace("	", "    ")
+            # 比對時忽略左右空白（縮排由另外的 indentation 機制處理）
+            return s.strip()
+        except Exception:
+            return (s or "").strip()
+
+    pool_by_id_for_compare = {str(b.get("id")): b for b in (parsed.get("pool") or [])}
+
     wrong_indices = []
     for i in range(len(expected_ids)):
-        if str(aligned[i]) != str(expected_ids[i]):
-            wrong_indices.append(i)
+        aid = str(aligned[i]) if aligned[i] is not None else ""
+        eid = str(expected_ids[i])
+
+        if aid == eid:
+            continue
+
+        a_text = str(pool_by_id_for_compare.get(aid, {}).get("text", "") or "")
+        e_text = str(pool_by_id_for_compare.get(eid, {}).get("text", "") or "")
+
+        # 若文字完全相同（忽略左右空白），視為該格正確
+        if _norm_line_for_compare(a_text) and _norm_line_for_compare(a_text) == _norm_line_for_compare(e_text):
+            continue
+
+        wrong_indices.append(i)
 
     extra_wrong = max(0, len(answer_ids) - len(expected_ids))
     is_correct = (len(wrong_indices) == 0 and extra_wrong == 0)
@@ -1590,13 +1114,12 @@ def submit_answer():
 
     task_id = (data.get("task_id") or "").strip()
     answer_ids = data.get("answer_ids") or []
+    answer_lines = data.get("answer_lines") or []
     student_id = (data.get("student_id") or "").strip()
-    level = (data.get("level") or "").strip()
 
     if not task_id:
         return jsonify({"ok": False, "message": "missing task_id"}), 400
 
-    # 1️⃣ 取得題目
     try:
         task = db.parsons_tasks.find_one({"_id": ObjectId(task_id)})
     except Exception:
@@ -1605,11 +1128,89 @@ def submit_answer():
     if not task:
         return jsonify({"ok": False, "message": "task not found"}), 404
 
-    solution_ids = task.get("solution_order") or None
-    if not solution_ids:
-        solution_blocks = task.get("solution_blocks", []) or []
-        solution_ids = [b.get("id") for b in solution_blocks if b.get("type") in ("core", "solution", None)]
-        solution_ids = [sid for sid in solution_ids if sid]
+    parsed = t5doc_to_parsons_task(task)
+
+    # 取得難度/等級資訊（優先 body 的 level，其次為 task 本身的設定）
+    level = (data.get("level") or task.get("level") or "").strip()
+
+    expected_ids = [
+        str(s.get("expected_id"))
+        for s in (parsed.get("template_slots") or [])
+    ]
+
+    # ===== DEBUG 區塊 1 =====
+    print("\n========== DEBUG SUBMIT START ==========")
+    print("task_id =", task_id)
+    print("answer_ids =", answer_ids)
+    print("expected_ids =", expected_ids)
+    print("answer_lines =", answer_lines)
+    print("=========================================\n")
+
+    # ===== 順序比對 =====
+    aligned = list(answer_ids)
+    if len(aligned) < len(expected_ids):
+        aligned += [None] * (len(expected_ids) - len(aligned))
+
+    wrong_indices = []
+    for i in range(len(expected_ids)):
+        if str(aligned[i]) != str(expected_ids[i]):
+            wrong_indices.append(i)
+
+    is_correct = len(wrong_indices) == 0
+
+    print("order_wrong_indices =", wrong_indices)
+    print("is_correct_after_order =", is_correct)
+
+    # ===== 縮排檢查（只在順序完全正確時）=====
+    if is_correct and answer_lines:
+        print("\n------ DEBUG INDENT CHECK START ------")
+
+        expected_blocks = parsed.get("solution_blocks") or []
+        expected_lines = [
+            (b.get("text") or "")
+            for b in expected_blocks
+        ]
+
+        indent_error = False
+
+        for i in range(min(len(expected_lines), len(answer_lines))):
+
+            expected_line = expected_lines[i]
+            user_line = answer_lines[i]
+
+            expected_indent = len(expected_line) - len(expected_line.lstrip(" "))
+            user_indent = len(user_line) - len(user_line.lstrip(" "))
+
+            print(f"[Slot {i}]")
+            print("expected_line =", repr(expected_line))
+            print("user_line     =", repr(user_line))
+            print("expected_indent =", expected_indent)
+            print("user_indent     =", user_indent)
+            print("-------------------------------")
+
+            # 只抓「缺縮排」
+            if user_indent < expected_indent:
+                indent_error = True
+                wrong_indices = [i]
+                is_correct = False
+                print(">>> INDENT ERROR at slot", i)
+                break
+
+        print("------ DEBUG INDENT CHECK END ------\n")
+        print("FINAL is_correct =", is_correct)
+        print("FINAL wrong_indices =", wrong_indices)
+        print("========== DEBUG SUBMIT END ==========\n")
+
+        return jsonify({
+            "ok": True,
+            "is_correct": is_correct,
+            "wrong_indices": wrong_indices,
+            "feedback": "✅ 完全正確！",
+            "score": 1.0,
+            "slot_label": "",
+            "actual_text": "",
+            "expected_text": "",
+        })
 
     # [新增] V1.3：Submit 端 fallback 解析 SRT（把 [行-行] 轉成秒數）
     def _parse_srt_time_to_seconds(t: str) -> float:
@@ -1711,9 +1312,16 @@ def submit_answer():
             if isinstance(seg, dict):
                 ts = seg.get("start")
                 te = seg.get("end")
-                if ts is not None and te is not None and float(te) > float(ts):
+                # only accept segment if start>0 and end>start
+                if (
+                    ts is not None
+                    and te is not None
+                    and float(te) > float(ts)
+                    and float(ts) > 0
+                ):
                     ctx = seg.get("evidence") or ""
                     return (float(ts), float(te), ctx)
+                # otherwise continue to fallback below
 
             # ② 沒有 map，就用 compact + subtitle_path 做推算（B 電腦常見）
             compact = task_doc.get("ai_segments_compact") or ""
@@ -1722,6 +1330,18 @@ def submit_answer():
                 line_a, line_b = _pick_segment_from_compact(compact, slot_idx or 0)
                 if line_a is not None and line_b is not None and line_b > line_a:
                     segs = _read_srt_segments(subtitle_path)
+                    # 如果讀不到，嘗試根據 video_id 在 uploads/subtitles 找檔案
+                    if not segs:
+                        vid = str(task_doc.get("video_id") or "")
+                        try:
+                            import glob, os
+                            for f in glob.glob(os.path.join(os.getcwd(), "uploads", "subtitles", "*.srt")):
+                                if vid and vid in os.path.basename(f):
+                                    segs = _read_srt_segments(f)
+                                    if segs:
+                                        break
+                        except Exception:
+                            pass
                     if segs:
                         a = max(0, min(line_a, len(segs) - 1))
                         b = max(0, min(line_b - 1, len(segs) - 1))
@@ -1733,6 +1353,35 @@ def submit_answer():
                         if te > ts:
                             return (ts, te, ctx)
 
+            # ③ 還是找不到？嘗試直接讀 srt 檔並平均分配時間區間
+            try:
+                segs = []
+                if subtitle_path:
+                    segs = _read_srt_segments(subtitle_path)
+                # 如果還是沒找到，試試看有沒有 video_id 對應的檔案
+                if not segs:
+                    vid = str(task_doc.get("video_id") or "")
+                    if vid:
+                        import glob, os
+                        for f in glob.glob(os.path.join(os.getcwd(), "uploads", "subtitles", "*.srt")):
+                            if vid in os.path.basename(f):
+                                segs = _read_srt_segments(f)
+                                if segs:
+                                    break
+                if segs:
+                    # 切成 total_slots 份
+                    # 計算總格數：優先 template_slots，再 fallback solution_blocks
+                    slots = task_doc.get("template_slots") or task_doc.get("solution_blocks") or []
+                    total_slots = max(1, len(slots))
+                    # if slot_idx 超出範圍，就仍使用整體範圍
+                    start = segs[0]["start"]
+                    end = segs[-1]["end"]
+                    span = float(end) - float(start)
+                    part_start = float(start) + span * slot_idx / total_slots
+                    part_end = float(start) + span * (slot_idx + 1) / total_slots
+                    return (part_start, part_end, "")
+            except Exception:
+                pass
             return (None, None, "")
         except Exception:
             return (None, None, "")
@@ -1749,10 +1398,33 @@ def submit_answer():
     if len(aligned) < len(expected_ids):
         aligned = aligned + [None] * (len(expected_ids) - len(aligned))
 
+    # [新增] 允許「文字相同但 block_id 不同」視為同一行（避免干擾題與解答文字相同導致誤判）
+    def _norm_line_for_compare(s: str) -> str:
+        try:
+            s = (s or "").replace("	", "    ")
+            # 比對時忽略左右空白（縮排由另外的 indentation 機制處理）
+            return s.strip()
+        except Exception:
+            return (s or "").strip()
+
+    pool_by_id_for_compare = {str(b.get("id")): b for b in (parsed.get("pool") or [])}
+
     wrong_indices = []
     for i in range(len(expected_ids)):
-        if str(aligned[i]) != str(expected_ids[i]):
-            wrong_indices.append(i)
+        aid = str(aligned[i]) if aligned[i] is not None else ""
+        eid = str(expected_ids[i])
+
+        if aid == eid:
+            continue
+
+        a_text = str(pool_by_id_for_compare.get(aid, {}).get("text", "") or "")
+        e_text = str(pool_by_id_for_compare.get(eid, {}).get("text", "") or "")
+
+        # 若文字完全相同（忽略左右空白），視為該格正確
+        if _norm_line_for_compare(a_text) and _norm_line_for_compare(a_text) == _norm_line_for_compare(e_text):
+            continue
+
+        wrong_indices.append(i)
 
     # 額外多填的答案也算錯（不新增不存在的格 index，只影響 is_correct / score）
     extra_wrong = max(0, len(answer_ids) - len(expected_ids))
@@ -1774,7 +1446,33 @@ def submit_answer():
     actual_text = pool_by_id.get(actual_id, {}).get("text", "") if actual_id else ""
     expected_text = pool_by_id.get(expected_id, {}).get("text", "") if expected_id else ""
 
+    # 組建回饋字串（與舊版本邏輯一致）
     feedback = "✅ 完全正確！" if is_correct else ((task.get("ai_feedback") or {}).get("general") or f"❌ 目前正確率 {score:.0%}，建議先確認「輸入 → 計算 → 輸出」的順序。")
+
+    # [修正] expected_lines 需在所有分支先定義，避免 UnboundLocalError（錯誤答案也會走到下方 debug）
+    expected_blocks_all = parsed.get("solution_blocks") or []
+    expected_lines = [(b.get("text") or "") for b in expected_blocks_all]
+    if len(expected_lines) < len(expected_ids):
+        expected_lines += [""] * (len(expected_ids) - len(expected_lines))
+
+    print("\n------ DEBUG INDENT CHECK ------")
+    for i in range(min(len(expected_ids), len(answer_lines), len(expected_lines))):
+        if i >= len(answer_lines):
+            continue
+
+        expected_line = expected_lines[i]
+        user_line = answer_lines[i]
+
+        expected_indent = len(expected_line) - len(expected_line.lstrip(" "))
+        user_indent = len(user_line) - len(user_line.lstrip(" "))
+
+        print(f"[Slot {i}]")
+        print("expected_line =", repr(expected_line))
+        print("user_line     =", repr(user_line))
+        print("expected_indent =", expected_indent)
+        print("user_indent     =", user_indent)
+        print("-------------------------------")
+    print("------ END INDENT CHECK ------\n")
 
     video_id_str = normalize_video_id(task.get("video_id"))
 
@@ -1828,20 +1526,81 @@ def submit_answer():
     }
 
     if not is_correct:
-        # [修改] V1.5：錯誤回饋由 AI（提示 + 建議回看時間軸）決定；若 AI 不可用則保留既有 fallback
         slot_key = str(wrong_index) if wrong_index is not None else "0"
-        hint, t_start, t_end, subtitle_context = ai_hint_and_segment_for_wrong(
-            task=task,
-            slot_key=slot_key,
-            expected_text=expected_text,
-            actual_text=actual_text,
-            level=(level or task.get("level") or "L1"),
-            slot_label=(slot_label or f"第{(wrong_index + 1)}格" if wrong_index is not None else "第1格"),
+
+        # [修正] ① 優先從 ai_segment_map 讀字幕對齊片段（老師講解程式碼的片段）
+        seg_map = (task.get("ai_segment_map") or {}) if isinstance(task.get("ai_segment_map"), dict) else {}
+        seg = seg_map.get(slot_key)
+        t_start = None
+        t_end = None
+        subtitle_context = ""
+
+        if isinstance(seg, dict):
+            try:
+                _s = float(seg.get("start"))
+                _e = float(seg.get("end"))
+                if _e > _s:
+                    t_start, t_end = _s, _e
+                    print(f"DEBUG_SEGMENT [ai_segment_map slot={slot_key}]: {t_start} -> {t_end}")
+            except Exception:
+                pass
+
+        # ② 通用 AI 診斷（取文字回饋；秒數只在 ai_segment_map 無資料時才用）
+        ai_diag = _generate_submit_ai_feedback(task, answer_ids)
+        ai_feedback_detail = (ai_diag.get("feedback") or {}) if isinstance(ai_diag, dict) else {}
+        recommended_review = (ai_diag.get("recommended_review") or {}) if isinstance(ai_diag, dict) else {}
+
+        resp["ai_feedback_detail"] = ai_feedback_detail
+        resp["ai_diagnosis_summary"] = ai_diag.get("diagnosis_summary", "") if isinstance(ai_diag, dict) else ""
+
+        hint = (
+            ai_feedback_detail.get("concept_explanation")
+            or ai_feedback_detail.get("guiding_question")
+            or ""
         )
+
+        # 只有 ai_segment_map 沒有命中時，才採用 AI 診斷給的秒數
+        if t_start is None or t_end is None or t_end <= t_start:
+            ai_t_start = recommended_review.get("start")
+            ai_t_end = recommended_review.get("end")
+            try:
+                ai_t_start = float(ai_t_start) if ai_t_start is not None else None
+            except Exception:
+                ai_t_start = None
+            try:
+                ai_t_end = float(ai_t_end) if ai_t_end is not None else None
+            except Exception:
+                ai_t_end = None
+            if ai_t_start is not None and ai_t_end is not None and ai_t_end > ai_t_start:
+                t_start, t_end = ai_t_start, ai_t_end
+                print(f"DEBUG_SEGMENT [ai_diag fallback]: {t_start} -> {t_end}")
+
+        # ③ 還是沒有，走 ai_hint_and_segment_for_wrong
+        if t_start is None or t_end is None or t_end <= t_start:
+            hint2, s2, e2, subtitle_context = ai_hint_and_segment_for_wrong(
+                task=task,
+                slot_key=slot_key,
+                expected_text=expected_text,
+                actual_text=actual_text,
+                level=(level or task.get("level") or "L1"),
+                slot_label=(slot_label or f"第{(wrong_index + 1)}格" if wrong_index is not None else "第1格"),
+            )
+            if not hint:
+                hint = hint2
+            t_start, t_end = s2, e2
+
         print("DEBUG_SEGMENT:", t_start, t_end)
 
-        # [新增] V1.3：若 AI 沒回出有效秒數，嘗試從 task 的 ai_segment_map / ai_segments_compact 推算
+        # =========================
+        # ③ 若還是沒有，再走 task 內既有對齊推估
+        # =========================
+        need_fallback = False
         if t_start is None or t_end is None or t_end <= t_start:
+            need_fallback = True
+        elif t_start == 0 and wrong_index is not None and wrong_index != 0:
+            need_fallback = True
+
+        if need_fallback:
             fb_start, fb_end, fb_ctx = _fallback_segment_from_task(task, wrong_index if wrong_index is not None else 0)
             if fb_start is not None and fb_end is not None and fb_end > fb_start:
                 t_start = fb_start
@@ -1849,12 +1608,38 @@ def submit_answer():
                 if not subtitle_context:
                     subtitle_context = fb_ctx
 
-        # fallback（維持你原本行為：一定會有 jump 秒數，不讓學生卡住）
+        # =========================
+        # ④ 再不行，吃 subtitle_range / source_subtitle
+        # =========================
+        if t_start is None or t_end is None or t_end <= t_start:
+            sr = task.get("subtitle_range") or {}
+            ss = task.get("source_subtitle") or {}
+
+            fb_start = (
+                sr.get("start_ts")
+                or ss.get("start_ts")
+            )
+            fb_end = (
+                sr.get("end_ts")
+                or ss.get("end_ts")
+            )
+
+            try:
+                if fb_start is not None and fb_end is not None and float(fb_end) > float(fb_start):
+                    t_start = float(fb_start)
+                    t_end = float(fb_end)
+            except Exception:
+                pass
+
+        # =========================
+        # ⑤ 最後最後才用固定保底值
+        # =========================
         if t_start is None or t_end is None or t_end <= t_start:
             t_start = 120.0
             t_end = 170.0
+
         if not hint:
-            hint = "（AI 暫時不可用）請回看影片片段並檢查輸入型別與運算順序。"
+            hint = "請重新檢查這一格在整體程式流程中的角色。"
 
         resp["review_t"] = int(float(t_start))
         resp["hint"] = hint
@@ -1866,7 +1651,11 @@ def submit_answer():
         resp["data"] = {
             "title": "回答錯誤",
             "error_detail": feedback,
-            "segment": {"start": float(t_start), "end": float(t_end), "label": f"影片片段 [{int(float(t_start))}–{int(float(t_end))} 秒]"},
+            "segment": {
+                "start": float(t_start),
+                "end": float(t_end),
+                "label": f"影片片段 [{int(float(t_start))}–{int(float(t_end))} 秒]"
+            },
             "subtitle_context": subtitle_context or "（未找到字幕）",
             "ai_hint": hint,
             "video_id": vid,
@@ -1874,71 +1663,6 @@ def submit_answer():
 
     return jsonify(resp)
 
-# =========================
-# (C) POST /review  學生選擇是否回看影片（V1.7-A）
-# =========================
-# @parsons_bp.post("/review")
-# def review_choice():
-#     data = request.get_json(silent=True) or {}
-
-#     attempt_id = (data.get("attempt_id") or "").strip()
-#     student_id = (data.get("student_id") or "").strip()
-#     task_id = (data.get("task_id") or "").strip()
-#     video_id = (data.get("video_id") or "").strip()
-#     student_choice = (data.get("student_choice") or "").strip().lower()  # yes / no
-
-#     if not attempt_id:
-#         return jsonify({"ok": False, "message": "missing attempt_id"}), 400
-
-#     if student_choice not in ("yes", "no"):
-#         return jsonify({"ok": False, "message": "student_choice must be 'yes' or 'no'"}), 400
-
-#     # 允許前端沒傳 task_id/video_id：我們嘗試從 attempts 裡補
-#     task_id_f = task_id or None
-#     video_id_f = video_id or None
-#     student_id_f = student_id or None
-
-#     try:
-#         att = db.parsons_attempts.find_one({"_id": ObjectId(attempt_id)})
-#         if att:
-#             if not task_id_f:
-#                 task_id_f = att.get("task_id") or None
-#             if not video_id_f:
-#                 video_id_f = att.get("video_id") or None
-#             if not student_id_f:
-#                 student_id_f = att.get("student_id") or None
-#     except Exception:
-#         # attempt_id 不是 ObjectId 也沒關係（你目前 attempts 的 _id 是 ObjectId）
-#         pass
-
-#     doc = {
-#         "attempt_id": attempt_id,
-#         "task_id": task_id_f,
-#         "video_id": video_id_f,
-#         "student_id": student_id_f,
-#         "student_choice": student_choice,  # yes/no
-#         "created_at": now_utc(),
-#     }
-
-#     # ✅ 安全策略：同一個 attempt_id 只留一筆（避免重複點擊產生多筆）
-#     # - 若已存在：更新 choice + updated_at
-#     # - 若不存在：插入
-#     existed = db.parsons_review_logs.find_one({"attempt_id": attempt_id})
-#     if existed:
-#         db.parsons_review_logs.update_one(
-#             {"_id": existed["_id"]},
-#             {"$set": {
-#                 "student_choice": student_choice,
-#                 "student_id": student_id_f,
-#                 "task_id": task_id_f,
-#                 "video_id": video_id_f,
-#                 "updated_at": now_utc(),
-#             }}
-#         )
-#         return jsonify({"ok": True, "mode": "update"})
-#     else:
-#         db.parsons_review_logs.insert_one(doc)
-#         return jsonify({"ok": True, "mode": "insert"})
 
 # =========================
 # (C) POST /review_choice  記錄學生是否選擇回看（yes/no）
@@ -1951,7 +1675,7 @@ def review_choice():
 
     data = request.get_json(silent=True) or {}
 
-    attempt_id = (data.get("attempt_id") or "").strip()
+    attempt_id = (data.get("attempt_id") or "").strip()  # 前端有送
     student_choice = (data.get("student_choice") or "").strip().lower()  # yes/no
 
     # ✅ A 方案：後端盡量補齊 student_id
@@ -2023,8 +1747,8 @@ def review_watch():
     Expected Payload:
     {
         "attempt_id": "xxx",                    # 關聯的練習嘗試
-        "video_id": "xxx",
-        "task_id": "xxx",
+        "video_id": "xxx",                      # 觀看影片id
+        "task_id": "xxx",                       # 觀看影片對應的任務id      
         "student_id": "xxx",                     # 學號
         "start_sec": 120,                        # 指定回看片段開始時間
         "end_sec": 180,                          # 指定回看片段結束時間
@@ -2171,12 +1895,19 @@ def review_watch():
 
 # =========================
 # (B) POST /regenerate  (老師端產生題目：預設 draft)
+# ✅ V1.8 增量：題目敘事多樣化 + 變數命名多樣化 + 補中文語意（含干擾題）
+# 只改這個 API，不動其他功能
 # =========================
 @parsons_bp.post("/regenerate")
 def regenerate():
     data = request.get_json(silent=True) or {}
     video_id = (data.get("video_id") or "").strip()
     level = (data.get("level") or "L1").strip()
+    stable_raw = data.get("stable")
+    if isinstance(stable_raw, str):
+        stable_mode = stable_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        stable_mode = bool(stable_raw)
 
     if not video_id:
         return jsonify({"ok": False, "message": "missing video_id"}), 400
@@ -2190,8 +1921,240 @@ def regenerate():
     if not v:
         return jsonify({"ok": False, "message": "video not found"}), 404
 
-    doc, gen_source, gen_error, env = create_task_for_video(v, video_id, level)
+    # 先照舊產生（不破壞既有生成流程）
+    doc, gen_source, gen_error, env = create_task_for_video(v, video_id, level, stable_mode=stable_mode)
 
+    # =========================
+    # ✅ V1.8 新增：多樣化（只在 unit=IO 時做）
+    # =========================
+    try:
+        import random as _random
+        import re as _re_local
+
+        unit = (doc.get("unit") or "").upper()
+        is_io = ("-IO" in unit) or (unit == "IO") or ("U1" in unit and "IO" in unit)
+
+        # --- 1) 題目敘事多樣化：只針對「兩個輸入對調輸出」這類 IO 題 ---
+        def _looks_like_swap_two_inputs(sol_blocks: list) -> bool:
+            lines = []
+            for b in (sol_blocks or []):
+                t = (b.get("text") if isinstance(b, dict) else str(b)) or ""
+                t = t.strip()
+                if t:
+                    lines.append(t)
+            if len(lines) < 4:
+                return False
+
+            # 常見形態：a=input(); b=input(); print(b); print(a)
+            # 只做「寬鬆判斷」，避免誤判其他 IO 題
+            has_two_input = sum(1 for x in lines if "input(" in x) >= 2
+            has_two_print = sum(1 for x in lines if "print(" in x) >= 2
+            return has_two_input and has_two_print
+
+        def _story_variant_question() -> str:
+            # 你要的「情境化敘事」：同樣是兩個輸入、對調輸出，但文字更像故事
+            variants = [
+                "曉華與小明各自買了一個禮物（以整數金額表示）。請依序輸入兩個金額，並把輸出順序對調後印出。",
+                "有兩個整數資料代表 A 與 B 的值。請依序輸入兩個整數，最後請先輸出第二個，再輸出第一個。",
+                "兩位同學交換禮物：先輸入曉華的金額，再輸入小明的金額。請把輸出順序對調後印出（先小明、再曉華）。",
+                "請依序輸入兩個整數，並把它們交換位置後輸出（先輸出第二個輸入，再輸出第一個輸入）。",
+            ]
+            return _random.choice(variants)
+
+        # --- 2) 變數命名多樣化（n1/n2 -> y1/y2, a/b, x1/x2 ...）---
+        def _pick_var_pair() -> tuple:
+            pairs = [
+                ("y1", "y2"),
+                ("a", "b"),
+                ("x1", "x2"),
+                ("p1", "p2"),
+                ("gift1", "gift2"),
+            ]
+            return _random.choice(pairs)
+
+        def _extract_two_input_vars(sol_blocks: list) -> tuple:
+            # 找出最前面兩個「var = input()」的 var 名
+            vars_found = []
+            for b in (sol_blocks or []):
+                if not isinstance(b, dict):
+                    continue
+                line = (b.get("text") or "").strip()
+                m = _re_local.match(r"^\s*([A-Za-z_]\w*)\s*=\s*input\s*\(\s*\)\s*$", line)
+                if m:
+                    vars_found.append(m.group(1))
+                if len(vars_found) >= 2:
+                    break
+            if len(vars_found) >= 2:
+                return vars_found[0], vars_found[1]
+            return "", ""
+
+        def _rename_vars_in_blocks(blocks: list, old_a: str, old_b: str, new_a: str, new_b: str):
+            if not old_a or not old_b or not new_a or not new_b:
+                return
+            # whole-word replacement
+            pa = _re_local.compile(rf"\b{_re_local.escape(old_a)}\b")
+            pb = _re_local.compile(rf"\b{_re_local.escape(old_b)}\b")
+
+            for b in (blocks or []):
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("text")
+                if t is None:
+                    continue
+                s = str(t)
+                s = pa.sub(new_a, s)
+                s = pb.sub(new_b, s)
+                b["text"] = s
+
+        # --- 3) 補中文語意（solution + distractor 都補，避免「未提供」）---
+        def _infer_semantic_zh(line: str) -> str:
+            s = (line or "").strip()
+            if not s:
+                return ""
+            if "input(" in s:
+                return "讀取使用者輸入"
+            if "print(" in s:
+                return "輸出結果"
+            if s.startswith("if "):
+                return "條件判斷：若成立則執行"
+            if s.startswith("elif "):
+                return "其他條件判斷"
+            if s.startswith("else"):
+                return "否則（不成立時）執行"
+            if s.startswith("for "):
+                return "使用 for 迴圈重複執行"
+            if s.startswith("while "):
+                return "使用 while 迴圈重複執行"
+            if s == "break" or s.startswith("break"):
+                return "中斷迴圈"
+            if "+=" in s or ("=" in s and "+" in s):
+                return "更新/累加變數"
+            if "=" in s and ("==" not in s) and ("!=" not in s):
+                return "設定/更新變數"
+            return "執行這一行程式"
+
+        def _ensure_zh(blocks: list):
+            for b in (blocks or []):
+                if not isinstance(b, dict):
+                    continue
+                line = (b.get("text") or "").strip()
+                zh = (b.get("semantic_zh") or b.get("zh") or "").strip()
+                if not zh:
+                    zh = _infer_semantic_zh(line)
+                # 同步寫兩種欄位，避免前端讀不同 key
+                b["semantic_zh"] = zh
+                b["zh"] = zh
+                # 1) 保底：solution/distractor/pool 都要有 zh（避免未提供）
+        _ensure_zh(doc.get("solution_blocks", []))
+        _ensure_zh(doc.get("distractor_blocks", []))
+        _ensure_zh(doc.get("pool", []))
+
+        # 2) 補回舊版 ai_slot_hints（以 template_slots 的順序對齊）
+        ai_slot_hints = {}
+        tpl = doc.get("template_slots") or []
+        sol = doc.get("solution_blocks") or []
+
+        # 盡量用 solution_blocks 的順序當 slot 對應（跟你舊版最接近）
+        for i in range(min(len(tpl), len(sol))):
+            hint = (sol[i].get("semantic_zh") or sol[i].get("zh") or "").strip()
+            if not hint:
+                hint = _infer_semantic_zh(sol[i].get("text") or "")
+            ai_slot_hints[str(i)] = hint
+
+        doc["ai_slot_hints"] = ai_slot_hints
+
+        # 3) 補回舊版 ai_segment_map（提供 submit/跳秒依據）
+        #   - 若你有 subtitle_range / source_subtitle，就把它掛到每個 slot 上（最穩）
+        sr = doc.get("subtitle_range") or {}
+        ss = doc.get("source_subtitle") or {}
+        start_ts = sr.get("start_ts") or ss.get("start_ts")
+        end_ts   = sr.get("end_ts")   or ss.get("end_ts")
+        start_idx = sr.get("start_index") or ss.get("start_index")
+        end_idx   = sr.get("end_index")   or ss.get("end_index")
+        text_used = doc.get("subtitle_text_used") or ss.get("text_used") or ""
+
+        ai_segment_map = {}
+        for i in range(len(tpl) or len(sol)):
+            ai_segment_map[str(i)] = {
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "start_index": start_idx,
+                "end_index": end_idx,
+                "text_used": text_used,
+                "hint": ai_slot_hints.get(str(i), ""),
+            }
+
+        doc["ai_segment_map"] = ai_segment_map
+
+        # 4) 補回舊版 ai_segments_compact（給老師端/前端快速顯示用）
+        #    生成一段文字：包含 index 範圍 + text_used 摘要
+        def _compact_text(s: str, max_chars: int = 140) -> str:
+            s = (s or "").strip()
+            s = _re.sub(r"\s+", " ", s)
+            if len(s) > max_chars:
+                return s[:max_chars] + "..."
+            return s
+
+        seg_head = ""
+        if start_idx is not None and end_idx is not None:
+            seg_head += f"[{start_idx}-{end_idx}] "
+        if start_ts is not None and end_ts is not None:
+            seg_head += f"({start_ts}-{end_ts}) "
+
+        doc["ai_segments_compact"] = seg_head + _compact_text(text_used)
+
+        # 5) 寫回 DB（確保不是只在記憶體）
+        try:
+            db.parsons_tasks.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {
+                    "solution_blocks": doc.get("solution_blocks", []),
+                    "distractor_blocks": doc.get("distractor_blocks", []),
+                    "pool": doc.get("pool", []),
+
+                    "ai_slot_hints": doc.get("ai_slot_hints", {}),
+                    "ai_segment_map": doc.get("ai_segment_map", {}),
+                    "ai_segments_compact": doc.get("ai_segments_compact", ""),
+                }}
+            )
+        except Exception:
+            pass
+
+        # ========== 真正套用 ==========
+        if is_io and _looks_like_swap_two_inputs(doc.get("solution_blocks", [])):
+            # (A) 題目文字換成故事版（仍是相同教學目標）
+            doc["question_text"] = _story_variant_question()
+
+            # (B) 變數名換掉：n1/n2 -> 隨機 pair
+            old1, old2 = _extract_two_input_vars(doc.get("solution_blocks", []))
+            new1, new2 = _pick_var_pair()
+            if old1 and old2 and (old1 != new1 or old2 != new2):
+                _rename_vars_in_blocks(doc.get("solution_blocks", []), old1, old2, new1, new2)
+                _rename_vars_in_blocks(doc.get("distractor_blocks", []), old1, old2, new1, new2)
+                _rename_vars_in_blocks(doc.get("pool", []), old1, old2, new1, new2)
+
+        # (C) 不管是不是 swap 題，都保底補語意（避免干擾題「未提供」）
+        _ensure_zh(doc.get("solution_blocks", []))
+        _ensure_zh(doc.get("distractor_blocks", []))
+        _ensure_zh(doc.get("pool", []))
+
+        # (D) 回寫 DB（不改 schema：只是補/覆蓋既有欄位）
+        try:
+            db.parsons_tasks.update_one(
+                {"_id": doc.get("_id")},
+                {"$set": {
+                    "question_text": doc.get("question_text"),
+                    "solution_blocks": doc.get("solution_blocks", []),
+                    "distractor_blocks": doc.get("distractor_blocks", []),
+                    "pool": doc.get("pool", []),
+                }},
+            )
+        except Exception:
+            pass
+
+    except Exception:
+        # 保守：多樣化失敗也不影響原本 regenerate 成功
+        pass
     return jsonify({
         "ok": True,
         "task": {
@@ -2207,5 +2170,848 @@ def regenerate():
         },
         "gen_source": gen_source,
         "gen_error": gen_error,
+        "stable_mode": stable_mode,
         "env": env,
     })
+
+# =========================
+# (D) AI 診斷：根據錯誤格 slot_key，從 task 內既有資料或 OpenAI 推估出 hint + 建議回看片段
+def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str, actual_text: str, level: str, slot_label: str) -> Tuple[str, Optional[float], Optional[float], str]:
+    """
+    錯誤時的 AI 回饋與回看時間軸
+    回傳 (hint, start, end, subtitle_context)
+
+    優先順序：
+    1) task.ai_segment_map / task.ai_slot_hints
+    2) OpenAI 根據字幕推估
+    3) 留給 submit() 走其他 fallback
+    """
+    hint = ""
+    start = None
+    end = None
+    subtitle_context = ""
+
+    seg_map = (task.get("ai_segment_map") or {}) if isinstance(task.get("ai_segment_map"), dict) else {}
+    slot_hints = (task.get("ai_slot_hints") or {}) if isinstance(task.get("ai_slot_hints"), dict) else {}
+
+    seg = seg_map.get(str(slot_key)) or None
+    if isinstance(seg, dict):
+        try:
+            # ✅ 同時支援 start/end 與 start_ts/end_ts
+            s = seg.get("start", seg.get("start_ts"))
+            e = seg.get("end", seg.get("end_ts"))
+            s = float(s) if s is not None else None
+            e = float(e) if e is not None else None
+            if s is not None and e is not None and e > s:
+                start, end = s, e
+        except Exception:
+            start, end = None, None
+
+        # ✅ hint 也可從 seg 裡面取
+        try:
+            if not hint:
+                hint = str(seg.get("hint") or "").strip()
+        except Exception:
+            pass
+
+    if not hint:
+        hint = (slot_hints.get(str(slot_key)) or "").strip()
+
+    try:
+        sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
+        if sub_path:
+            sub_text = read_subtitle_text(sub_path)
+            segs = parse_srt_segments(sub_text)
+            if start is not None and end is not None:
+                subtitle_context = extract_context_around(segs, start, end, window=5)
+            else:
+                subtitle_context = compact_segments_for_prompt(segs[:18], max_chars=3000)
+    except Exception:
+        subtitle_context = ""
+
+    if ai_enabled() and (not hint or start is None or end is None):
+        try:
+            model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+            segs_compact = (task.get("ai_segments_compact") or "").strip()
+
+            if not segs_compact:
+                sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
+                if sub_path:
+                    segs_compact = compact_segments_for_prompt(
+                        parse_srt_segments(read_subtitle_text(sub_path)),
+                        max_chars=12000
+                    )
+
+            prompt = f"""
+你是一位 Python 程式設計助教。學生在 Parsons 題目中把某一格放錯了。
+請你做兩件事：
+1) 給「繁體中文」提示（1~2句，針對該格錯誤）
+2) 從字幕時間戳中找出老師「邊輸入程式碼、邊口頭講解」該程式區塊的片段（start/end 必須是字幕裡實際存在的時間戳，不可捏造）
+
+請輸出「純 JSON」，不要多餘文字：
+{{
+  "hint": "繁體中文提示",
+  "start": 12.0,
+  "end": 28.0,
+  "evidence": "引用字幕關鍵句（可短）"
+}}
+
+資訊：
+- 難度 level: {level}
+- 錯誤格：{slot_label}
+- 正確應該是（expected）：{expected_text}
+- 學生放的是（actual）：{actual_text if actual_text else "（空白）"}
+
+字幕（含時間戳）如下（格式：[start-end] text）：
+{segs_compact}
+""".strip()
+
+            data = parsons_ai.call_openai_json(
+                model=model,
+                system="你是一位 Python 程式設計助教，協助分析 Parsons 錯誤並找出老師講解程式碼的字幕時間戳。只輸出 JSON。",
+                user=prompt
+            ) or {}
+
+            ai_hint = (data.get("hint") or "").strip()
+            ai_s = data.get("start", None)
+            ai_e = data.get("end", None)
+
+            ai_start = float(ai_s) if ai_s is not None else None
+            ai_end = float(ai_e) if ai_e is not None else None
+
+            if ai_hint:
+                hint = ai_hint
+            if ai_start is not None and ai_end is not None and ai_end > ai_start:
+                start, end = ai_start, ai_end
+
+            try:
+                update = {}
+                if hint:
+                    update[f"ai_slot_hints.{str(slot_key)}"] = hint
+                if start is not None and end is not None:
+                    update[f"ai_segment_map.{str(slot_key)}"] = {
+                        "start": float(start),
+                        "end": float(end),
+                        "start_ts": float(start),
+                        "end_ts": float(end),
+                        "evidence": (data.get("evidence") or "").strip(),
+                        "hint": hint,
+                    }
+                if update:
+                    db.parsons_tasks.update_one({"_id": task.get("_id")}, {"$set": update})
+            except Exception:
+                pass
+
+            try:
+                sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
+                if sub_path and start is not None and end is not None:
+                    sub_text = read_subtitle_text(sub_path)
+                    segs = parse_srt_segments(sub_text)
+                    subtitle_context = extract_context_around(segs, start, end, window=5)
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+    return hint, start, end, subtitle_context
+
+
+# 給 submit() 用的 AI 回饋生成（不保證一定有，盡量有）
+def _generate_submit_ai_feedback(task_doc: dict, answer_ids: list) -> dict:
+    """
+    學生 submit 後，直接產生 AI 診斷回饋。
+    目標：
+    1. 不讓 submit 因 AI 回饋失敗而爆掉
+    2. 優先回傳可顯示的 AI 訊息
+    3. 若 AI 或字幕失敗，仍回傳保底診斷內容
+    """
+    try:
+        parsed = t5doc_to_parsons_task(task_doc)
+        template_slots = parsed.get("template_slots") or []
+        pool = parsed.get("pool") or []
+        question_text = str(task_doc.get("question_text") or "")
+        unit = str(task_doc.get("unit") or "")
+
+        pool_map = {str(b.get("id")): b for b in pool if b.get("id") is not None}
+
+        expected_ids = []
+        for s in template_slots:
+            eid = s.get("expected_id")
+            expected_ids.append(str(eid) if eid is not None else "")
+
+        aligned = list(answer_ids or [])
+        if len(aligned) < len(expected_ids):
+            aligned += [None] * (len(expected_ids) - len(aligned))
+
+        def _norm_line(s: str) -> str:
+            try:
+                return (s or "").replace("\t", "    ").strip()
+            except Exception:
+                return (s or "").strip()
+
+        wrong_slots = []
+        for i in range(len(expected_ids)):
+            aid = str(aligned[i]) if aligned[i] is not None else ""
+            eid = str(expected_ids[i])
+
+            if aid == eid:
+                continue
+
+            a_text = str(pool_map.get(aid, {}).get("text", "") or "")
+            e_text = str(pool_map.get(eid, {}).get("text", "") or "")
+
+            # 文字相同也視為正確
+            if _norm_line(a_text) and _norm_line(a_text) == _norm_line(e_text):
+                continue
+
+            wrong_slots.append(i)
+
+        extra_wrong = max(0, len(answer_ids or []) - len(expected_ids))
+        is_correct = (len(wrong_slots) == 0 and extra_wrong == 0)
+
+        if is_correct:
+            return {
+                "is_correct": True,
+                "error_code": None,
+                "wrong_slots": [],
+                "diagnosis_summary": "作答正確",
+                "feedback": {
+                    "feedback_type": "correct",
+                    "concept_explanation": "答對了，你已掌握這題的程式流程與區塊排列邏輯。",
+                    "possible_causes": [],
+                    "impact": "",
+                    "guiding_question": ""
+                },
+                "recommended_review": {
+                    "start": None,
+                    "end": None,
+                    "reason": ""
+                }
+            }
+
+        wrong_label = "、".join([f"第{i+1}格" for i in wrong_slots]) if wrong_slots else "部分格子"
+
+        expected_blocks = []
+        for eid in expected_ids:
+            b = pool_map.get(str(eid), {})
+            expected_blocks.append({
+                "id": str(eid),
+                "text": str(b.get("text", "") or ""),
+                "type": str(b.get("type", "") or "")
+            })
+
+        student_blocks = []
+        for aid in aligned[:len(expected_ids)]:
+            bid = str(aid) if aid is not None else ""
+            b = pool_map.get(bid, {})
+            student_blocks.append({
+                "id": bid,
+                "text": str(b.get("text", "") or ""),
+                "type": str(b.get("type", "") or "")
+            })
+
+        subtitle_text_used = ""
+        try:
+            subtitle_path = ((task_doc.get("prompt_source") or {}).get("subtitle_path") or "").strip()
+            if subtitle_path:
+                raw_text = read_subtitle_text(subtitle_path)
+                segs = parse_srt_segments(raw_text)
+                subtitle_text_used = compact_segments_for_prompt(segs, max_chars=1800)
+        except Exception:
+            subtitle_text_used = ""
+
+        # 若未開 AI，直接走保底
+        if not ai_enabled():
+            return {
+                "is_correct": False,
+                "error_code": "AI_DISABLED",
+                "wrong_slots": wrong_slots,
+                "diagnosis_summary": f"學生主要在 {wrong_label} 的排列與預期不一致",
+                "feedback": {
+                    "feedback_type": "generic_fallback",
+                    "concept_explanation": f"你目前在 {wrong_label} 的程式區塊排列與題目要求不一致。",
+                    "possible_causes": [
+                        "可能把輸入、處理、輸出的先後順序放錯",
+                        "可能沒有正確理解這格在整體流程中的角色"
+                    ],
+                    "impact": "若程式區塊順序錯誤，程式可能無法依照題目要求執行。",
+                    "guiding_question": "請想想這一格是在讀取資料、處理資料，還是輸出結果？"
+                },
+                "recommended_review": {
+                    "start": None,
+                    "end": None,
+                    "reason": ""
+                }
+            }
+
+        model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+
+        prompt = f"""
+你是一位 Python Parsons 題診斷助教。
+請根據題目、正解區塊、學生作答區塊，產生「繁體中文」診斷回饋。
+
+【規則】
+1. 不可直接給完整正解
+2. 要說明學生主要錯誤概念
+3. 要用教學式語氣
+4. 若有字幕摘要，可輔助判斷
+5. 回傳純 JSON，不要多餘文字
+
+【題目資訊】
+unit: {unit}
+question_text: {question_text}
+wrong_slots: {json.dumps(wrong_slots, ensure_ascii=False)}
+
+【正解 blocks】
+{json.dumps(expected_blocks, ensure_ascii=False, indent=2)}
+
+【學生作答 blocks】
+{json.dumps(student_blocks, ensure_ascii=False, indent=2)}
+
+【字幕摘要】
+{subtitle_text_used}
+
+請輸出：
+{{
+  "diagnosis_summary": "一句話摘要主要問題",
+  "concept_explanation": "用 2~4 句說明學生主要錯誤概念",
+  "possible_causes": ["原因1", "原因2"],
+  "impact": "此錯誤可能造成什麼影響",
+  "guiding_question": "引導學生反思的問題",
+  "recommended_review": {{
+    "start": null,
+    "end": null,
+    "reason": ""
+  }}
+}}
+""".strip()
+
+        ai_data = parsons_ai.call_openai_json(
+            model=model,
+            system="你是一位 Python Parsons 題診斷助教。只輸出 JSON。",
+            user=prompt
+        ) or {}
+        recommended_review = ai_data.get("recommended_review") or {}
+
+        start = recommended_review.get("start")
+        end = recommended_review.get("end")
+
+        try:
+            start = float(start) if start is not None else None
+        except Exception:
+            start = None
+
+        try:
+            end = float(end) if end is not None else None
+        except Exception:
+            end = None
+
+        return {
+            "is_correct": False,
+            "error_code": "AI_DIAGNOSIS",
+            "wrong_slots": wrong_slots,
+            "diagnosis_summary": str(ai_data.get("diagnosis_summary") or f"學生主要在 {wrong_label} 的排列與預期不一致"),
+            "feedback": {
+                "feedback_type": "ai_diagnostic",
+                "concept_explanation": str(ai_data.get("concept_explanation") or f"你目前在 {wrong_label} 的程式流程理解上有些混淆。"),
+                "possible_causes": ai_data.get("possible_causes") if isinstance(ai_data.get("possible_causes"), list) else [],
+                "impact": str(ai_data.get("impact") or ""),
+                "guiding_question": str(ai_data.get("guiding_question") or "")
+            },
+            "recommended_review": {
+                "start": start,
+                "end": end,
+                "reason": str(recommended_review.get("reason") or "")
+            }
+        }
+
+    except Exception as e:
+        return {
+            "is_correct": False,
+            "error_code": "SUBMIT_AI_DIAGNOSIS_ERROR",
+            "wrong_slots": [],
+            "diagnosis_summary": f"AI 診斷暫時失敗：{str(e)}",
+            "feedback": {
+                "feedback_type": "submit_ai_error_fallback",
+                "concept_explanation": "系統目前無法產生完整診斷回饋，請先檢查程式區塊的順序與角色。",
+                "concept_hint": "請先確認該格在程式流程中的角色與資料型態。",
+                "possible_causes": [],
+                "impact": "",
+                "guiding_question": "哪一格應該先執行？哪一格是在使用前面產生的資料？",
+                "reflection_questions": [
+                    "這一格的目的，是接收輸入，還是設定初始值？",
+                    "這個值在後面會如何被使用？",
+                    "用目前的寫法，能順利完成運算嗎？"
+                ]
+            },
+            "recommended_review": {
+                "start": None,
+                "end": None,
+                "reason": ""
+            }
+        }
+    
+
+
+def _get_blocks_by_ids(task_doc: dict, block_ids: list):
+    parsed = t5doc_to_parsons_task(task_doc)
+    pool = parsed.get("pool") or []
+    pool_map = {str(b.get("id")): b for b in pool if b.get("id") is not None}
+
+    out = []
+    for bid in block_ids or []:
+        b = pool_map.get(str(bid), {})
+        out.append({
+            "id": str(bid),
+            "text": str(b.get("text", "") or ""),
+            "type": str(b.get("type", "") or ""),
+        })
+    return out
+
+def _normalize_line_for_compare(s: str) -> str:
+    """
+    比對程式行文字時使用：
+    - tab 轉空白
+    - 忽略前後空白
+    """
+    try:
+        s = (s or "").replace("\t", "    ")
+        return s.strip()
+    except Exception:
+        return (s or "").strip()
+
+
+def _get_wrong_slots_and_core_compare(task_doc: dict, student_order: list):
+    parsed = t5doc_to_parsons_task(task_doc)
+    expected_ids = _get_expected_ids_from_task(task_doc)
+    pool = parsed.get("pool") or []
+    pool_map = {str(b.get("id")): b for b in pool if b.get("id") is not None}
+
+    aligned = list(student_order or [])
+    if len(aligned) < len(expected_ids):
+        aligned = aligned + [None] * (len(expected_ids) - len(aligned))
+
+    wrong_slots = []
+    for i in range(len(expected_ids)):
+        aid = str(aligned[i]) if aligned[i] is not None else ""
+        eid = str(expected_ids[i])
+
+        if aid == eid:
+            continue
+
+        a_text = str(pool_map.get(aid, {}).get("text", "") or "")
+        e_text = str(pool_map.get(eid, {}).get("text", "") or "")
+
+        if _normalize_line_for_compare(a_text) and _normalize_line_for_compare(a_text) == _normalize_line_for_compare(e_text):
+            continue
+
+        wrong_slots.append(i)
+
+    extra_wrong = max(0, len(student_order or []) - len(expected_ids))
+    is_correct = (len(wrong_slots) == 0 and extra_wrong == 0)
+
+    return {
+        "is_correct": is_correct,
+        "wrong_slots": wrong_slots,
+        "expected_ids": expected_ids,
+        "aligned_student_ids": aligned,
+        "extra_wrong": extra_wrong
+    }
+
+
+def _get_subtitle_context_for_ai(task_doc: dict) -> dict:
+    ai_align = task_doc.get("ai_subtitle_alignment") or {}
+    source_subtitle = ai_align.get("source_subtitle") or {}
+    prompt_source = task_doc.get("prompt_source") or {}
+
+    subtitle_text_used = (
+        ai_align.get("subtitle_text_used")
+        or source_subtitle.get("text_used")
+        or task_doc.get("subtitle_text_used")
+        or ""
+    )
+
+    subtitle_range = ai_align.get("subtitle_range") or task_doc.get("subtitle_range") or {}
+    ai_segment_map = ai_align.get("ai_segment_map") or task_doc.get("ai_segment_map") or {}
+    ai_slot_hints = ai_align.get("ai_slot_hints") or task_doc.get("ai_slot_hints") or {}
+    ai_segments_compact = task_doc.get("ai_segments_compact") or ""
+
+    if not subtitle_text_used:
+        subtitle_path = (prompt_source.get("subtitle_path") or "").strip()
+        if subtitle_path:
+            try:
+                raw_text = read_subtitle_text(subtitle_path)
+                segs = parse_srt_segments(raw_text)
+                print(segs[:3])
+                subtitle_text_used = compact_segments_for_prompt(segs, max_chars=2000)
+            except Exception:
+                subtitle_text_used = ""
+
+    return {
+        "subtitle_text_used": subtitle_text_used,
+        "subtitle_range": subtitle_range,
+        "ai_segment_map": ai_segment_map,
+        "ai_slot_hints": ai_slot_hints,
+        "ai_segments_compact": ai_segments_compact,
+    }
+
+
+def _build_generic_fallback_feedback(task_doc: dict, compare_result: dict) -> dict:
+    wrong_slots = compare_result.get("wrong_slots", [])
+    wrong_label = "、".join([f"第{i+1}格" for i in wrong_slots]) if wrong_slots else "部分格子"
+
+    subtitle_ctx = _get_subtitle_context_for_ai(task_doc)
+    subtitle_text_used = subtitle_ctx.get("subtitle_text_used", "")
+
+    concept_explanation = f"這次作答與題目的預期排列不一致，主要錯誤出現在 {wrong_label}。"
+    if subtitle_text_used:
+        concept_explanation += " 建議對照影片字幕與題目要求，重新確認每個程式區塊的先後順序與作用。"
+
+    reflection_questions = [
+        "這一格的目的，是接收輸入，還是設定初始值？",
+        "這個值在後面會如何被使用？",
+        "用目前的寫法，能順利完成運算嗎？",
+    ]
+
+    return {
+        "feedback_type": "generic_ai_fallback",
+        "concept_explanation": concept_explanation,
+        "concept_hint": concept_explanation,
+        "possible_causes": [
+            "可能尚未掌握各程式區塊的先後執行關係",
+            "可能知道題目要完成的功能，但未正確對應到每一格的程式碼位置",
+            "可能將讀取、判斷、計算或輸出等步驟的角色混淆"
+        ],
+        "impact": "若程式區塊順序或位置錯誤，程式可能無法依照預期流程執行，造成輸出結果錯誤或邏輯不完整。",
+        "guiding_question": "你可以回想一下：哪一格應該先執行？哪一格是在使用前面產生的資料或結果？",
+        "reflection_questions": reflection_questions,
+    }
+
+
+def _build_correct_feedback() -> dict:
+    return {
+        "feedback_type": "correct",
+        "concept_explanation": "答對了，你已掌握這題的程式流程與區塊排列邏輯。",
+        "concept_hint": "",
+        "possible_causes": [],
+        "impact": "",
+        "guiding_question": "",
+        "reflection_questions": []
+    }
+
+def _generate_submit_ai_feedback(task_doc: dict, answer_ids: list) -> dict:
+    try:
+        compare_result = _get_wrong_slots_and_core_compare(task_doc, answer_ids)
+        return _call_ai_for_generic_diagnosis(task_doc, compare_result)
+    except Exception as e:
+        import traceback
+        print("\n========== SUBMIT AI DIAGNOSIS ERROR ==========")
+        print("error =", repr(e))
+        traceback.print_exc()
+        print("===============================================\n")
+
+        wrong_slots = []
+        try:
+            compare_result = _get_wrong_slots_and_core_compare(task_doc, answer_ids)
+            wrong_slots = compare_result.get("wrong_slots", []) or []
+        except Exception:
+            pass
+
+        return {
+            "is_correct": False,
+            "error_code": "SUBMIT_AI_DIAGNOSIS_ERROR",
+            "wrong_slots": wrong_slots,
+            "diagnosis_summary": f"AI 診斷暫時失敗：{str(e)}",
+            "feedback": {
+                "feedback_type": "submit_ai_error_fallback",
+                "concept_explanation": "系統目前無法產生完整診斷回饋，請先檢查程式區塊的順序與角色。",
+                "possible_causes": [],
+                "impact": "",
+                "guiding_question": "哪一格應該先執行？哪一格是在使用前面產生的資料？"
+            },
+            "recommended_review": {
+                "start": None,
+                "end": None,
+                "reason": ""
+            }
+        }
+
+
+
+def _call_ai_for_generic_diagnosis(task_doc: dict, compare_result: dict) -> dict:
+    if compare_result.get("is_correct"):
+        return {
+            "is_correct": True,
+            "error_code": None,
+            "wrong_slots": [],
+            "diagnosis_summary": "作答正確",
+            "feedback": _build_correct_feedback(),
+            "recommended_review": {
+                "start": None,
+                "end": None,
+                "reason": ""
+            }
+        }
+
+    parsed = t5doc_to_parsons_task(task_doc)
+    unit = str(task_doc.get("unit", "") or "")
+    level = str(task_doc.get("level", "") or "")
+    question_text = str(task_doc.get("question_text", "") or "")
+
+    expected_ids = compare_result.get("expected_ids", []) or []
+    aligned_student_ids = compare_result.get("aligned_student_ids", []) or []
+    wrong_slots = compare_result.get("wrong_slots", []) or []
+
+    expected_blocks = _get_blocks_by_ids(task_doc, expected_ids)
+    student_blocks = _get_blocks_by_ids(task_doc, [x for x in aligned_student_ids if x is not None])
+
+    subtitle_ctx = _get_subtitle_context_for_ai(task_doc)
+    subtitle_text_used = subtitle_ctx.get("subtitle_text_used", "")
+    subtitle_range = subtitle_ctx.get("subtitle_range", {}) or {}
+    ai_segment_map = subtitle_ctx.get("ai_segment_map", {}) or {}
+    ai_slot_hints = subtitle_ctx.get("ai_slot_hints", {}) or {}
+    ai_segments_compact = subtitle_ctx.get("ai_segments_compact", "") or ""
+
+    prompt = f"""
+你是一位 Python Parsons 題診斷助教。
+請根據「固定題內容、正解區塊、學生作答順序、字幕教學內容」，
+判斷學生主要錯在哪幾格，並給出概念導向的診斷式回饋。
+
+【重要規則】
+1. 不可直接給完整正解。
+2. 不可逐字要求學生把哪一行放到哪一格。
+3. 要用繁體中文。
+4. 要用教學方式解釋，不要像編譯器。
+5. 若 wrong_slots 已提供，優先以這些格數為主分析。
+6. 若字幕內容可協助判斷，請納入解釋。
+7. 回傳純 JSON，不要多餘文字。
+8. 診斷內容要能套用到以下模板段落：診斷結果、概念提示、請你反思(3題)。
+9. reflection_questions 必須剛好 3 題，每題一句。
+
+【題目資訊】
+unit: {unit}
+question_text: {question_text}
+
+【正解 blocks】
+{json.dumps(expected_blocks, ensure_ascii=False, indent=2)}
+
+【學生作答 blocks】
+{json.dumps(student_blocks, ensure_ascii=False, indent=2)}
+
+【系統初步比對】
+wrong_slots: {json.dumps(wrong_slots, ensure_ascii=False)}
+
+【字幕摘要】
+subtitle_text_used:
+{subtitle_text_used}
+
+subtitle_range:
+{json.dumps(subtitle_range, ensure_ascii=False)}
+
+ai_segment_map:
+{json.dumps(ai_segment_map, ensure_ascii=False)}
+
+ai_slot_hints:
+{json.dumps(ai_slot_hints, ensure_ascii=False)}
+
+ai_segments_compact:
+{ai_segments_compact}
+
+請輸出以下 JSON：
+{{
+  "is_correct": false,
+  "wrong_slots": [0],
+  "error_concept": "用一句話描述錯誤概念",
+  "diagnosis_summary": "用一句話摘要學生主要問題",
+    "concept_hint": "給學生的概念提示（1~2句）",
+  "possible_causes": ["原因1", "原因2"],
+  "impact": "這類錯誤可能造成什麼影響",
+  "guiding_question": "引導學生反思的問題",
+    "reflection_questions": [
+        "反思問題1",
+        "反思問題2",
+        "反思問題3"
+    ],
+  "recommended_review": {{
+    "start": null,
+    "end": null,
+    "reason": "若能從字幕判斷，請說明為何建議回看該片段"
+  }}
+}}
+""".strip()
+
+    try:
+        if not ai_enabled():
+            raise RuntimeError("AI not enabled")
+
+        model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+        ai_data = parsons_ai.call_openai_json(
+            model=model,
+            system="你是一位 Python Parsons 題診斷助教。",
+            user=prompt
+        ) or {}
+
+        ai_wrong_slots = ai_data.get("wrong_slots")
+        if not isinstance(ai_wrong_slots, list) or len(ai_wrong_slots) == 0:
+            ai_wrong_slots = wrong_slots
+
+        ai_reflections = ai_data.get("reflection_questions") if isinstance(ai_data.get("reflection_questions"), list) else []
+        ai_reflections = [str(x or "").strip() for x in ai_reflections if str(x or "").strip()]
+        if len(ai_reflections) < 3:
+            gq = str(ai_data.get("guiding_question", "") or "").strip()
+            causes = ai_data.get("possible_causes") if isinstance(ai_data.get("possible_causes"), list) else []
+            c1 = str(causes[0]).strip() if len(causes) >= 1 else ""
+            c2 = str(causes[1]).strip() if len(causes) >= 2 else ""
+            fallback_qs = [
+                gq or "這一格的目的，是接收輸入，還是設定初始值？",
+                (f"你覺得這次是否出現這個狀況：{c1}？" if c1 else "這個值在後面會如何被使用？"),
+                (f"如果改掉「{c2}」，目前流程會更接近正確解法嗎？" if c2 else "用目前的寫法，能順利完成運算嗎？"),
+            ]
+            for q in fallback_qs:
+                if len(ai_reflections) >= 3:
+                    break
+                if q and q not in ai_reflections:
+                    ai_reflections.append(q)
+        ai_reflections = ai_reflections[:3]
+
+        recommended_review = ai_data.get("recommended_review") or {}
+        start = recommended_review.get("start")
+        end = recommended_review.get("end")
+
+        try:
+            start = float(start) if start is not None else None
+        except Exception:
+            start = None
+
+        try:
+            end = float(end) if end is not None else None
+        except Exception:
+            end = None
+
+        return {
+            "is_correct": False,
+            "error_code": "GENERIC_AI_DIAGNOSIS",
+            "wrong_slots": ai_wrong_slots,
+            "diagnosis_summary": str(ai_data.get("diagnosis_summary", "") or "學生作答與預期程式流程不一致"),
+            "feedback": {
+                "feedback_type": "generic_ai_diagnostic",
+                "concept_explanation": str(ai_data.get("error_concept", "") or "這次的問題主要和程式區塊的排列邏輯有關。"),
+                "concept_hint": str(ai_data.get("concept_hint", "") or ai_data.get("error_concept", "") or "請先確認該格在程式流程中的角色與資料型態。"),
+                "possible_causes": ai_data.get("possible_causes", []) if isinstance(ai_data.get("possible_causes"), list) else [],
+                "impact": str(ai_data.get("impact", "") or ""),
+                "guiding_question": str(ai_data.get("guiding_question", "") or ""),
+                "reflection_questions": ai_reflections,
+            },
+            "recommended_review": {
+                "start": start,
+                "end": end,
+                "reason": str(recommended_review.get("reason", "") or "")
+            }
+        }
+
+    except Exception as e:
+        import traceback
+        print("\n========== AI GENERIC DIAGNOSIS ERROR ==========")
+        print("error =", repr(e))
+        traceback.print_exc()
+        print("===============================================\n")
+
+        fallback = _build_generic_fallback_feedback(task_doc, compare_result)
+        return {
+            "is_correct": False,
+            "error_code": "GENERIC_AI_FALLBACK",
+            "wrong_slots": wrong_slots,
+            "diagnosis_summary": f"AI 診斷失敗，改用保底回饋：{str(e)}",
+            "feedback": fallback,
+            "recommended_review": {
+                "start": None,
+                "end": None,
+                "reason": ""
+            }
+        }
+
+
+
+def diagnose_fixed_task_attempt(task_id: str, student_order: list):
+    task = db.parsons_tasks.find_one({"_id": ObjectId(task_id)})
+    if not task:
+        raise ValueError("task not found")
+
+    solution_order = task.get("solution_order", [])
+    pool_map = _build_pool_map(task)
+
+    if student_order == solution_order:
+        return {
+            "is_correct": True,
+            "error_code": None,
+            "wrong_slots": [],
+            "diagnosis_summary": "作答正確"
+        }
+
+    student_blocks = [pool_map.get(x, {}) for x in student_order]
+    student_texts = [_normalize_text(x.get("text", "")) for x in student_blocks]
+
+    # ===== U1-IO: 順序錯誤 =====
+    if len(student_texts) >= 2:
+        first_text = student_texts[0]
+        second_text = student_texts[1]
+
+        if "print" in first_text and "input" in second_text:
+            return {
+                "is_correct": False,
+                "error_code": "IO_ORDER_01",
+                "wrong_slots": [0, 1],
+                "diagnosis_summary": "學生將輸出放在讀取輸入之前"
+            }
+
+    # ===== U1-IO: input 沒存變數 =====
+    for idx, text in enumerate(student_texts):
+        if "input(" in text and "=" not in text:
+            return {
+                "is_correct": False,
+                "error_code": "IO_VAR_01",
+                "wrong_slots": [idx],
+                "diagnosis_summary": "學生使用 input() 但沒有將結果存入變數"
+            }
+
+    # ===== U1-IO: print 使用問題 =====
+    for idx, text in enumerate(student_texts):
+        if "print" in text:
+            if "hello" not in text and "name" not in text:
+                return {
+                    "is_correct": False,
+                    "error_code": "IO_OUTPUT_01",
+                    "wrong_slots": [idx],
+                    "diagnosis_summary": "學生的輸出內容與題目需求不一致"
+                }
+
+    # ===== U1-IO: 變數名稱不一致 =====
+    input_var_name = None
+    output_var_name = None
+
+    for text in student_texts:
+        if "=" in text and "input(" in text:
+            left = text.split("=", 1)[0].strip()
+            if left:
+                input_var_name = left
+
+        if "print" in text:
+            if "name" in text:
+                output_var_name = "name"
+
+    if input_var_name and output_var_name and input_var_name != output_var_name:
+        return {
+            "is_correct": False,
+            "error_code": "IO_VAR_NAME_01",
+            "wrong_slots": [],
+            "diagnosis_summary": "學生前後使用的變數名稱不一致"
+        }
+
+    # ===== fallback =====
+    return {
+        "is_correct": False,
+        "error_code": "IO_CONCEPT_01",
+        "wrong_slots": [],
+        "diagnosis_summary": "學生的輸入輸出流程與預期概念不一致"
+    }

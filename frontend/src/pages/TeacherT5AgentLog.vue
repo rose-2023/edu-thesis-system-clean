@@ -270,6 +270,15 @@
                         </button>
 
                         <button
+                          v-if="getSourceType(q) === 'fixed'"
+                          class="pillBtn"
+                          @click="alignFixedTask(q)"
+                          title="用 AI 將固定題每個 slot 對齊到影片字幕時間"
+                        >
+                          對齊字幕
+                        </button>
+
+                        <button
                           v-if="getSourceType(q) !== 'fixed'"
                           class="pillBtn regen"
                           @click="regenerate(q)"
@@ -352,6 +361,74 @@
               </div>
             </div>
 
+            <div class="pvSection">
+              <div class="pvH">【字幕切片品質】</div>
+              <div class="pvBox">
+                <div class="pvMetaRow">
+                  <div class="pill">best_score：{{ getSelectorMeta(previewData)?.best_score ?? "—" }}</div>
+                  <div class="pill">hit_ratio：{{ fmtRatio(getSelectorMeta(previewData)?.hit_ratio) }}</div>
+                  <div class="pill">keyword_coverage：{{ fmtRatio(getSelectorMeta(previewData)?.keyword_coverage_ratio) }}</div>
+                  <div class="pill">selected_count：{{ getSelectorMeta(previewData)?.selected_count ?? "—" }}</div>
+                  <div class="pill">fallback：{{ getSelectorMeta(previewData)?.fallback || "—" }}</div>
+                </div>
+
+                <div class="pvMetaRow">
+                  <div class="pill">policy_ok：{{ getPolicyMeta(previewData)?.ok === true ? "yes" : (getPolicyMeta(previewData)?.ok === false ? "no" : "—") }}</div>
+                  <div class="pill">policy_min_hits：{{ getPolicyMeta(previewData)?.min_hits ?? "—" }}</div>
+                  <div class="pill">policy_hit_count：{{ (getPolicyMeta(previewData)?.anchor_hits || []).length }}</div>
+                  <div class="pill">off_topic_ratio：{{ fmtRatio(getPolicyMeta(previewData)?.off_topic_ratio) }}</div>
+                </div>
+                <div class="hint" v-if="getPolicyMeta(previewData)?.reason">
+                  policy reason：{{ getPolicyMeta(previewData)?.reason }}
+                </div>
+
+                <details>
+                  <summary>關鍵句（key_sentences，點我展開）</summary>
+                  <ol class="pvList" v-if="(getKeySentences(previewData) || []).length">
+                    <li v-for="(s, i) in getKeySentences(previewData)" :key="`ks-${i}`">{{ s }}</li>
+                  </ol>
+                  <div v-else class="hint">（目前沒有 key_sentences）</div>
+                </details>
+              </div>
+            </div>
+
+            <div class="pvSection">
+              <div class="pvH">【研究分析面板】</div>
+              <div class="pvBox">
+                <div class="pvMetaRow">
+                  <div class="pill">alignment_score：{{ fmtRatio(getAlignmentConfidence(previewData)?.score) }}</div>
+                  <div class="pill">mapped_slots：{{ getAlignmentConfidence(previewData)?.mapped_slots ?? "—" }}</div>
+                  <div class="pill">hinted_slots：{{ getAlignmentConfidence(previewData)?.hinted_slots ?? "—" }}</div>
+                  <div class="pill">source：{{ getAlignmentConfidence(previewData)?.source || "—" }}</div>
+                </div>
+
+                <div class="pvMetaRow">
+                  <div class="pill">function_param_count：{{ getFunctionProfile(previewData)?.param_count ?? "—" }}</div>
+                  <div class="pill">need_input：{{ boolText(getFunctionProfile(previewData)?.need_input) }}</div>
+                  <div class="pill">need_print：{{ boolText(getFunctionProfile(previewData)?.need_print) }}</div>
+                  <div class="pill">allow_condition：{{ boolText(getFunctionProfile(previewData)?.allow_condition) }}</div>
+                </div>
+
+                <div class="pvMetaRow">
+                  <div class="pill">typed_definition：{{ getSentenceTypeCount(previewData, "definition") }}</div>
+                  <div class="pill">typed_rule：{{ getSentenceTypeCount(previewData, "rule") }}</div>
+                  <div class="pill">typed_example：{{ getSentenceTypeCount(previewData, "example") }}</div>
+                  <div class="pill">typed_other：{{ getSentenceTypeCount(previewData, "other") }}</div>
+                </div>
+
+                <details>
+                  <summary>關鍵句型別（key_sentences_typed，點我展開）</summary>
+                  <ol class="pvList" v-if="(getTypedKeySentences(previewData) || []).length">
+                    <li v-for="(row, i) in getTypedKeySentences(previewData)" :key="`kst-${i}`">
+                      <span class="typeTag">{{ row.sentence_type || "other" }}</span>
+                      {{ row.text || "" }}
+                    </li>
+                  </ol>
+                  <div v-else class="hint">（目前沒有 key_sentences_typed）</div>
+                </details>
+              </div>
+            </div>
+
             <!-- [新增] Rule Check：規則驗證 -->
             <div class="pvSection">
               <div class="pvH">【規則驗證】</div>
@@ -396,13 +473,25 @@
                 <div v-else class="hint">（目前沒有 rule_check，請確認後端是否有寫入 rule_check）</div>
               </div>
             </div>
-<!-- Parsons 區塊 -->
+        <!-- Parsons 區塊 -->
             <div class="pvSection">
-              <div class="pvH">Parsons 區塊（AI 生成｜逐區塊中文語意）</div>
+              <div class="pvHRow">
+                <div class="pvH">Parsons 區塊（AI 生成｜逐區塊中文語意）</div>
+                <label class="dSwitch" title="控制老師端與學生端是否顯示中文語意提示">
+                  <input
+                    type="checkbox"
+                    :checked="!hideSemanticZh"
+                    :disabled="semanticToggleSaving"
+                    @change="onToggleSemanticVisibility($event.target.checked)"
+                  />
+                  <span class="dSlider"></span>
+                  <span class="dSwitchText">{{ hideSemanticZh ? "中文語意：隱藏" : "中文語意：顯示" }}</span>
+                </label>
+              </div>
               <div class="pvGrid">
                 <div class="pvBlock" v-for="b in (previewData.parsons_blocks || [])" :key="b.id">
                   <div class="code">{{ b.text || "（空）" }}</div>
-                  <div class="zh">中文語意（AI）：{{ enhanceMeaning(b.text, b.meaning_zh) }}</div>
+                  <div class="zh" v-if="!hideSemanticZh">中文語意（AI）：{{ enhanceMeaning(b.text, b.meaning_zh) }}</div>
                 </div>
                 <div v-if="!(previewData.parsons_blocks || []).length" class="pvEmpty">
                   尚無 Parsons 區塊資料（請確認題目生成時是否有存 blocks）。
@@ -421,30 +510,23 @@
                 :key="'d-' + (b.id || b._id)"
                 :class="{ removed: !isKeepDistractor(b.id || b._id) }"
               >
-                <!-- 右上角 ✅/❌ -->
+                <!-- 右上角顯示/隱藏開關（預設開啟） -->
                 <div class="dCtrl">
-                  <button
-                    class="dBtn ok"
-                    type="button"
-                    :class="{ active: isKeepDistractor(b.id || b._id) }"
-                    @click="keepDistractor(b.id || b._id)"
-                    title="保留此干擾（學生端會看到）"
-                  >
-                    ✅
-                  </button>
-                  <button
-                    class="dBtn no"
-                    type="button"
-                    :class="{ active: !isKeepDistractor(b.id || b._id) }"
-                    @click="removeDistractor(b.id || b._id)"
-                    title="移除此干擾（學生端不會看到）"
-                  >
-                    ❌
-                  </button>
+                  <label class="dSwitch" :title="isKeepDistractor(b.id || b._id) ? '目前：顯示（學生端會看到）' : '目前：隱藏（學生端不會看到）'">
+                    <input
+                      type="checkbox"
+                      :checked="isKeepDistractor(b.id || b._id)"
+                      @change="setDistractorVisible(b.id || b._id, $event.target.checked)"
+                    />
+                    <span class="dSlider"></span>
+                    <span class="dSwitchText">{{ isKeepDistractor(b.id || b._id) ? "顯示" : "隱藏" }}</span>
+                  </label>
                 </div>
 
+                <div v-if="!isKeepDistractor(b.id || b._id)" class="dMask" aria-hidden="true"></div>
+
                 <div class="code">{{ b.text || "（空）" }}</div>
-                <div class="zh">
+                <div class="zh" v-if="!hideSemanticZh">
                   中文語意（AI）：{{ enhanceMeaning(b.text, b.meaning_zh) }}
                   <span v-if="!isKeepDistractor(b.id || b._id)" class="removedTag">（已標記移除）</span>
                 </div>
@@ -462,13 +544,26 @@
               <div class="pvOrder">
                 {{ previewData.solution_order_text || "（未提供）" }}
               </div>
+              <div class="pvIndentControls" v-if="solutionDetailList.length">
+                <label>
+                  解答縮排顯示：
+                  <select v-model="teacherIndentMode">
+                    <option value="raw">原始縮排</option>
+                    <option value="2">每層 2 空格</option>
+                    <option value="4">每層 4 空格</option>
+                  </select>
+                </label>
+              </div>
               <!-- ✅ 顯示對應程式碼（老師一眼看懂） -->
               <div class="pvOrderList" v-if="solutionDetailList.length">
                 <div class="pvOrderItem" v-for="r in solutionDetailList" :key="r.id">
                   <div class="pvOrderIdx">{{ r.idx }}.</div>
                   <div class="pvOrderMain">
-                    <div class="pvOrderCode"><span class="pvOrderId">{{ r.id }}</span> {{ r.text }}</div>
-                    <div class="pvOrderZh" v-if="r.meaning_zh">中文語意：{{ r.meaning_zh }}</div>
+                    <div class="pvOrderCode">
+                      <span class="pvOrderId">{{ r.id }}</span>
+                      <span class="indentGuide" v-if="getIndentLevel(r) > 0">{{ indentGuidePrefix(r) }}</span>{{ formatTeacherCodeLine(r) }}
+                    </div>
+                    <div class="pvOrderZh" v-if="!hideSemanticZh && r.meaning_zh">中文語意：{{ r.meaning_zh }}</div>
                   </div>
                 </div>
               </div>
@@ -666,6 +761,9 @@ const filterStatus = ref("all");
 const sortOrder = ref("newest");
 const questions = ref([]);
 const previewData = ref(null);
+const teacherIndentMode = ref("raw");
+const hideSemanticZh = ref(false);
+const semanticToggleSaving = ref(false);
 
 // Modal
 const modal = reactive({
@@ -751,6 +849,61 @@ function fmtConstraints(pd) {
   return "—";
 }
 
+function getKeySentences(pd) {
+  const arr = pd?.key_sentences;
+  if (!Array.isArray(arr)) return [];
+  return arr.map((x) => String(x || "").trim()).filter(Boolean);
+}
+
+function getSelectorMeta(pd) {
+  const m = pd?.selector_meta;
+  return (m && typeof m === "object") ? m : {};
+}
+
+function getPolicyMeta(pd) {
+  const m = pd?.unified_policy_meta;
+  return (m && typeof m === "object") ? m : {};
+}
+
+function getFunctionProfile(pd) {
+  const m = pd?.function_profile;
+  return (m && typeof m === "object") ? m : {};
+}
+
+function getAlignmentConfidence(pd) {
+  const m = pd?.alignment_confidence;
+  return (m && typeof m === "object") ? m : {};
+}
+
+function getTypedKeySentences(pd) {
+  const arr = pd?.key_sentences_typed;
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((x) => ({
+      text: String(x?.text || "").trim(),
+      sentence_type: String(x?.sentence_type || "other").trim().toLowerCase() || "other",
+    }))
+    .filter((x) => x.text);
+}
+
+function getSentenceTypeCount(pd, t) {
+  const rows = getTypedKeySentences(pd);
+  const target = String(t || "other").trim().toLowerCase();
+  return rows.filter((r) => r.sentence_type === target).length;
+}
+
+function boolText(v) {
+  if (v === true) return "yes";
+  if (v === false) return "no";
+  return "—";
+}
+
+function fmtRatio(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return `${Math.round(n * 100)}%`;
+}
+
 function mark(v) {
   if (v === true) return "✅";
   if (v === false) return "❌";
@@ -786,14 +939,17 @@ async function openPreview(row = null) {
 
     const question = data.question || {};
     const prompt = question.prompt || question.title || question.text || "";
-    initDistractorKeep(previewData.value?.distractor_blocks || []);
 
 
     const mapBlocks = (arr = []) =>
       (arr || []).map((b, idx) => ({
         id: String(b.id ?? b._id ?? `b${idx}`),
         text: b.text || b.code || b.line || "",
-        meaning_zh: b.semantic_zh || b.semantic || b.zh || ""
+        meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
+        enabled: b?.enabled !== false,
+        indent: Number.isFinite(Number(b.indent))
+          ? Number(b.indent)
+          : (String(b.text || b.code || b.line || "").length - String(b.text || b.code || b.line || "").replace(/^\s+/, "").length)
       }));
 
     const solutionOrderText = Array.isArray(data.solution_order)
@@ -815,10 +971,20 @@ async function openPreview(row = null) {
         created_by: "AI Agent"
       },
       prompt,
+      key_sentences: Array.isArray(data.key_sentences) ? data.key_sentences : [],
+      key_sentences_typed: Array.isArray(data.key_sentences_typed) ? data.key_sentences_typed : [],
+      selector_meta: (data.selector_meta && typeof data.selector_meta === "object") ? data.selector_meta : {},
+      unified_policy_meta: (data.unified_policy_meta && typeof data.unified_policy_meta === "object") ? data.unified_policy_meta : {},
+      function_profile: (data.function_profile && typeof data.function_profile === "object") ? data.function_profile : {},
+      alignment_confidence: (data.alignment_confidence && typeof data.alignment_confidence === "object") ? data.alignment_confidence : {},
       parsons_blocks: mapBlocks(data.solution_blocks),
       distractor_blocks: mapBlocks(data.distractor_blocks),
       solution_order_text: solutionOrderText
     };
+
+    resetDistractorKeep(previewData.value?.distractor_blocks || []);
+
+    hideSemanticZh.value = !!data.hide_semantic_zh;
 
     reviewForm.tags = data.review_tags || [];
     reviewForm.note = data.review_note || "";
@@ -858,16 +1024,76 @@ const solutionDetailList = computed(() => {
 
   const map = new Map(blocks.map(b => [String(b.id), b]));
 
-  return (order || []).map((id, idx) => {
+  const rows = (order || []).map((id, idx) => {
     const b = map.get(String(id));
     return {
       idx: idx + 1,
       id: String(id),
       text: b?.text || "（找不到對應區塊）",
+      indent: Number.isFinite(Number(b?.indent)) ? Number(b?.indent) : 0,
       meaning_zh: b?.meaning_zh || "",
     };
   });
+
+  // 若後端 text 已去除前導空白且 indent 也缺失，前端用程式結構推回縮排層級。
+  let level = 0;
+  return rows.map((r) => {
+    const line = String(r?.text || "").trim();
+    const lower = line.toLowerCase();
+
+    if (/^(elif\b|else\s*:|except\b|finally\s*:)/.test(lower)) {
+      level = Math.max(0, level - 1);
+    }
+
+    const fallbackIndent = level * 4;
+    const finalIndent = Number(r?.indent || 0) > 0 ? Number(r.indent) : fallbackIndent;
+
+    if (/:\s*$/.test(line) && !/^#/.test(line)) {
+      level += 1;
+    }
+
+    return {
+      ...r,
+      indent: finalIndent,
+      indent_level: Math.max(0, Math.round(finalIndent / 4)),
+    };
+  });
 });
+
+function formatTeacherCodeLine(row) {
+  const raw = String(row?.text || "").replace(/\t/g, "    ");
+  if (!raw) return "（空）";
+
+  const rawIndent = Number.isFinite(Number(row?.indent))
+    ? Number(row.indent)
+    : (raw.length - raw.replace(/^\s+/, "").length);
+
+  if (teacherIndentMode.value === "raw") {
+    if (rawIndent > 0 && raw.length === raw.trimStart().length) {
+      return " ".repeat(rawIndent) + raw;
+    }
+    return raw;
+  }
+
+  const unit = Number(teacherIndentMode.value);
+  const trimmed = raw.trimStart();
+  const level = Math.max(0, Math.round(rawIndent / 4));
+  const displayIndent = " ".repeat(level * (Number.isFinite(unit) ? unit : 4));
+  return displayIndent + trimmed;
+}
+
+function getIndentLevel(row) {
+  const n = Number(row?.indent_level);
+  if (Number.isFinite(n) && n >= 0) return n;
+  const rawIndent = Number(row?.indent || 0);
+  return Math.max(0, Math.round(rawIndent / 4));
+}
+
+function indentGuidePrefix(row) {
+  const level = getIndentLevel(row);
+  if (level <= 0) return "";
+  return "│ ".repeat(level);
+}
 
 
 // review in modal
@@ -1095,7 +1321,8 @@ async function saveReviewOnly() {
     task_id: modal.data.task_id,
     review_tags: reviewTags.value,
     review_note: reviewNote.value,
-    distractor_keep: { ...dKeep }
+    distractor_keep: { ...dKeep },
+    hide_semantic_zh: !!hideSemanticZh.value,
   };
   await t5Post("/question/review_save", payload);
 }
@@ -1108,6 +1335,27 @@ async function publish(row) {
 async function unpublish(row) {
   await t5Post("/question/unpublish", { task_id: row.task_id });
   await fetchQuestions();
+}
+
+async function alignFixedTask(row) {
+  try {
+    const taskId = row?.task_id;
+    if (!taskId) throw new Error("缺少 task_id");
+
+    const { data } = await api.post("/api/parsons/fixed_task/align_subtitle", {
+      task_id: taskId,
+      video_id: selectedVideo.value || ""
+    });
+
+    if (!data?.ok) {
+      throw new Error(data?.message || "字幕對齊失敗");
+    }
+
+    await fetchQuestions();
+    alert(`✅ 對齊完成：${(data?.slots_aligned || []).length} 格已建立回看片段`);
+  } catch (e) {
+    alert("⚠️ 對齊失敗：" + (e?.response?.data?.message || e?.message || "unknown"));
+  }
 }
 
 async function publishFromModal() {
@@ -1136,15 +1384,14 @@ async function rejectFromModal() {
 }
 
 // 干擾區塊切換移除/保留
-/** 初始化：預覽載入成功後，把所有 distractor 預設設為 true */
-function initDistractorKeep(distractors = []) {
-  // 只初始化「尚未存在」的，避免老師切過後又被覆蓋
+/** 每次載入預覽都重置為該題目前狀態，避免沿用上一題切換結果 */
+function resetDistractorKeep(distractors = []) {
+  Object.keys(distractorKeep).forEach((k) => delete distractorKeep[k]);
+
   for (const b of distractors) {
     const id = String(b.id ?? b._id ?? "");
     if (!id) continue;
-    if (typeof distractorKeep[id] === "undefined") {
-      distractorKeep[id] = true; // 預設保留
-    }
+    distractorKeep[id] = b?.enabled !== false;
   }
 }
 
@@ -1162,6 +1409,32 @@ function keepDistractor(id) {
 /** 點 ❌：移除 */
 function removeDistractor(id) {
   distractorKeep[String(id)] = false;
+}
+
+function setDistractorVisible(id, visible) {
+  if (visible) keepDistractor(id);
+  else removeDistractor(id);
+}
+
+async function onToggleSemanticVisibility(checked) {
+  hideSemanticZh.value = !checked;
+
+  const taskId = previewData.value?.meta?.task_id;
+  if (!taskId) return;
+
+  semanticToggleSaving.value = true;
+  try {
+    await t5Post("/question/review_save", {
+      task_id: taskId,
+      review_tags: reviewForm.tags || [],
+      review_note: reviewForm.note || "",
+      hide_semantic_zh: !!hideSemanticZh.value,
+    });
+  } catch (e) {
+    alert("⚠️ 中文語意顯示設定儲存失敗，請再試一次");
+  } finally {
+    semanticToggleSaving.value = false;
+  }
 }
 
 // ===== watchers =====
@@ -1204,6 +1477,7 @@ async function publishFromPreview() {
       review_tags: reviewForm.tags || [],
       review_note: reviewForm.note || "",
       distractor_keep: { ...distractorKeep }, // ✅ 把 ✅/❌ 狀態送到後端
+      hide_semantic_zh: !!hideSemanticZh.value,
     });
 
     // 2) 再發布（學生端可見）
@@ -1452,6 +1726,18 @@ watch(selectedUnit, () => {
   margin-bottom: 10px;
 }
 
+.pvHRow{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.pvHRow .pvH{
+  margin-bottom: 0;
+}
+
 /* 題目敘述 box */
 .pvBox{
   background: #f8fafc;
@@ -1461,6 +1747,28 @@ watch(selectedUnit, () => {
   color: #111827;
   line-height: 1.7;
   white-space: pre-wrap;
+}
+
+.pvList{
+  margin: 8px 0 0 18px;
+  padding: 0;
+}
+
+.pvList li{
+  margin: 4px 0;
+  line-height: 1.6;
+}
+
+.typeTag{
+  display: inline-block;
+  min-width: 78px;
+  margin-right: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 12px;
 }
 
 /* Blocks grid */
@@ -1634,6 +1942,34 @@ watch(selectedUnit, () => {
 .pvOrderCode{
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 13px;
+  white-space: pre;
+  tab-size: 4;
+}
+
+.indentGuide{
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.pvIndentControls{
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.pvIndentControls label{
+  font-size: 12px;
+  color: #475569;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pvIndentControls select{
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 4px 8px;
+  background: #fff;
 }
 
 .pvOrderId{
@@ -1675,28 +2011,60 @@ watch(selectedUnit, () => {
   top: 10px;
   right: 10px;
   display: inline-flex;
-  gap: 8px;
+  gap: 10px;
   z-index: 2;
 }
 
-.dBtn{
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
+.dSwitch{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 800;
+  color: #334155;
+  user-select: none;
+  background: rgba(255, 255, 255, .9);
   border: 1px solid rgba(0,0,0,.12);
-  background: #fff;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-  transition: transform .08s ease, background .12s ease, box-shadow .12s ease, opacity .12s ease;
+  border-radius: 999px;
+  padding: 4px 8px;
 }
 
-.dBtn:hover{ background: #f3f4f6; }
-.dBtn:active{ transform: scale(.98); }
+.dSwitch input{
+  display: none;
+}
 
-.dBtn.active{
-  box-shadow: 0 0 0 4px rgba(59,130,246,.12);
-  border-color: rgba(59,130,246,.45);
+.dSlider{
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  transition: background .15s ease;
+}
+
+.dSlider::after{
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,.2);
+  transition: transform .15s ease;
+}
+
+.dSwitch input:checked + .dSlider{
+  background: #22c55e;
+}
+
+.dSwitch input:checked + .dSlider::after{
+  transform: translateX(16px);
+}
+
+.dSwitchText{
+  min-width: 28px;
 }
 
 /* 移除狀態：卡片淡掉 */
@@ -1710,6 +2078,16 @@ watch(selectedUnit, () => {
 .pvBlock.removed .code{
   text-decoration: line-through;
   opacity: .8;
+}
+
+.dMask{
+  position: absolute;
+  inset: 0;
+  background: rgba(148, 163, 184, 0.26);
+  border-radius: 12px;
+  z-index: 1;
+  pointer-events: auto;
+  cursor: not-allowed;
 }
 
 /* 標籤 */

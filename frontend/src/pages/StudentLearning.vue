@@ -5,7 +5,7 @@
         <div class="brand-dot"></div>
         <div class="topbar-texts">
           <div class="title">單元列表</div>
-          <div class="subtitle">{{ currentUnit }}<span v-if="currentTitle">：{{ currentTitle }}</span></div>
+          <div class="subtitle">{{ displayUnitName(currentUnit) }}<span v-if="currentTitle">：{{ currentTitle }}</span></div>
         </div>
       </div>
 
@@ -31,7 +31,7 @@
           <button class="unit-header" @click="toggleUnit(idx)">
             <div class="unit-left">
               <span class="chev" :class="{ open: openIndex === idx }">▾</span>
-              <span class="unit-title">{{ u.unit }}</span>
+              <span class="unit-title">{{ displayUnitName(u.unit) }}</span>
             </div>
             <span class="count">{{ u.videos.length }} 部</span>
           </button>
@@ -218,6 +218,61 @@ const showReturnBar = computed(() => {
   return route.query.start != null;
 });
 
+function _normalizeUnitPrefix(rawUnit) {
+  const raw = String(rawUnit || "").trim();
+  const m = raw.match(/^(U\d+)/i);
+  return m ? m[1].toUpperCase() : raw.toUpperCase();
+}
+
+function _normalizeUnitKey(rawUnit) {
+  const raw = String(rawUnit || "").trim();
+  if (!raw) return "";
+  const m = raw.match(/^(U\d+)(?:[-_\s]*([A-Za-z]+))?/i);
+  if (m) {
+    const p = String(m[1] || "").toUpperCase();
+    const sub = String(m[2] || "").toLowerCase();
+    return sub ? `${p}-${sub}` : p;
+  }
+  return raw.toUpperCase().replace(/\s+/g, "");
+}
+
+function displayUnitName(rawUnit) {
+  const raw = String(rawUnit || "").trim();
+  if (!raw) return "";
+
+  const prefix = _normalizeUnitPrefix(raw);
+  const m = raw.match(/^(U\d+)(?:[-_ ]*([A-Za-z]+))?(.*)$/i);
+  const subTag = (m?.[2] || "").toLowerCase();
+  const tail = String(m?.[3] || "").trim();
+
+  if (prefix === "U3") {
+    if (subTag === "for") return "for 迴圈";
+    if (subTag === "loop") return "迴圈觀念解析";
+  }
+  if (prefix === "U2") {
+    if (subTag === "if") return "if 條件判斷";
+    if (subTag === "ifelse") return "if-else 條件判斷";
+    if (subTag === "elif") return "elif 條件判斷";
+  }
+  if (prefix === "U1" && subTag === "io") return "輸入輸出";
+
+  if (tail) {
+    const cleanTail = tail.replace(/^[-_\s]+/, "").trim();
+    if (cleanTail) return cleanTail;
+  }
+
+  const nameMap = {
+    U1: "輸入輸出",
+    U2: "條件判斷",
+    U3: "迴圈觀念解析",
+    U4: "巢狀迴圈",
+    U5: "不定數迴圈",
+    U6: "串列與字典",
+    U7: "函數觀念解析",
+  };
+  return nameMap[prefix] || raw;
+}
+
 const segmentLabel = computed(() => {
   const s = Number(route.query.start);
   const e = Number(route.query.end);
@@ -233,12 +288,13 @@ function toggleUnit(idx) {
 function groupByUnit(videos) {
   const map = new Map();
   for (const v of videos) {
-    const key = v.unit || "未分類";
-    if (!map.has(key)) map.set(key, { unit: key, videos: [] });
+    const rawUnit = String(v.unit || "未分類").trim();
+    const key = _normalizeUnitKey(rawUnit) || "未分類";
+    if (!map.has(key)) map.set(key, { unit: rawUnit, unitKey: key, videos: [] });
     map.get(key).videos.push(v);
   }
   return [...map.values()].sort((a, b) =>
-    a.unit.localeCompare(b.unit, "en", { numeric: true })
+    (a.unitKey || a.unit).localeCompare((b.unitKey || b.unit), "en", { numeric: true })
   );
 }
 
@@ -441,7 +497,8 @@ onMounted(async () => {
   // ✅ 原本路由：/learn/:unit
   const unitParam = route.params.unit ? String(route.params.unit) : "";
   if (unitParam) {
-    const idx = units.value.findIndex((u) => u.unit === unitParam);
+    const targetKey = _normalizeUnitKey(unitParam);
+    const idx = units.value.findIndex((u) => _normalizeUnitKey(u.unit) === targetKey || String(u.unit).trim() === String(unitParam).trim());
     if (idx >= 0 && units.value[idx].videos.length) {
       openIndex.value = idx;
       selectVideo(units.value[idx], units.value[idx].videos[0]);

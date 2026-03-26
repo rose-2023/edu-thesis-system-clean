@@ -1,6 +1,8 @@
 import os
 import re
 import hashlib
+import random
+import ast
 _re = re
 import json
 from datetime import datetime, timezone
@@ -10,7 +12,7 @@ from bson import ObjectId
 
 from ..db import db
 from . import parsons_ai
-from .parsons_concept_engine import build_generation_plan, build_template_solution
+from .parsons_concept_engine import build_generation_plan, build_template_solution, CONCEPT_KEYWORDS
 
 # ===== [安全版] anti-copy import =====
 try:
@@ -160,6 +162,209 @@ def _teacher_alignment_check(teacher_description: str, question_text: str, solut
     return ok, missing
 
 
+def _subtitle_concept_alignment_check(
+    plan: dict,
+    trace_keywords: list,
+    subtitle_text: str,
+    question_text: str,
+    solution_lines: list,
+) -> Tuple[bool, list, list]:
+    """檢查題目是否命中字幕概念關鍵詞，作為生成品質的硬性 gate。"""
+    concept = str((plan or {}).get("concept") or "").strip()
+    concept_kws = list(CONCEPT_KEYWORDS.get(concept, [])) if concept else []
+    unit_kws = [str(x).strip() for x in (trace_keywords or []) if str(x).strip()]
+
+    # 補少量字幕特徵詞，提升與影片概念的連動，但避免過度貼字幕原句。
+    subtitle_terms = _extract_subtitle_signature_terms(subtitle_text or "", max_terms=6)
+    subtitle_terms = [
+        t for t in subtitle_terms
+        if len(t) >= 2 and t not in {"老師", "影片", "題目", "程式", "說明", "內容"}
+    ]
+
+    seen = set()
+    required = []
+    for k in concept_kws + unit_kws + subtitle_terms:
+        kk = str(k or "").strip().lower()
+        if not kk or kk in seen:
+            continue
+        seen.add(kk)
+        required.append(kk)
+
+    if not required:
+        return True, [], []
+
+    hay = ((question_text or "") + "\n" + "\n".join(solution_lines or [])).lower()
+    hits = [k for k in required if k in hay]
+
+    # 關鍵詞越多，門檻越高；至少要求命中 1~2 個。
+    needed = 1 if len(required) <= 3 else 2
+    ok = len(hits) >= needed
+    missing = [k for k in required if k not in hits]
+    return ok, missing, required
+
+
+def _build_unified_generation_policy(
+    plan: dict,
+    unit: str,
+    constraints: dict,
+    video_title: str,
+    teacher_description: str,
+    subtitle_text: str,
+    selector_keywords: list,
+) -> dict:
+    """建立所有題型共用的一致性限制，避免規則零散漂移。"""
+    concept = str((plan or {}).get("concept") or "").strip()
+    unit_type = str((constraints or {}).get("unit_type") or "").strip().lower()
+
+    concept_terms = [str(x).strip().lower() for x in (CONCEPT_KEYWORDS.get(concept, []) if concept else []) if str(x).strip()]
+    title_terms = [str(x).strip().lower() for x in _extract_focus_keywords(video_title or "", max_keywords=6)]
+    teacher_terms = [str(x).strip().lower() for x in _extract_focus_keywords(teacher_description or "", max_keywords=6)]
+    subtitle_terms = [str(x).strip().lower() for x in _extract_subtitle_signature_terms(subtitle_text or "", max_terms=8)]
+    selector_terms = [str(x).strip().lower() for x in (selector_keywords or []) if str(x).strip()]
+
+    seen = set()
+    allow_terms = []
+    for term in (concept_terms + teacher_terms + title_terms + selector_terms + subtitle_terms):
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        allow_terms.append(term)
+
+    anchor_terms = []
+    for term in (teacher_terms + title_terms + concept_terms + selector_terms):
+        if term and term not in anchor_terms:
+            anchor_terms.append(term)
+        if len(anchor_terms) >= 10:
+            break
+    if not anchor_terms:
+        anchor_terms = allow_terms[:8]
+
+    min_hits = 1 if len(anchor_terms) <= 3 else 2
+    if unit_type == "function" and len(anchor_terms) >= 5:
+        min_hits = max(min_hits, 2)
+
+    hard_forbid_terms = []
+    if unit_type == "function" and any(x in allow_terms for x in ["加減乘除", "運算子", "operator", "+-*/"]):
+        hard_forbid_terms = ["購物", "金額", "折扣", "會員", "庫存"]
+
+    return {
+        "concept": concept,
+        "unit": str(unit or "").strip(),
+        "unit_type": unit_type,
+        "allow_terms": allow_terms,
+        "anchor_terms": anchor_terms,
+        "min_hits": min_hits,
+        "hard_forbid_terms": hard_forbid_terms,
+    }
+
+
+def _unified_policy_prompt_block(policy: dict) -> str:
+    anchors = [str(x).strip() for x in (policy or {}).get("anchor_terms", []) if str(x).strip()]
+    if not anchors:
+        return ""
+    min_hits = int((policy or {}).get("min_hits") or 1)
+    return (
+        "【統一一致性限制（所有題型共用）】\n"
+        f"- 題目與程式必須命中來源關鍵詞至少 {min_hits} 個：" + "、".join(anchors[:8]) + "\n"
+        "- 若來源未提及，不要引入新的主題領域（例如購物/庫存/會員等）。\n"
+        "- 老師有指定方向時，以老師方向優先。"
+    )
+
+
+def _policy_tokenize_text(text: str, max_terms: int = 24) -> list:
+    raw = re.findall(r"[a-z_][a-z0-9_]*|[\u4e00-\u9fff]{2,}", (text or "").lower())
+    stop = {
+        "題目", "程式", "輸入", "輸出", "老師", "影片", "請", "使用", "完成", "資料",
+        "python", "print", "input", "code", "line", "result", "value", "values",
+    }
+    out = []
+    seen = set()
+    for t in raw:
+        if (not t) or (len(t) <= 1) or (t in stop) or (t in seen):
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _validate_unified_generation_policy(question_text: str, solution_lines: list, policy: dict) -> Tuple[bool, dict]:
+    policy = policy or {}
+    anchors = [str(x).strip().lower() for x in policy.get("anchor_terms", []) if str(x).strip()]
+    allow_terms = set([str(x).strip().lower() for x in policy.get("allow_terms", []) if str(x).strip()])
+    hard_forbid_terms = [str(x).strip().lower() for x in policy.get("hard_forbid_terms", []) if str(x).strip()]
+    min_hits = int(policy.get("min_hits") or 1)
+
+    hay = ((question_text or "") + "\n" + "\n".join(solution_lines or [])).lower()
+    anchor_hits = [k for k in anchors if k in hay]
+    anchor_missing = [k for k in anchors if k not in hay]
+
+    forbid_hit = [k for k in hard_forbid_terms if k in hay]
+
+    q_terms = _policy_tokenize_text(question_text or "")
+    off_topic_terms = [t for t in q_terms if (t not in allow_terms) and (t not in anchors)]
+    off_topic_ratio = (len(off_topic_terms) / max(1, len(q_terms))) if q_terms else 0.0
+
+    # 保持寬鬆，避免影響生題能力：只有偏題非常明顯才擋。
+    severe_drift = (len(off_topic_terms) >= 9) and (off_topic_ratio >= 0.80)
+    ok = (len(anchor_hits) >= min_hits) and (not forbid_hit) and (not severe_drift)
+
+    reason = ""
+    if len(anchor_hits) < min_hits:
+        reason = "policy missing anchor terms: " + ", ".join(anchor_missing[:5])
+    elif forbid_hit:
+        reason = "policy forbidden terms: " + ", ".join(forbid_hit[:5])
+    elif severe_drift:
+        reason = "policy drift risk: too many off-topic terms"
+
+    meta = {
+        "ok": bool(ok),
+        "anchor_hits": anchor_hits,
+        "anchor_missing": anchor_missing,
+        "min_hits": min_hits,
+        "off_topic_terms": off_topic_terms[:10],
+        "off_topic_ratio": round(float(off_topic_ratio), 4),
+        "forbidden_hits": forbid_hit,
+        "reason": reason,
+    }
+    return ok, meta
+
+
+def _mix_pool_blocks(solution_blocks: list, distractor_blocks: list, seed_text: str = "") -> list:
+    """打散 pool 順序，避免干擾題固定集中在最上方。"""
+    sol = list(solution_blocks or [])
+    dis = list(distractor_blocks or [])
+    if not sol:
+        return dis
+    if not dis:
+        return sol
+
+    seed_src = seed_text or ("|".join(str(b.get("text", "")) for b in (sol + dis)))
+    seed_int = int(hashlib.md5(seed_src.encode("utf-8", errors="ignore")).hexdigest()[:8], 16)
+    rnd = random.Random(seed_int)
+
+    rnd.shuffle(sol)
+    rnd.shuffle(dis)
+
+    # 交錯合併，確保不會出現「前面全是干擾題」的情況。
+    out = []
+    i = j = 0
+    start_with_dis = bool(seed_int % 2)
+    while i < len(sol) or j < len(dis):
+        if start_with_dis and j < len(dis):
+            out.append(dis[j])
+            j += 1
+        if i < len(sol):
+            out.append(sol[i])
+            i += 1
+        if (not start_with_dis) and j < len(dis):
+            out.append(dis[j])
+            j += 1
+
+    return out
+
+
 def _extract_subtitle_signature_terms(text: str, max_terms: int = 10) -> list:
     text = (text or "").strip().lower()
     if not text:
@@ -234,6 +439,122 @@ def _semantic_paraphrase(label: str, question_text: str, line: str) -> str:
     return out
 
 
+def _semantic_keywords_from_question(question_text: str, max_keywords: int = 8) -> list:
+    kws = _extract_focus_keywords(question_text or "", max_keywords=max_keywords)
+    if kws:
+        return kws
+    raw = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z_]{3,}", question_text or "")
+    seen = set()
+    out = []
+    for t in raw:
+        k = str(t or "").strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+        if len(out) >= max_keywords:
+            break
+    return out
+
+
+def _trim_semantic_text(text: str, max_len: int = 18) -> str:
+    s = str(text or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[:max_len]
+
+
+def _build_contextual_semantic_labels(solution_lines: list, question_text: str) -> list:
+    kws = _semantic_keywords_from_question(question_text, max_keywords=8)
+    if not kws:
+        return [_label_for_code_line(ln) for ln in (solution_lines or [])]
+
+    focus_terms = [k for k in kws if any(x in str(k) for x in ["底", "指數", "次方", "金額", "分數", "成績", "筆數", "次數", "面積", "平均", "折扣", "寬", "高"]) ]
+    if not focus_terms:
+        focus_terms = kws[:2]
+    result_terms = [k for k in kws if any(x in str(k) for x in ["結果", "總", "平均", "次方", "面積", "筆數", "次數", "金額"]) ]
+    main_result = result_terms[0] if result_terms else (focus_terms[0] if focus_terms else "結果")
+
+    labels = []
+    input_idx = 0
+    for line in (solution_lines or []):
+        s = (line or "").strip()
+        low = s.lower()
+
+        if "input(" in low:
+            term = focus_terms[min(input_idx, len(focus_terms) - 1)] if focus_terms else "資料"
+            input_idx += 1
+            if "int(input" in low or "float(input" in low:
+                labels.append(_trim_semantic_text(f"讀取{term}並轉成數值"))
+            else:
+                labels.append(_trim_semantic_text(f"讀取{term}資料"))
+            continue
+
+        if low.startswith("def "):
+            labels.append(_trim_semantic_text(f"定義計算{main_result}的函式"))
+            continue
+
+        if low.startswith("return "):
+            labels.append(_trim_semantic_text(f"回傳{main_result}計算結果"))
+            continue
+
+        if low.startswith("print("):
+            labels.append(_trim_semantic_text(f"輸出{main_result}結果"))
+            continue
+
+        if low.startswith("if "):
+            term = focus_terms[0] if focus_terms else main_result
+            labels.append(_trim_semantic_text(f"判斷{term}條件是否成立"))
+            continue
+
+        if low.startswith("elif "):
+            labels.append("補充另一個條件判斷")
+            continue
+
+        if low.startswith("else"):
+            labels.append("處理條件未成立流程")
+            continue
+
+        if low.startswith("while "):
+            labels.append("條件成立時重複執行")
+            continue
+
+        if low.startswith("for "):
+            labels.append("使用迴圈逐步處理")
+            continue
+
+        if any(op in low for op in ["+=", "-=", "*=", "/="]):
+            labels.append(_trim_semantic_text(f"更新{main_result}累計值"))
+            continue
+
+        labels.append(_trim_semantic_text(_label_for_code_line(line)))
+
+    return labels
+
+
+def _is_generic_semantic_label(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+    generic_terms = [
+        "先準備一個值", "更新變數", "處理資料", "完成這一步", "銜接下一個程式流程",
+        "先準備一個後續會使用到的值", "更新中間結果", "先做一個條件判斷",
+    ]
+    return any(t in s for t in generic_terms)
+
+
+def _refine_semantic_labels(labels: list, solution_lines: list, question_text: str) -> list:
+    contextual = _build_contextual_semantic_labels(solution_lines, question_text)
+    out = []
+    for i, line in enumerate(solution_lines or []):
+        cur = str((labels or [])[i] if i < len(labels or []) else "").strip()
+        if _is_generic_semantic_label(cur):
+            cur = contextual[i] if i < len(contextual) else _label_for_code_line(line)
+        cur = _trim_semantic_text(cur or _label_for_code_line(line))
+        out.append(cur)
+    return out
+
+
 def _guided_hint_by_line(line: str, is_distractor: bool = False) -> str:
     """產生不揭露答案細節的引導式語意提示。"""
     s = (line or "").strip()
@@ -277,35 +598,41 @@ def _soften_semantic_hint(label: str, line: str, is_distractor: bool = False) ->
     if not base:
         return _guided_hint_by_line(line, is_distractor=is_distractor)
 
-    # 明顯在洩漏程式細節（變數/運算式/常數）時，一律降級為引導式提示。
-    leak_patterns = [
+    # 干擾題保持保守，避免語意直接提示正解位置。
+    if is_distractor:
+        leak_patterns = [
+            r"[A-Za-z_]\w*\s*=",
+            r"==|!=|<=|>=|<|>|\+|-|\*|/|%",
+            r"\b\d+\b",
+            r"if\s+.+:",
+            r"for\s+.+:",
+            r"while\s+.+:",
+            r"print\s*\(",
+            r"input\s*\(",
+            r"[「『\"'].*?[」』\"']",
+        ]
+        for p in leak_patterns:
+            if _re.search(p, base, flags=_re.IGNORECASE):
+                return _guided_hint_by_line(line, is_distractor=True)
+        if len(base) > 20:
+            return _guided_hint_by_line(line, is_distractor=True)
+        return base
+
+    # 核心解答允許貼情境語意，但仍避免把程式碼片段直接塞進中文。
+    core_code_leak = [
         r"[A-Za-z_]\w*\s*=",
         r"==|!=|<=|>=|<|>|\+|-|\*|/|%",
-        r"\b\d+\b",
         r"if\s+.+:",
         r"for\s+.+:",
         r"while\s+.+:",
         r"print\s*\(",
         r"input\s*\(",
-        r"[「『\"'].*?[」』\"']",
     ]
-    for p in leak_patterns:
+    for p in core_code_leak:
         if _re.search(p, base, flags=_re.IGNORECASE):
-            return _guided_hint_by_line(line, is_distractor=is_distractor)
+            return _guided_hint_by_line(line, is_distractor=False)
 
-    # 常見過度明確中文模板，直接降級避免提示過頭。
-    explicit_phrases = [
-        "讀入整數", "存入", "輸出結果", "顯示結果", "判斷條件", "檢查條件",
-        "設定", "建立", "等於", "小於", "大於", "倍數",
-    ]
-    if any(p in base for p in explicit_phrases):
-        return _guided_hint_by_line(line, is_distractor=is_distractor)
-
-    # 文字太長也容易透露關鍵，統一改為短引導。
-    if len(base) > 20:
-        return _guided_hint_by_line(line, is_distractor=is_distractor)
-
-    return base
+    return _trim_semantic_text(base, max_len=18)
 
 
 def _extract_int_literals(text: str) -> list:
@@ -553,6 +880,320 @@ def compact_segments_for_prompt(segs: list, max_chars: int = 12000) -> str:
         total += len(line) + 1
     return "\n".join(out)
 
+# =====================================
+# [新增] 偵測subtitle中的實現細節
+# =====================================
+
+def _detect_output_style_preference(subtitle_text: str) -> str:
+    """
+    偵測subtitle中教的輸出風格：是用print，還是用return。
+    回傳: 'print_only', 'return_preferred', 'mixed'
+    """
+    if not subtitle_text:
+        return "print_only"
+    
+    text_lc = subtitle_text.lower()
+    print_count = len(re.findall(r"\bprint\s*\(", text_lc))
+    return_count = len(re.findall(r"\breturn\b", text_lc))
+    
+    # 如果只有print，明確是print輸出
+    if print_count > 0 and return_count == 0:
+        return "print_only"
+    # 如果只有return，或return多於print
+    elif return_count > print_count:
+        return "return_preferred"
+    # 如果都有，但print更多
+    elif print_count >= return_count and print_count > 0:
+        return "print_only"
+    else:
+        return "print_only"  # 預設
+
+def _detect_int_input_pattern(subtitle_text: str) -> bool:
+    """
+    偵測subtitle中是否明確教了 int(input()) 這種轉型模式。
+    回傳True如果有明確示意必須轉型。
+    """
+    if not subtitle_text:
+        return False
+    
+    text_lc = subtitle_text.lower()
+    # 檢查 int(input()) 或 int ( input ( ) ) 各種格式
+    if re.search(r"\bint\s*\(\s*input\s*\(", text_lc):
+        return True
+    # 檢查「int轉型」、「資料型別」、「轉整數」等提示詞
+    if any(k in text_lc for k in ["int 轉型", "轉型", "資料型別", "轉整數", "整數輸入", "型別轉換"]):
+        return True
+    
+    return False
+
+def _detect_output_format_pattern(subtitle_text: str) -> str:
+    """
+    偵測subtitle中教的輸出格式。
+    回傳：'simple' (只輸出值), 'with_label' (帶標籤如'Name: xxx'), 'custom' (自訂格式)
+    """
+    if not subtitle_text:
+        return "simple"
+    
+    text_lc = subtitle_text.lower()
+    
+    # 檢查是否有「name:」、「total=」等標籤格式
+    if re.search(r"['\"]?\w+\s*[:=]", subtitle_text):
+        return "with_label"
+    
+    # 檢查是否有複雜的格式化
+    if re.search(r"print\(.*[':+]", subtitle_text):
+        return "custom"
+    
+    return "simple"
+
+def _detect_param_count(subtitle_text: str) -> Optional[int]:
+    """
+    偵測subtitle中教的函式參數數量。
+    回傳參數數量（例如2個參數回傳2），或None if無明確指示。
+    """
+    if not subtitle_text:
+        return None
+    
+    text_lc = subtitle_text.lower()
+    
+    # 方案1：搜尋 "def xxx(param1, param2, ...)" 這類定義
+    # 提取最長的def定義
+    def_matches = re.findall(r"def\s+\w+\s*\((.*?)\)", subtitle_text)
+    if def_matches:
+        # 取最後一個def（最新的教學），計算逗號+1 = 參數數
+        last_def = def_matches[-1].strip()
+        if last_def:  # 有參數
+            param_count = last_def.count(',') + 1
+            return param_count
+        else:  # def xxx() 無參數
+            return 0
+    
+    # 方案2：搜尋「幾個參數」「幾個引數」的提示
+    # 例如「兩個參數」「3個參數」「參數有2個」
+    for match in re.findall(r"([一二三四五1234])\s*[個個]?\s*(?:參數|引數|輸入|參數)", text_lc):
+        zh_to_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+        if match in zh_to_num:
+            return zh_to_num[match]
+        try:
+            return int(match)
+        except ValueError:
+            continue
+    
+    # 方案3：搜尋「底數與指數」「兩個輸入」這類雙參數提示
+    if any(k in text_lc for k in ["底數", "指數", "兩個輸入", "兩筆輸入", "兩個資料"]):
+        if "底數" in text_lc and "指數" in text_lc:
+            return 2
+        if "兩個" in text_lc or "兩筆" in text_lc:
+            return 2
+    
+    return None
+
+
+def _build_function_structure_profile(subtitle_text: str, teacher_description: str = "", context_text: str = "", force_operator_dispatch: bool = False) -> dict:
+    """將 function 題需求收斂為統一 profile，避免生成階段分散判斷。"""
+    src = "\n".join([
+        str(subtitle_text or ""),
+        str(teacher_description or ""),
+        str(context_text or ""),
+    ])
+    src_lc = src.lower()
+
+    output_style_preference = _detect_output_style_preference(src)
+    need_input = bool(
+        ("input(" in src_lc)
+        or any(k in src_lc for k in ["輸入", "讀入", "輸入值", "int(input", "float(input"])
+    )
+    need_print = (output_style_preference == "print_only") or ("print(" in src_lc) or ("輸出" in src_lc)
+    prefer_return = (output_style_preference == "return_preferred") or ("return" in src_lc)
+
+    param_count = _detect_param_count(src)
+    allow_condition = bool(_should_func_allow_condition(src, teacher_description))
+    need_int_cast = bool(_detect_int_input_pattern(src))
+    output_format_style = _detect_output_format_pattern(src)
+
+    if force_operator_dispatch:
+        allow_condition = True
+        need_input = True
+        need_print = True
+        if param_count is None or param_count < 3:
+            param_count = 3
+
+    return {
+        "param_count": param_count,
+        "need_input": bool(need_input),
+        "need_print": bool(need_print),
+        "prefer_return": bool(prefer_return),
+        "allow_condition": bool(allow_condition),
+        "need_int_cast": bool(need_int_cast),
+        "output_format_style": str(output_format_style or "simple"),
+        "force_operator_dispatch": bool(force_operator_dispatch),
+    }
+
+
+def _validate_function_structure_profile(solution_lines: list, profile: dict) -> Tuple[bool, str]:
+    if not solution_lines:
+        return False, "function profile: empty solution"
+
+    profile = profile or {}
+    code = "\n".join(solution_lines)
+    has_def = bool(_re.search(r"^\s*def\s+", code, flags=_re.M))
+    if not has_def:
+        return False, "function profile: missing def"
+
+    input_count = len(_re.findall(r"\binput\s*\(", code))
+    has_print = bool(_re.search(r"\bprint\s*\(", code))
+    has_return = bool(_re.search(r"\breturn\b", code))
+    has_if_like = bool(_re.search(r"^\s*(if|elif|else)\b", code, flags=_re.M))
+
+    if bool(profile.get("need_input")) and input_count <= 0:
+        return False, "function profile: need input()"
+    if bool(profile.get("need_print")) and (not has_print):
+        return False, "function profile: need print()"
+    if bool(profile.get("prefer_return")) and (not has_return):
+        return False, "function profile: prefer return"
+    if (not bool(profile.get("allow_condition", True))) and has_if_like:
+        return False, "function profile: condition not allowed"
+
+    expected_param_count = profile.get("param_count")
+    if expected_param_count is not None:
+        try:
+            tree = ast.parse(code)
+            funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+            if funcs:
+                actual = len(funcs[0].args.args)
+                if int(actual) != int(expected_param_count):
+                    return False, f"function profile: expected {expected_param_count} params, got {actual}"
+        except Exception:
+            return False, "function profile: parse failed"
+
+    if bool(profile.get("need_int_cast")) and input_count > 0:
+        without_cast = _re.sub(r'\b(?:int|float|str)\s*\(\s*input\s*\(\s*\)\s*\)', '', code)
+        if "input(" in without_cast:
+            return False, "function profile: need int/float/str cast for input"
+
+    return True, ""
+
+
+def _classify_subtitle_sentence_type(text: str) -> str:
+    t = str(text or "").strip().lower()
+    if not t:
+        return "other"
+    if any(k in t for k in ["例如", "比如", "像是", "範例", "example", "舉例"]):
+        return "example"
+    if any(k in t for k in ["必須", "需要", "注意", "禁止", "不可", "規則", "rule"]):
+        return "rule"
+    if any(k in t for k in ["是", "代表", "意思", "定義", "就是", "稱為", "指的是"]):
+        return "definition"
+    return "other"
+
+
+def _extract_typed_key_sentences_from_segments(segs: list, max_sentences: int = 10) -> list:
+    out = []
+    seen = set()
+    for s in (segs or []):
+        txt = str((s or {}).get("text") or "").strip()
+        if not txt:
+            continue
+        key = txt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "text": txt,
+            "sentence_type": _classify_subtitle_sentence_type(txt),
+            "start": float((s or {}).get("start") or 0.0),
+            "end": float((s or {}).get("end") or 0.0),
+        })
+        if len(out) >= max_sentences:
+            break
+    return out
+
+
+def _build_alignment_confidence(selector_meta: dict, typed_key_sentences: list, segment_map: Optional[dict] = None, slot_hints: Optional[dict] = None) -> dict:
+    sel = selector_meta or {}
+    typed = typed_key_sentences or []
+    seg_map = segment_map or {}
+    slot_hints = slot_hints or {}
+
+    sentence_type_counts = {"definition": 0, "rule": 0, "example": 0, "other": 0}
+    for it in typed:
+        tp = str((it or {}).get("sentence_type") or "other")
+        if tp not in sentence_type_counts:
+            tp = "other"
+        sentence_type_counts[tp] += 1
+
+    selector_score = float(sel.get("best_score") or 0.0)
+    hit_ratio = float(sel.get("hit_ratio") or 0.0)
+    kw_cov = float(sel.get("keyword_coverage_ratio") or 0.0)
+    selected_count = int(sel.get("selected_count") or 0)
+
+    mapped_slots = len([k for k, v in (seg_map.items() if isinstance(seg_map, dict) else []) if isinstance(v, dict)])
+    hinted_slots = len([k for k, v in (slot_hints.items() if isinstance(slot_hints, dict) else []) if str(v or "").strip()])
+
+    # 0~1 分數，偏保守。selector 品質占大宗，slot 對齊做加分。
+    base = min(1.0, max(0.0, (hit_ratio * 0.4) + (kw_cov * 0.35) + (min(selector_score, 20.0) / 20.0) * 0.25))
+    bonus = min(0.2, (min(mapped_slots, 10) / 10.0) * 0.15 + (min(hinted_slots, 10) / 10.0) * 0.05)
+    confidence = round(min(1.0, base + bonus), 4)
+
+    return {
+        "score": confidence,
+        "selected_count": selected_count,
+        "sentence_type_counts": sentence_type_counts,
+        "mapped_slots": mapped_slots,
+        "hinted_slots": hinted_slots,
+        "source": "selector_plus_slot_map",
+    }
+
+def _should_func_allow_condition(subtitle_text: str, teacher_description: str = "") -> bool:
+    """
+    啟發式檢查：某些場景函式中必須允許 if/elif/else。
+    例如：計算機題、操作選擇、多分支邏輯。
+    回傳 True → 即使 subtitle 沒教 if，仍允許 if 使用。
+    """
+    if not subtitle_text:
+        return False
+    
+    combined = (subtitle_text + " " + (teacher_description or "")).lower()
+    
+    # 方案1：參數名稱暗示操作選擇（在 def 行中找）
+    # 例如 def f(x, y, op):, def calculate(a, b, operation):
+    operation_param_names = [
+        "op", "operation", "operator", "choice", "option",
+        "type", "mode", "kind", "select", "cmd", "action", "func"
+    ]
+    
+    def_line_matches = re.findall(r"def\s+\w+\s*\((.*?)\)", combined)
+    for def_params in def_line_matches:
+        params_lc = def_params.lower()
+        if any(pname in params_lc for pname in operation_param_names):
+            return True
+    
+    # 方案2：Subtitle 明確提到計算機、選擇、多分支邏輯
+    heuristic_keywords = [
+        "計算器", "calculator", "operator", "operation", "運算",
+        "加減乘除", "+-*/", "選擇", "分支", "選項", "option",
+        "+-*/, 根據", "根據選擇", "根據操作", "依據",
+        "加", "減", "乘", "除"  # 四則運算
+    ]
+    
+    if any(kw in combined for kw in heuristic_keywords):
+        # 檢查是否真的有「多個操作」提示
+        if combined.count("加") > 0 or combined.count("減") > 0:
+            # 至少提到兩個運算
+            op_count = sum(1 for op in ["加", "減", "乘", "除"] if op in combined)
+            if op_count >= 2:
+                return True
+        
+        # 或直接提到「計算器」「運算選擇」
+        if any(k in combined for k in ["計算器", "calculator", "根據選擇", "根據操作"]):
+            return True
+        
+        # 或有「operation」「operator」這類英文提示
+        if "operation" in combined or "operator" in combined:
+            return True
+    
+    return False
+
 def extract_context_around(segs: list, start: float, end: float, window: int = 5) -> str:
     picked = []
     for s in segs:
@@ -592,6 +1233,151 @@ def pick_latest_subtitle_path(video_doc: dict, video_id_str: str) -> str:
     return (video_doc.get("subtitle_path", "") or "").strip()
 
 
+def _norm_unit_prefix(unit: str) -> str:
+    u = (unit or "").strip().upper()
+    if not u:
+        return ""
+    return u.split("-")[0]
+
+
+def _to_block_list(lines_or_blocks: Any, block_prefix: str = "b") -> list:
+    out = []
+    seq = lines_or_blocks or []
+    if not isinstance(seq, list):
+        return out
+    for i, item in enumerate(seq):
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            out.append({
+                "id": str(item.get("id") or f"{block_prefix}{i+1}"),
+                "text": text,
+                "type": str(item.get("type") or ("distractor" if block_prefix == "d" else "core")),
+            })
+        else:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            out.append({"id": f"{block_prefix}{i+1}", "text": text, "type": "distractor" if block_prefix == "d" else "core"})
+    return out
+
+
+def _pick_db_fallback_question(unit: str, video_title: str, level: str = "L1") -> Optional[dict]:
+    """從 DB 撈備選題，優先 video_title + unit，其次 unit 前綴（例如 U7）。"""
+    try:
+        unit_u = (unit or "").strip().upper()
+        unit_prefix = _norm_unit_prefix(unit_u)
+        title = (video_title or "").strip()
+        lv = (level or "L1").strip().upper()
+
+        base_q = {"active": {"$ne": False}}
+
+        # 避免同影片/同單元短時間重覆抽到同一題（看最近 8 筆 fallback）
+        recent_used_qtexts = set()
+        try:
+            recent_q = {
+                "gen_source": "fallback",
+                "unit": unit_u,
+                "video_title": title,
+            }
+            for t in db.parsons_tasks.find(recent_q, {"question_text": 1}).sort("created_at", -1).limit(8):
+                qt = str((t or {}).get("question_text") or "").strip()
+                if qt:
+                    recent_used_qtexts.add(qt)
+        except Exception:
+            pass
+
+        def _pick_non_recent(candidates: list) -> Optional[dict]:
+            if not candidates:
+                return None
+            fresh = [c for c in candidates if str((c or {}).get("question_text") or "").strip() not in recent_used_qtexts]
+            pool = fresh if fresh else candidates
+            return random.choice(pool) if pool else None
+
+        # 1) 最精準：unit + video_title + level
+        if title:
+            q1 = {
+                **base_q,
+                "unit": unit_u,
+                "video_title": title,
+                "$or": [{"level": lv}, {"level": {"$exists": False}}, {"level": ""}],
+            }
+            c1 = list(db.parsons_fallback_questions.find(q1).limit(30))
+            picked = _pick_non_recent(c1)
+            if picked:
+                return picked
+
+        # 2) unit + level
+        q2 = {
+            **base_q,
+            "unit": unit_u,
+            "$or": [{"level": lv}, {"level": {"$exists": False}}, {"level": ""}],
+        }
+        c2 = list(db.parsons_fallback_questions.find(q2).limit(50))
+        picked = _pick_non_recent(c2)
+        if picked:
+            return picked
+
+        # 3) unit 前綴（U1/U2...）
+        if unit_prefix:
+            q3 = {
+                **base_q,
+                "unit_prefix": unit_prefix,
+                "$or": [{"level": lv}, {"level": {"$exists": False}}, {"level": ""}],
+            }
+            c3 = list(db.parsons_fallback_questions.find(q3).limit(50))
+            picked = _pick_non_recent(c3)
+            if picked:
+                return picked
+
+        return None
+    except Exception:
+        return None
+
+
+def _build_fallback_payload_from_doc(doc: dict, constraints: dict) -> Optional[Dict[str, Any]]:
+    try:
+        question_text = str(doc.get("question_text") or "").strip()
+        if not question_text:
+            return None
+
+        solution_blocks = _to_block_list(doc.get("solution_blocks") or doc.get("solution_lines"), "b")
+        distractor_blocks = _to_block_list(doc.get("distractor_blocks") or doc.get("distractor_lines"), "d")
+        if not solution_blocks:
+            return None
+
+        solution_lines = [str(b.get("text") or "") for b in solution_blocks]
+        _labels = _build_contextual_semantic_labels(solution_lines, question_text)
+        for i, b in enumerate(solution_blocks):
+            b["semantic_zh"] = _soften_semantic_hint(_labels[i], b.get("text") or "", is_distractor=False)
+
+        pool = _mix_pool_blocks(solution_blocks, distractor_blocks, seed_text=question_text)
+        template_slots = [{"label": _soften_semantic_hint(_labels[i], solution_lines[i], is_distractor=False), "slot": str(i)} for i in range(len(solution_lines))]
+
+        return {
+            "question_text": question_text,
+            "solution_blocks": solution_blocks,
+            "distractor_blocks": distractor_blocks,
+            "pool": pool,
+            "template_slots": template_slots,
+            "ai_feedback": {
+                "general": "（使用資料庫備選題）",
+                "common_mistakes": doc.get("common_mistakes") or [],
+                "hints": doc.get("hints") or [],
+            },
+            "unit_type": (constraints or {}).get("unit_type") or "loop",
+            "constraints": constraints,
+            "rule_check": build_rule_check(solution_lines, constraints),
+            "source_subtitle": {"text_used": ""},
+            "subtitle_range": {"start_index": 0, "end_index": 0, "start_ts": 0, "end_ts": 0},
+            "subtitle_text_used": "",
+            "fallback_source": "db",
+        }
+    except Exception:
+        return None
+
+
 # =========================
 # t5doc_to_parsons_task (teacher->student normalize)
 # =========================
@@ -600,6 +1386,13 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
     constraints = resolve_unit_constraints(unit)
     unit_type = (constraints or {}).get("unit_type") or "loop"
     loop_style = (constraints or {}).get("loop_style") or "either"
+
+    # 優先使用資料庫備選題；查不到時才走舊版程式內建備援。
+    fb_doc = _pick_db_fallback_question(unit=unit, video_title=video_title, level=level)
+    if fb_doc:
+        db_payload = _build_fallback_payload_from_doc(fb_doc, constraints)
+        if db_payload:
+            return db_payload
 
     if unit_type == "io":
         question_text = "（備援題目）請輸入兩個整數，並輸出它們的總和。"
@@ -620,6 +1413,22 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
             "print('pass')",
             "elif score >= 60:",
             "score = input()",
+        ]
+
+    elif unit_type == "function":
+        question_text = "（備援題目）請定義函式 add(a, b) 回傳兩數和，讀入兩個整數後呼叫函式並輸出結果。"
+        solution_lines = [
+            "def add(a, b):",
+            "    return a + b",
+            "x = int(input())",
+            "y = int(input())",
+            "print(add(x, y))",
+        ]
+        distractor_lines = [
+            "def add(a, b):",
+            "    print(a + b)",
+            "print(add(x + y))",
+            "x = input()",
         ]
 
     else:
@@ -654,11 +1463,17 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
                 "print(i)",
             ]
 
-    solution_blocks = [{"id": f"b{i+1}", "text": line, "type": "core", "semantic_zh": _label_for_code_line(line)} for i, line in enumerate(solution_lines)]
+    _fb_labels = _build_contextual_semantic_labels(solution_lines, question_text)
+    solution_blocks = [
+        {"id": f"b{i+1}", "text": line, "type": "core", "semantic_zh": _soften_semantic_hint(_fb_labels[i], line, is_distractor=False)}
+        for i, line in enumerate(solution_lines)
+    ]
     distractor_blocks = [{"id": f"d{i+1}", "text": line, "type": "distractor"} for i, line in enumerate(distractor_lines)]
-    pool = distractor_blocks + solution_blocks
-    _fb_labels = [_label_for_code_line(ln) for ln in solution_lines]
-    template_slots = [{"label": _fb_labels[i], "slot": str(i)} for i in range(len(solution_lines))]
+    pool = _mix_pool_blocks(solution_blocks, distractor_blocks, seed_text=question_text)
+    template_slots = [
+        {"label": _soften_semantic_hint(_fb_labels[i], solution_lines[i], is_distractor=False), "slot": str(i)}
+        for i in range(len(solution_lines))
+    ]
 
     return {
         "question_text": question_text,
@@ -705,7 +1520,7 @@ def resolve_unit_constraints(unit: str) -> Dict[str, Any]:
     if "-LIST" in u or u.startswith("U6"):
         return {"unit_type": "loop", "loop_style": "for_only", "prefer_list_ops": True}
     if "-FUNCTION" in u or u.startswith("U7"):
-        return {"unit_type": "loop", "loop_style": "either", "prefer_function_style": True}
+        return {"unit_type": "function", "require_def": True, "forbid_class": True}
     if "-LOOP" in u:
         return {"unit_type": "loop", "loop_style": "for_only"}
 
@@ -718,6 +1533,7 @@ def _pick_trace_window(segs: list, constraints: dict, max_lines: int = 7) -> Dic
         "io": ["input", "print", "輸入", "輸出", "讀入", "輸出結果"],
         "condition": ["if", "else", "elif", "條件", "判斷", "比較", "大於", "小於", "等於"],
         "loop": ["for", "while", "迴圈", "重複", "range", "次", "循環"],
+        "function": ["def", "function", "函式", "return", "參數", "呼叫"],
     }
     kws = kw_map.get(unit_type, [])
     hit = None
@@ -744,6 +1560,211 @@ def _pick_trace_window(segs: list, constraints: dict, max_lines: int = 7) -> Dic
         "subtitle_text_used": text_used,
         "keywords": kws,
     }
+
+
+def _selector_unit_keywords(
+    unit: str,
+    constraints: dict,
+    teacher_description: str = "",
+    video_title: str = "",
+    extra_keywords: Optional[list] = None,
+    trace_keywords: Optional[list] = None,
+) -> list:
+    u = (unit or "").strip().upper()
+    unit_type = (constraints or {}).get("unit_type") or "loop"
+    loop_style = (constraints or {}).get("loop_style") or "either"
+
+    kws = []
+    if unit_type == "io":
+        kws.extend(["input", "print", "輸入", "輸出", "讀入"])
+    elif unit_type == "condition":
+        kws.extend(["if", "elif", "else", "條件", "判斷", "比較"])
+    elif unit_type == "function":
+        kws.extend(["def", "return", "函式", "function", "參數", "呼叫", "input", "輸入", "讀入", "int("])
+    elif unit_type == "loop":
+        if loop_style == "while_only":
+            kws.extend(["while", "quit", "end", "停止", "結束", "重複", "輸入"])
+        elif loop_style == "for_only":
+            kws.extend(["for", "range", "迴圈", "次數", "重複", "走訪"])
+            if "-LIST" in u or u.startswith("U6"):
+                kws.extend(["list", "列表", "append", "清單"])
+        else:
+            kws.extend(["for", "while", "range", "迴圈", "重複", "條件"])
+
+    if trace_keywords:
+        kws.extend([str(x) for x in (trace_keywords or []) if str(x or "").strip()])
+
+    # 教師描述常含題目語境，加入切片關鍵字可以提高相關段落命中率。
+    kws.extend(_extract_focus_keywords(teacher_description or "", max_keywords=6))
+    kws.extend(_extract_focus_keywords(video_title or "", max_keywords=5))
+
+    if extra_keywords:
+        kws.extend([str(x) for x in (extra_keywords or []) if str(x or "").strip()])
+
+    out = []
+    seen = set()
+    for k in kws:
+        kk = str(k or "").strip().lower()
+        if not kk or kk in seen:
+            continue
+        seen.add(kk)
+        out.append(kk)
+    return out
+
+
+def _score_subtitle_segment_for_selector(text: str, keywords: list) -> int:
+    t = (text or "").lower()
+    if not t:
+        return 0
+
+    score = 0
+    for kw in (keywords or []):
+        k = str(kw or "").strip().lower()
+        if not k:
+            continue
+        if k in t:
+            score += 3 if len(k) >= 2 else 1
+
+    for token in ["input", "print", "if", "for", "while", "def", "return", "quit", "range"]:
+        if token in t:
+            score += 1
+
+    # 題目可出性加權：定義句、規則句、示例句通常比閒聊更穩定。
+    sentence_type_bonus = ["例如", "比如", "像是", "必須", "需要", "注意", "通常", "代表", "意思是"]
+    for token in sentence_type_bonus:
+        if token in t:
+            score += 1
+    return score
+
+
+def _select_relevant_subtitle_segments(
+    segs: list,
+    unit: str,
+    constraints: dict,
+    teacher_description: str = "",
+    video_title: str = "",
+    question_keywords: Optional[list] = None,
+    trace_keywords: Optional[list] = None,
+    window: int = 4,
+    max_segments: int = 10,
+) -> Dict[str, Any]:
+    if not segs:
+        return {"segments": [], "keywords": [], "best_idx": -1, "best_score": 0, "fallback": "empty_subtitle"}
+
+    keywords = _selector_unit_keywords(
+        unit=unit,
+        constraints=constraints,
+        teacher_description=teacher_description,
+        video_title=video_title,
+        extra_keywords=question_keywords,
+        trace_keywords=trace_keywords,
+    )
+
+    if not keywords:
+        return {
+            "segments": segs[:max_segments],
+            "keywords": [],
+            "best_idx": 0,
+            "best_score": 0,
+            "fallback": "no_keywords",
+        }
+
+    scored = []
+    for idx, seg in enumerate(segs):
+        txt = str(seg.get("text") or "")
+        scored.append((idx, _score_subtitle_segment_for_selector(txt, keywords)))
+
+    best_idx, best_score = max(scored, key=lambda x: x[1]) if scored else (0, 0)
+    hit_scored = [x for x in scored if x[1] > 0]
+
+    if best_score <= 0:
+        trace = _pick_trace_window(segs, constraints, max_lines=max_segments)
+        sr = (trace.get("subtitle_range") or {})
+        s_idx = int(sr.get("start_index") or 0)
+        e_idx = int(sr.get("end_index") or 0)
+        selected = segs[s_idx:e_idx + 1] if e_idx >= s_idx else segs[:max_segments]
+        return {
+            "segments": selected[:max_segments],
+            "keywords": keywords,
+            "best_idx": best_idx,
+            "best_score": best_score,
+            "fallback": "trace_window",
+        }
+
+    # 命中時優先取 Top N 句，再按原字幕順序回傳，降低多概念混入。
+    # 命中太少時，補 best_idx 周圍 window 句，避免上下文斷裂。
+    hit_scored_sorted = sorted(hit_scored, key=lambda x: (-x[1], x[0]))
+    picked_idx = [idx for idx, _ in hit_scored_sorted[:max_segments]]
+
+    if len(picked_idx) < min(5, max_segments):
+        start = max(0, best_idx - max(0, int(window)))
+        end = min(len(segs), best_idx + max(0, int(window)) + 1)
+        for i in range(start, end):
+            if i not in picked_idx:
+                picked_idx.append(i)
+            if len(picked_idx) >= max_segments:
+                break
+
+    picked_idx = sorted(picked_idx)
+    selected = [segs[i] for i in picked_idx[:max_segments]]
+
+    return {
+        "segments": selected,
+        "keywords": keywords,
+        "best_idx": best_idx,
+        "best_score": best_score,
+        "total_segments": len(segs),
+        "hit_count": len(hit_scored),
+        "fallback": "",
+    }
+
+
+def _extract_key_sentences_from_segments(segs: list, max_sentences: int = 10) -> list:
+    typed = _extract_typed_key_sentences_from_segments(segs, max_sentences=max_sentences)
+    return [str((x or {}).get("text") or "").strip() for x in typed if str((x or {}).get("text") or "").strip()]
+
+
+def _build_selector_quality_meta(selected_meta: dict, selected_segs: list) -> dict:
+    meta = dict(selected_meta or {})
+    keywords = [str(x).strip().lower() for x in (meta.get("keywords") or []) if str(x).strip()]
+    kw_set = list(dict.fromkeys(keywords))
+    total_segments = int(meta.get("total_segments") or len(selected_segs or []) or 0)
+    hit_count = int(meta.get("hit_count") or 0)
+
+    covered = set()
+    for seg in (selected_segs or []):
+        t = str((seg or {}).get("text") or "").lower()
+        if not t:
+            continue
+        for kw in kw_set:
+            if kw and kw in t:
+                covered.add(kw)
+
+    hit_ratio = (float(hit_count) / float(total_segments)) if total_segments > 0 else 0.0
+    keyword_coverage_ratio = (float(len(covered)) / float(len(kw_set))) if kw_set else 0.0
+
+    meta.update({
+        "total_segments": total_segments,
+        "hit_count": hit_count,
+        "hit_ratio": round(hit_ratio, 4),
+        "keyword_coverage_ratio": round(keyword_coverage_ratio, 4),
+        "selected_count": len(selected_segs or []),
+    })
+    return meta
+
+
+def _selector_quality_low(meta: dict) -> bool:
+    m = meta or {}
+    if int(m.get("best_score") or 0) <= 0:
+        return True
+    hit_ratio = float(m.get("hit_ratio") or 0.0)
+    kw_cov = float(m.get("keyword_coverage_ratio") or 0.0)
+    selected_count = int(m.get("selected_count") or 0)
+    if selected_count <= 0:
+        return True
+    if hit_ratio < 0.05 and kw_cov < 0.12:
+        return True
+    return False
 
 def build_rule_check(solution_lines: list, constraints: dict) -> Dict[str, Any]:
     text = _strip_py_strings_and_comments("\n".join(solution_lines or []))
@@ -830,9 +1851,13 @@ def _ai_generate_semantic_labels(solution_lines: list, question_text: str, model
     回傳與 solution_lines 等長的 list[str]。失敗時 fallback 為規則式標籤。
     """
     if not ai_enabled() or not solution_lines:
-        return [_semantic_paraphrase(_label_for_code_line(ln), question_text, ln) for ln in solution_lines]
+        base = _build_contextual_semantic_labels(solution_lines, question_text)
+        base = [_semantic_paraphrase(base[i], question_text, solution_lines[i]) for i in range(len(solution_lines))]
+        return _refine_semantic_labels(base, solution_lines, question_text)
 
     numbered = "\n".join(f"{i}: {ln}" for i, ln in enumerate(solution_lines))
+    kw_list = _semantic_keywords_from_question(question_text, max_keywords=8)
+    kw_text = "、".join(kw_list) if kw_list else "（無）"
     try:
         result = parsons_ai.call_openai_json(
             model=model,
@@ -840,33 +1865,37 @@ def _ai_generate_semantic_labels(solution_lines: list, question_text: str, model
             max_output_tokens=600,
             system=(
                 "你是 Python 程式設計助教。"
-                "請為每一行程式碼寫一句簡短的繁體中文說明（12字以內），"
-                "只描述程式動作，不要使用題目情境名詞。"
+                "請為每一行程式碼寫一句簡短的繁體中文說明（10~18字）。"
+                "語意需貼合題目情境，優先使用題目關鍵詞。"
                 "不要暴露變數名、數字、比較符號、運算式。"
                 "不要直接說明正確條件內容。"
                 "語氣要穩定、教學式，避免花俏修辭。"
+                "避免泛用句，例如：先準備一個值、更新變數、處理資料。"
                 "只輸出純 JSON，格式：{\"labels\": [\"第0行說明\", \"第1行說明\", ...]}"
             ),
             user=(
+                f"題目：{question_text}\n"
+                f"題目關鍵詞：{kw_text}\n\n"
                 f"程式碼（格式：行號: 程式碼）：\n{numbered}\n\n"
                 "請依序為每行輸出一句繁體中文說明，數量必須和行數相同。"
-                "不得引用題目情境詞。"
+                "請盡量使用題目關鍵詞。"
                 "提示要保留學生思考空間，不可直接揭示答案。"
             ),
         ) or {}
         labels = result.get("labels") or []
         if isinstance(labels, list) and len(labels) == len(solution_lines):
+            refined = _refine_semantic_labels(labels, solution_lines, question_text)
             return [
                 _soften_semantic_hint(str(l).strip() or _label_for_code_line(solution_lines[i]), solution_lines[i], is_distractor=False)
-                for i, l in enumerate(labels)
+                for i, l in enumerate(refined)
             ]
     except Exception:
         pass
     # fallback 規則式
-    return [
-        _soften_semantic_hint(_semantic_paraphrase(_label_for_code_line(ln), question_text, ln), ln, is_distractor=False)
-        for ln in solution_lines
-    ]
+    base = _build_contextual_semantic_labels(solution_lines, question_text)
+    base = [_semantic_paraphrase(base[i], question_text, solution_lines[i]) for i in range(len(solution_lines))]
+    base = _refine_semantic_labels(base, solution_lines, question_text)
+    return [_soften_semantic_hint(base[i], solution_lines[i], is_distractor=False) for i in range(len(solution_lines))]
 
 
 def _apply_semantic_labels_to_blocks(blocks: dict, labels: list) -> None:
@@ -1008,10 +2037,31 @@ def _ensure_distractor_items(solution_lines: list, distractor_items: list, min_c
     distractor_items = distractor_items or []
     sol_norm = {_normalize_code_line(x) for x in solution_lines if (x or "").strip()}
 
-    chosen = []
+    def _infer_error_type(line: str) -> str:
+        s = str(line or "")
+        low = s.lower().strip()
+        if not s:
+            return "generic_mutation"
+        if (not s.startswith("    ")) and (len(s) != len(s.lstrip(" "))) and low:
+            return "wrong_indent"
+        if "int(input(" in low or "float(input(" in low or "input()" in low:
+            return "input_cast_or_io"
+        if any(op in low for op in ["==", "!=", "<=", ">=", "<", ">"]):
+            return "wrong_condition"
+        if low in {"break", "continue"}:
+            return "flow_control"
+        if any(op in low for op in ["+=", "-=", "*=", "/="]):
+            return "state_update"
+        if "print(" in low:
+            return "wrong_output"
+        if "for " in low or "while " in low or "range(" in low:
+            return "loop_intrusion"
+        return "generic_mutation"
+
+    pool = []
     seen = set()
 
-    def _push(item):
+    def _push_pool(item):
         line = item.get("text", "") if isinstance(item, dict) else str(item or "")
         semantic = item.get("semantic_zh", "") if isinstance(item, dict) else ""
         error_type = item.get("error_type", "") if isinstance(item, dict) else ""
@@ -1019,35 +2069,64 @@ def _ensure_distractor_items(solution_lines: list, distractor_items: list, min_c
         if not normalized or normalized in sol_norm or normalized in seen:
             return
         seen.add(normalized)
-        chosen.append({
+        et = (error_type or "").strip() or _infer_error_type(line)
+        pool.append({
             "text": line,
             "semantic_zh": _soften_semantic_hint((semantic or "").strip() or _label_for_distractor_line(line), line, is_distractor=True),
-            "error_type": (error_type or "").strip(),
+            "error_type": et,
         })
 
     for item in distractor_items:
-        _push(item)
-        if len(chosen) >= max_count:
-            return chosen[:max_count]
+        _push_pool(item)
 
     candidates = []
     for line in solution_lines:
         candidates.extend(_mutate_distractor_candidates(line))
-
     for line in candidates:
-        _push(line)
-        if len(chosen) >= max_count:
-            return chosen[:max_count]
+        _push_pool(line)
 
     fallback = [
-        "print('結果錯誤')",
-        "value = input()",
-        "count = count + 1",
+        {"text": "print('結果錯誤')", "error_type": "wrong_output"},
+        {"text": "value = input()", "error_type": "input_cast_or_io"},
+        {"text": "count = count + 1", "error_type": "state_update"},
     ]
-    for line in fallback:
-        _push(line)
-        if len(chosen) >= min_count:
+    for item in fallback:
+        _push_pool(item)
+
+    if not pool:
+        return []
+
+    # 先保證錯誤類型多樣性：至少兩種（若資料足夠）。
+    chosen = []
+    chosen_types = set()
+    diversity_target = min(2, max_count)
+    available_types = {str(p.get("error_type") or "generic_mutation") for p in pool}
+    if len(available_types) < diversity_target:
+        diversity_target = len(available_types)
+
+    for item in pool:
+        et = str(item.get("error_type") or "generic_mutation")
+        if et in chosen_types:
+            continue
+        chosen.append(item)
+        chosen_types.add(et)
+        if len(chosen_types) >= diversity_target:
             break
+
+    for item in pool:
+        if len(chosen) >= max_count:
+            break
+        if item in chosen:
+            continue
+        chosen.append(item)
+
+    if len(chosen) < min_count:
+        for item in pool:
+            if len(chosen) >= min_count:
+                break
+            if item in chosen:
+                continue
+            chosen.append(item)
 
     return chosen[:max_count]
 
@@ -1288,8 +2367,8 @@ def _build_blocks_from_lines(question_text: str, solution_lines: list, distracto
     seed_items = list(distractor_items or []) + [{"text": line} for line in (distractor_lines or [])]
     distractor_items = _ensure_distractor_items(solution_lines, seed_items)
 
-    # 產生有意義的中文語意標籤
-    labels = [_label_for_code_line(ln) for ln in solution_lines]
+    # 產生貼合題目情境的中文語意標籤
+    labels = _build_contextual_semantic_labels(solution_lines, question_text)
 
     solution_blocks = [
         {
@@ -1311,7 +2390,7 @@ def _build_blocks_from_lines(question_text: str, solution_lines: list, distracto
         }
         for i, item in enumerate(distractor_items)
     ]
-    pool = distractor_blocks + solution_blocks
+    pool = _mix_pool_blocks(solution_blocks, distractor_blocks, seed_text=question_text)
     template_slots = [
         {"label": _soften_semantic_hint(labels[i], solution_lines[i], is_distractor=False), "slot": str(i)}
         for i in range(len(solution_lines))
@@ -1330,15 +2409,41 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
     if not subtitle_text:
         raise RuntimeError("subtitle_text is empty")
 
-    segs = parse_srt_segments(subtitle_text)
-    segs_compact = compact_segments_for_prompt(segs, max_chars=3500) or ""
     constraints = resolve_unit_constraints(unit)
+    segs = parse_srt_segments(subtitle_text)
     trace = _pick_trace_window(segs, constraints, max_lines=7)
+    selected_meta = _select_relevant_subtitle_segments(
+        segs=segs,
+        unit=unit,
+        constraints=constraints,
+        teacher_description=teacher_description,
+        video_title=video_title,
+        question_keywords=_extract_focus_keywords(video_title or "", max_keywords=5),
+        trace_keywords=trace.get("keywords", []),
+        window=4,
+        max_segments=10,
+    )
+    selected_segs = selected_meta.get("segments") or segs
+    segs_compact = compact_segments_for_prompt(selected_segs, max_chars=1500) or ""
+    selector_keywords = "、".join((selected_meta.get("keywords") or [])[:8])
+    key_sentences = _extract_key_sentences_from_segments(selected_segs, max_sentences=10)
+    key_sentences_typed = _extract_typed_key_sentences_from_segments(selected_segs, max_sentences=10)
+    selector_meta = _build_selector_quality_meta(selected_meta, selected_segs)
 
     # ✅ 修正：傳入 teacher_description，老師描述優先決定 concept / scenario_hint
     plan = build_generation_plan(unit, trace.get("subtitle_text_used", "") or subtitle_text, video_title, teacher_description)
     concept = (plan.get("concept") or "").strip()
     scenario_hint = (plan.get("scenario") or "").strip()
+    unified_policy = _build_unified_generation_policy(
+        plan=plan,
+        unit=unit,
+        constraints=constraints,
+        video_title=video_title,
+        teacher_description=teacher_description,
+        subtitle_text=trace.get("subtitle_text_used", "") or subtitle_text,
+        selector_keywords=selected_meta.get("keywords") or [],
+    )
+    unified_rule_text = _unified_policy_prompt_block(unified_policy)
     anti_copy_rules = plan.get("anti_copy_rules") or []
     variation_directive = _build_variation_directive(
         unit,
@@ -1383,6 +2488,15 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
 
 【老師指定題目方向】
 {teacher_description}
+
+【字幕切片關鍵詞】
+{selector_keywords or "（自動）"}
+
+【字幕切片使用規則】
+- 你只能根據下方「字幕參考 / 字幕（含時間戳）」內容出題。
+- 不可自行補充未出現在字幕切片中的教學內容。
+
+{unified_rule_text}
 
 請根據上述資訊設計一題 Parsons 程式重組題。
 
@@ -1473,9 +2587,29 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
         unit,
     )
 
+    concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
+        plan,
+        trace.get("keywords", []),
+        trace.get("subtitle_text_used", subtitle_text),
+        question_text,
+        solution_lines,
+    )
+    policy_ok, policy_meta = _validate_unified_generation_policy(
+        question_text,
+        solution_lines,
+        unified_policy,
+    )
     rc = build_rule_check(solution_lines, constraints)
-    if not rc.get("ok"):
-        retry_prompt = base_prompt + f"\n\n你上一版未通過自動驗收：{rc.get('reason')}，請修正後重新輸出 JSON。"
+    if (not rc.get("ok")) or (not concept_ok) or (not policy_ok):
+        issues = []
+        if not rc.get("ok"):
+            issues.append(f"自動驗收失敗：{rc.get('reason')}")
+        if not concept_ok:
+            issues.append("與字幕概念不夠對齊，缺少關鍵詞：" + ", ".join(concept_missing[:5]))
+        if not policy_ok:
+            issues.append("統一限制未通過：" + str(policy_meta.get("reason") or "請提高來源關鍵詞命中"))
+
+        retry_prompt = base_prompt + f"\n\n你上一版需要修正：{'；'.join(issues)}。請修正後重新輸出 JSON。"
         data = parsons_ai.call_openai_json(
             system=system_msg,
             user=retry_prompt,
@@ -1498,6 +2632,18 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
             trace.get("subtitle_text_used", subtitle_text),
             unit,
         )
+        concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
+            plan,
+            trace.get("keywords", []),
+            trace.get("subtitle_text_used", subtitle_text),
+            question_text,
+            solution_lines,
+        )
+        policy_ok, policy_meta = _validate_unified_generation_policy(
+            question_text,
+            solution_lines,
+            unified_policy,
+        )
         rc = build_rule_check(solution_lines, constraints)
 
     if is_too_similar_to_subtitle(trace.get("subtitle_text_used", subtitle_text), question_text):
@@ -1505,6 +2651,10 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
 
     if not rc.get("ok"):
         raise RuntimeError(f"AI condition generation failed: {rc.get('reason')}")
+    if not concept_ok:
+        raise RuntimeError("AI condition generation failed: subtitle concept alignment not met")
+    if not policy_ok:
+        raise RuntimeError("AI condition generation failed: unified policy not met")
 
     template_distractors = _select_template_distractors("condition", _make_template_distractors("condition", solution_lines), max_count=3)
     blocks = _build_blocks_from_lines(question_text, solution_lines, [], distractor_items=template_distractors)
@@ -1533,6 +2683,13 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
         },
         "subtitle_range": trace["subtitle_range"],
         "subtitle_text_used": trace["subtitle_text_used"],
+        "key_sentences": key_sentences,
+        "key_sentences_typed": key_sentences_typed,
+        # 讓後續對齊/除錯流程可直接使用已壓縮字幕片段。
+        "ai_segments_compact": segs_compact,
+        "selector_meta": selector_meta,
+        "unified_policy_meta": policy_meta,
+        "alignment_confidence": _build_alignment_confidence(selector_meta, key_sentences_typed),
     })
     return blocks
 
@@ -1553,15 +2710,41 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
     if not subtitle_text:
         raise RuntimeError("subtitle_text is empty")
 
-    segs = parse_srt_segments(subtitle_text)
-    segs_compact = compact_segments_for_prompt(segs, max_chars=3200) or ""
     constraints = resolve_unit_constraints(unit)
+    segs = parse_srt_segments(subtitle_text)
     trace = _pick_trace_window(segs, constraints, max_lines=7)
+    selected_meta = _select_relevant_subtitle_segments(
+        segs=segs,
+        unit=unit,
+        constraints=constraints,
+        teacher_description=teacher_description,
+        video_title=video_title,
+        question_keywords=_extract_focus_keywords(video_title or "", max_keywords=5),
+        trace_keywords=trace.get("keywords", []),
+        window=4,
+        max_segments=10,
+    )
+    selected_segs = selected_meta.get("segments") or segs
+    segs_compact = compact_segments_for_prompt(selected_segs, max_chars=1500) or ""
+    selector_keywords = "、".join((selected_meta.get("keywords") or [])[:8])
+    key_sentences = _extract_key_sentences_from_segments(selected_segs, max_sentences=10)
+    key_sentences_typed = _extract_typed_key_sentences_from_segments(selected_segs, max_sentences=10)
+    selector_meta = _build_selector_quality_meta(selected_meta, selected_segs)
 
     # ✅ 修正：傳入 teacher_description，老師描述優先決定 concept / scenario_hint
     plan = build_generation_plan(unit, trace.get("subtitle_text_used", "") or subtitle_text, video_title, teacher_description)
     concept = (plan.get("concept") or "").strip()
     scenario_hint = (plan.get("scenario") or "").strip()
+    unified_policy = _build_unified_generation_policy(
+        plan=plan,
+        unit=unit,
+        constraints=constraints,
+        video_title=video_title,
+        teacher_description=teacher_description,
+        subtitle_text=trace.get("subtitle_text_used", "") or subtitle_text,
+        selector_keywords=selected_meta.get("keywords") or [],
+    )
+    unified_rule_text = _unified_policy_prompt_block(unified_policy)
     anti_copy_rules = plan.get("anti_copy_rules") or []
     variation_directive = _build_variation_directive(
         unit,
@@ -1603,6 +2786,15 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
 
 【老師指定需求（最高優先）】
 {teacher_description or "（未提供）"}
+
+【字幕切片關鍵詞】
+{selector_keywords or "（自動）"}
+
+【字幕切片使用規則】
+- 你只能根據下方「字幕參考 / 字幕（含時間戳）」內容出題。
+- 不可自行補充未出現在字幕切片中的教學內容。
+
+{unified_rule_text}
 
 優先級規則：
 1) 老師指定需求（若有）
@@ -1690,14 +2882,30 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
     )
 
     align_ok, missing_kws = _teacher_alignment_check(teacher_description, question_text, solution_lines)
+    concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
+        plan,
+        trace.get("keywords", []),
+        trace.get("subtitle_text_used", subtitle_text),
+        question_text,
+        solution_lines,
+    )
+    policy_ok, policy_meta = _validate_unified_generation_policy(
+        question_text,
+        solution_lines,
+        unified_policy,
+    )
 
     rc = build_rule_check(solution_lines, constraints)
-    if (not rc.get("ok")) or (not align_ok):
+    if (not rc.get("ok")) or (not align_ok) or (not concept_ok) or (not policy_ok):
         extra = []
         if not rc.get("ok"):
             extra.append(f"自動驗收失敗：{rc.get('reason')}")
         if not align_ok:
             extra.append("與老師指定需求不夠對齊，缺少關鍵詞：" + ", ".join(missing_kws[:5]))
+        if not concept_ok:
+            extra.append("與字幕概念不夠對齊，缺少關鍵詞：" + ", ".join(concept_missing[:5]))
+        if not policy_ok:
+            extra.append("統一限制未通過：" + str(policy_meta.get("reason") or "請提高來源關鍵詞命中"))
 
         retry_prompt = base_prompt + f"\n\n你上一版需要修正：{'；'.join(extra)}。請修正後重新輸出 JSON。"
         data = parsons_ai.call_openai_json(
@@ -1724,6 +2932,18 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
         )
         rc = build_rule_check(solution_lines, constraints)
         align_ok, missing_kws = _teacher_alignment_check(teacher_description, question_text, solution_lines)
+        concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
+            plan,
+            trace.get("keywords", []),
+            trace.get("subtitle_text_used", subtitle_text),
+            question_text,
+            solution_lines,
+        )
+        policy_ok, policy_meta = _validate_unified_generation_policy(
+            question_text,
+            solution_lines,
+            unified_policy,
+        )
 
     if is_too_similar_to_subtitle(trace.get("subtitle_text_used", subtitle_text), question_text):
         raise RuntimeError("generated question is too similar to subtitle example")
@@ -1732,6 +2952,10 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
         raise RuntimeError(f"AI IO generation failed: {rc.get('reason')}")
     if not align_ok:
         raise RuntimeError("AI IO generation failed: not aligned with teacher_description")
+    if not concept_ok:
+        raise RuntimeError("AI IO generation failed: subtitle concept alignment not met")
+    if not policy_ok:
+        raise RuntimeError("AI IO generation failed: unified policy not met")
 
     template_distractors = _select_template_distractors("io", _make_template_distractors("io", solution_lines), max_count=3)
     blocks = _build_blocks_from_lines(question_text, solution_lines, [], distractor_items=template_distractors)
@@ -1760,6 +2984,13 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
         },
         "subtitle_range": trace["subtitle_range"],
         "subtitle_text_used": trace["subtitle_text_used"],
+        "key_sentences": key_sentences,
+        "key_sentences_typed": key_sentences_typed,
+        # 讓後續對齊/除錯流程可直接使用已壓縮字幕片段。
+        "ai_segments_compact": segs_compact,
+        "selector_meta": selector_meta,
+        "unified_policy_meta": policy_meta,
+        "alignment_confidence": _build_alignment_confidence(selector_meta, key_sentences_typed),
     })
     return blocks
 
@@ -1885,15 +3116,183 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     if not subtitle_text:
         raise RuntimeError("subtitle_text is empty")
 
+    constraints = resolve_unit_constraints(unit)
+    unit_type = (constraints or {}).get("unit_type") or "loop"
+    function_mode = (unit_type == "function")
+
     # --- subtitles ---
     segs = parse_srt_segments(subtitle_text)
     cleaned = strip_srt_noise(subtitle_text)
+    trace = _pick_trace_window(segs, constraints, max_lines=7)
+    selector_extra_kws = _extract_focus_keywords(teacher_description or "", max_keywords=6)
+    selected_meta = _select_relevant_subtitle_segments(
+        segs=segs,
+        unit=unit,
+        constraints=constraints,
+        teacher_description=teacher_description,
+        video_title=video_title,
+        question_keywords=selector_extra_kws,
+        trace_keywords=trace.get("keywords", []),
+        window=4,
+        max_segments=10,
+    )
+    selected_segs = selected_meta.get("segments") or segs
+    selector_keywords = "、".join((selected_meta.get("keywords") or [])[:8])
+    selector_meta = _build_selector_quality_meta(selected_meta, selected_segs)
+    key_sentences = _extract_key_sentences_from_segments(selected_segs, max_sentences=10)
+    key_sentences_typed = _extract_typed_key_sentences_from_segments(selected_segs, max_sentences=10)
+    selected_preview = " | ".join([
+        str(s.get("text") or "").strip()
+        for s in (selected_segs[:5] if selected_segs else [])
+        if str(s.get("text") or "").strip()
+    ])[:300]
+
+    if selected_segs:
+        sel_start_ts = float(selected_segs[0].get("start") or 0.0)
+        sel_end_ts = float(selected_segs[-1].get("end") or sel_start_ts)
+        try:
+            sel_start_idx = int(segs.index(selected_segs[0]))
+            sel_end_idx = int(segs.index(selected_segs[-1]))
+        except Exception:
+            sel_start_idx = int((trace.get("subtitle_range") or {}).get("start_index") or 0)
+            sel_end_idx = int((trace.get("subtitle_range") or {}).get("end_index") or 0)
+    else:
+        sel_start_idx = int((trace.get("subtitle_range") or {}).get("start_index") or 0)
+        sel_end_idx = int((trace.get("subtitle_range") or {}).get("end_index") or 0)
+        sel_start_ts = float((trace.get("subtitle_range") or {}).get("start_ts") or 0.0)
+        sel_end_ts = float((trace.get("subtitle_range") or {}).get("end_ts") or 0.0)
+
+    selected_subtitle_range = {
+        "start_index": sel_start_idx,
+        "end_index": sel_end_idx,
+        "start_ts": sel_start_ts,
+        "end_ts": sel_end_ts,
+    }
+
+    def _if_signal_score(text: str) -> int:
+        t = (text or "").lower()
+        score = 0
+        if re.search(r"\bif\b", t):
+            score += 2
+        if re.search(r"\belif\b|\belse\b", t):
+            score += 2
+        if "判斷" in t:
+            score += 1
+        if "條件" in t:
+            score += 1
+        if "如果" in t:
+            score += 1
+        if "否則" in t:
+            score += 1
+        return score
+
+    _selected_subtitle_text = "\n".join([
+        str(s.get("text") or "").strip()
+        for s in (selected_segs or [])
+        if str(s.get("text") or "").strip()
+    ])
+    _ctx_text = "\n".join([
+        str(trace.get("subtitle_text_used") or ""),
+        _selected_subtitle_text,
+        str(teacher_description or ""),
+        str(video_title or ""),
+    ])
+
+    def _has_token_signal(text: str, en_tokens: list, zh_tokens: list) -> bool:
+        t = (text or "").lower()
+        if any(z in t for z in (zh_tokens or [])):
+            return True
+        return any(re.search(r"\b" + re.escape(tok.lower()) + r"\b", t) for tok in (en_tokens or []))
+    loop_style_from_constraints = (constraints or {}).get("loop_style") or "either"
+    # while 題型若明確提到 if/條件，強制要求生成結果含 if 判斷。
+    require_if_from_context = (loop_style_from_constraints == "while_only") and (_if_signal_score(_ctx_text) >= 2)
+
+    _ctx_lc = _ctx_text.lower()
+    require_function_input_from_context = function_mode and _has_token_signal(
+        _ctx_text,
+        ["input"],
+        ["輸入", "讀入", "整數輸入", "int(input"],
+    )
+    require_function_two_inputs = function_mode and (
+        (("底數" in _ctx_text) and ("指數" in _ctx_text)) or
+        ("兩個" in _ctx_text) or ("兩筆" in _ctx_text) or ("2個" in _ctx_lc)
+    )
+    has_operator_signal_in_context = function_mode and (
+        _has_token_signal(
+            _ctx_text,
+            ["operator", "op", "calculator", "plus", "minus", "multiply", "divide"],
+            ["運算子", "四則", "加減乘除", "計算機", "+-*/", "運算"]
+        )
+        or bool(re.search(r"\+|\-|\*|/", _ctx_text))
+    )
+    require_function_operator_dispatch = bool(has_operator_signal_in_context)
+    has_loop_signal_in_context = _has_token_signal(
+        _ctx_text,
+        ["for", "while", "range"],
+        ["迴圈", "重複", "循環"],
+    )
+    require_no_loop_in_function_from_context = function_mode and (not has_loop_signal_in_context)
+    has_condition_signal_in_context = _has_token_signal(
+        _ctx_text,
+        ["if", "elif", "else"],
+        ["判斷", "條件", "分支", "否則"],
+    )
+    require_no_condition_in_function_from_context = function_mode and (not has_condition_signal_in_context)
+    
+    # [新增] 啟發式例外：某些場景（計算機題等）必須允許 if
+    # 即使 subtitle 沒明確教 if，也不應該禁用 if
+    if require_no_condition_in_function_from_context:
+        should_allow_if = _should_func_allow_condition(subtitle_text, teacher_description)
+        if should_allow_if:
+            require_no_condition_in_function_from_context = False
+
+    if require_function_operator_dispatch:
+        # +-*/ 教學類型強制走運算分派，不要漂移成購物/迴圈累加。
+        require_no_loop_in_function_from_context = True
+        require_no_condition_in_function_from_context = False
+        require_function_input_from_context = True
+        require_function_two_inputs = True
+
+    function_profile = _build_function_structure_profile(
+        subtitle_text=subtitle_text,
+        teacher_description=teacher_description,
+        context_text=_ctx_text,
+        force_operator_dispatch=require_function_operator_dispatch,
+    )
+
+    # [新增] 偵測實現細節：print vs return、int(input())、輸出格式、參數數量
+    output_style_preference = _detect_output_style_preference(subtitle_text)
+    require_print_only = bool(function_profile.get("need_print")) if function_mode else (output_style_preference == "print_only")
+
+    require_int_input_cast = bool(function_profile.get("need_int_cast")) if function_mode else _detect_int_input_pattern(subtitle_text)
+
+    output_format_style = str(function_profile.get("output_format_style") or "simple") if function_mode else _detect_output_format_pattern(subtitle_text)
+
+    expected_param_count = function_profile.get("param_count") if function_mode else None
+    require_function_param_count = (expected_param_count is not None)
+
+    function_profile_summary = ""
+    if function_mode:
+        function_profile_summary = (
+            "【Function 結構穩定器（正式 gate）】\n"
+            f"- param_count: {function_profile.get('param_count')}\n"
+            f"- need_input: {function_profile.get('need_input')}\n"
+            f"- need_print: {function_profile.get('need_print')}\n"
+            f"- prefer_return: {function_profile.get('prefer_return')}\n"
+            f"- allow_condition: {function_profile.get('allow_condition')}"
+        )
 
     # [新增] 低 token：字幕壓縮（只提供必要片段給 AI）
-    segs_compact = compact_segments_for_prompt(segs, max_chars=4000)
+    segs_compact = compact_segments_for_prompt(selected_segs, max_chars=1700)
     if not segs_compact:
         # 仍允許無字幕，但 segment_map 會走 fallback
         segs_compact = ""
+
+    strict_subtitle_rule = (
+        "【字幕切片使用規則】\n"
+        "- 你只能根據本次提供的字幕切片出題。\n"
+        "- 不可自行補充未出現在字幕切片中的教學內容。\n"
+    )
 
     # ✅ 修正：老師有描述時，任何情境都不得攔截 — 不只圖形類
     teacher_desc_lc = (teacher_description or "").lower()
@@ -1928,7 +3327,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     # ✅ 修正根本問題：依 loop_style 選對應的情境池
     # 原本 scenarios 全是 while/sentinel 型，for 迴圈字幕卻也走這裡，導致出 while 題
     # ===============================
-    loop_style = (resolve_unit_constraints(unit) or {}).get("loop_style") or "either"
+    loop_style = (constraints or {}).get("loop_style") or "either"
 
     scenarios_for = [
         {
@@ -2013,8 +3412,27 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         },
     ]
 
+    scenarios_function = [
+        {
+            "name": "function_operator_dispatch",
+            "desc": "函式運算：定義函式 f(x, y, op)，依 op 的 '+', '-', '*', '/' 回傳對應結果，主程式讀入 x、y、op 並輸出。",
+            "tests": [["6", "12", "+"]],
+            "check": "nums>=1",
+            "keywords": ["函式", "def", "operator", "op", "+", "-", "*", "/", "四則", "運算子"],
+        },
+        {
+            "name": "function_two_params",
+            "desc": "函式計算：定義函式處理兩個輸入值，回傳計算結果，主程式讀入後呼叫並輸出。",
+            "tests": [["3", "4"]],
+            "check": "nums>=1",
+            "keywords": ["函式", "def", "return", "參數", "呼叫"],
+        },
+    ]
+
     # 依 loop_style 選對應情境池
-    if loop_style == "for_only":
+    if function_mode:
+        scenarios = scenarios_function
+    elif loop_style == "for_only":
         scenarios = scenarios_for
     elif loop_style == "while_only":
         scenarios = scenarios_while
@@ -2086,6 +3504,12 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     scenario_tests = picked["tests"]
     scenario_check = picked["check"]
 
+    if function_mode and require_function_operator_dispatch:
+        picked = scenarios_function[0]
+        scenario_desc = picked["desc"]
+        scenario_tests = picked["tests"]
+        scenario_check = picked["check"]
+
         # ===============================
     # [0309新增] concept layer：讓 prompt 更穩定、更多樣
     # ✅ 修正：傳入 teacher_description，讓 concept 也依老師描述推斷
@@ -2093,6 +3517,16 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     plan = build_generation_plan(unit, subtitle_text, video_title, teacher_description)
     concept = (plan.get("concept") or "").strip()
     scenario_hint = (plan.get("scenario") or "").strip()
+    unified_policy = _build_unified_generation_policy(
+        plan=plan,
+        unit=unit,
+        constraints=constraints,
+        video_title=video_title,
+        teacher_description=teacher_description,
+        subtitle_text=trace.get("subtitle_text_used", "") or subtitle_text,
+        selector_keywords=selected_meta.get("keywords") or [],
+    )
+    unified_rule_text = _unified_policy_prompt_block(unified_policy)
     anti_copy_rules = plan.get("anti_copy_rules") or []
 
     # ✅ 修正 Bug 2：先宣告 concept_template_solution，再後面注入到 base_prompt
@@ -2158,7 +3592,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     import re as _re
 
     _cjk_re = _re.compile(r"[\u4e00-\u9fff]")
-    _python_token_re = _re.compile(r"\b(while|for|if|elif|else|break|continue|input|print|int|float|str|len|range)\b|[=:+\-*/()<>]")
+    _python_token_re = _re.compile(r"\b(def|return|while|for|if|elif|else|break|continue|pass|input|print|int|float|str|len|range)\b|[=:+\-*/()<>]")
     # [新增] 清理 input() 的中文提示字串，避免被本地驗收判定為「含中文」
     # 例：int(input("請輸入...")) -> int(input())
     def _strip_input_prompt(s: str) -> str:
@@ -2225,10 +3659,18 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         out = []
         for ln in (lines or []):
             s = str(ln)
+            s = s.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
             # 1) remove Chinese inside input prompt
             s = _strip_input_prompt(s)
             # 2) drop leading print label (often Chinese) so solution_lines stays code-only
             s = _strip_print_label(s)
+            # 3) repair common LLM artifact: stray unmatched quote at line end, e.g. "return result'"
+            t = s.rstrip()
+            if t.endswith("'") and (t.count("'") % 2 == 1):
+                t = t[:-1]
+            if t.endswith('"') and (t.count('"') % 2 == 1):
+                t = t[:-1]
+            s = t
             out.append(s)
         return out
 
@@ -2310,6 +3752,8 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             print("[AST_SAFE] code:\n" + code)
             return False
 
+        defined_funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)} if function_mode else set()
+
         for node in ast.walk(tree):
             # ✅ 寬鬆模式：移除 ALLOWED_NODES 白名單（這是你一直 AST rejected 的主因）
             # if not isinstance(node, ALLOWED_NODES):
@@ -2317,7 +3761,12 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 
             # ✅ 仍保留：擋掉危險/你不希望出現的語法
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.Attribute, ast.Subscript,
-                                 ast.Lambda, ast.With, ast.Try, ast.FunctionDef, ast.ClassDef)):
+                                 ast.Lambda, ast.With, ast.Try, ast.ClassDef)):
+                print("[AST_SAFE] rejected node:", type(node).__name__)
+                print("[AST_SAFE] code:\n" + code)
+                return False
+
+            if (not function_mode) and isinstance(node, ast.FunctionDef):
                 print("[AST_SAFE] rejected node:", type(node).__name__)
                 print("[AST_SAFE] code:\n" + code)
                 return False
@@ -2325,7 +3774,8 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             # ✅ 仍保留：呼叫只允許白名單函式（避免 eval/exec/open 等）
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name):
-                    if node.func.id not in ALLOWED_FUNCS:
+                    fn = node.func.id
+                    if (fn not in ALLOWED_FUNCS) and (not (function_mode and fn in defined_funcs)):
                         print("[AST_SAFE] rejected call:", node.func.id)
                         print("[AST_SAFE] code:\n" + code)
                         return False
@@ -2377,7 +3827,77 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             return len(nums) >= need
         return True
 
-    def _auto_grade(solution_lines: list) -> str:
+    def _parse_numeric_tokens(out: str) -> list:
+        vals = []
+        for s in _re.findall(r"-?\d+\.?\d*", out or ""):
+            try:
+                vals.append(float(s))
+            except Exception:
+                continue
+        return vals
+
+    def _has_num(nums: list, target: float, tol: float = 1e-6) -> bool:
+        for n in nums or []:
+            if abs(float(n) - float(target)) <= tol:
+                return True
+        return False
+
+    def _while_semantic_check(question_text: str, out: str, inputs: list) -> str:
+        # 只對 while-only 題型做語意驗收，降低誤判
+        if function_mode or loop_style != "while_only":
+            return ""
+
+        qmix = " ".join([
+            str(question_text or ""),
+            str(scenario_desc or ""),
+            str(teacher_description or ""),
+        ]).lower()
+
+        nums = _parse_numeric_tokens(out)
+        if not nums:
+            return "while semantic check failed: no numeric output"
+
+        in_vals = list(inputs or [])
+        scenario_name = str((picked or {}).get("name") or "")
+
+        # 題目若要求「最後一次輸入」必須驗收：要同時輸出筆數與最後一次非 sentinel 值
+        requires_last_input = (
+            ("最後" in qmix or "last" in qmix) and
+            ("輸入" in qmix or "金額" in qmix or "amount" in qmix)
+        )
+        if requires_last_input:
+            if len(in_vals) < 2:
+                return "while semantic check failed: insufficient test inputs"
+            expected_count = max(0, len(in_vals) - 1)
+            try:
+                expected_last = float(in_vals[-2])
+            except Exception:
+                return "while semantic check failed: cannot parse expected last input"
+            if not _has_num(nums, expected_count):
+                return "while semantic check failed: missing entry count"
+            if not _has_num(nums, expected_last):
+                return "while semantic check failed: missing last non-sentinel input"
+
+        # 依既定情境再做一次語意檢查，避免「看起來有 while 但算錯欄位」
+        if scenario_name == "sum_prices" and len(in_vals) >= 2:
+            expected_count = max(0, len(in_vals) - 1)
+            try:
+                expected_total = sum(float(x) for x in in_vals[:-1])
+            except Exception:
+                expected_total = None
+            if not _has_num(nums, expected_count):
+                return "while semantic check failed: sum_prices missing count"
+            if expected_total is not None and not _has_num(nums, expected_total):
+                return "while semantic check failed: sum_prices missing total"
+
+        if scenario_name == "sentinel_ok" and len(in_vals) >= 1:
+            expected_count = max(0, len(in_vals) - 1)
+            if not _has_num(nums, expected_count):
+                return "while semantic check failed: sentinel_ok missing count"
+
+        return ""
+
+    def _auto_grade(solution_lines: list, question_text: str = "") -> str:
         if not _compile_ok(solution_lines):
             detail = _compile_error(solution_lines)
             print(f"[_auto_grade] compile failed: {detail}")
@@ -2390,16 +3910,103 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
                 print("[AI_VERIFY] bad line repr :", repr(x))
                 return "solution_lines contains Chinese or non-code"
 
-        if any(_re.search(r"^\s*def\s+", x) for x in solution_lines):
+        has_def = any(_re.search(r"^\s*def\s+", x) for x in solution_lines)
+        has_if = any(_re.search(r"^\s*if\s+", x) for x in solution_lines)
+        has_elif = any(_re.search(r"^\s*elif\s+", x) for x in solution_lines)
+        has_else = any(_re.search(r"^\s*else\s*:\s*$", x) for x in solution_lines)
+        joined_lines = "\n".join(solution_lines)
+        code = joined_lines
+        input_count = len(_re.findall(r"\binput\s*\(", joined_lines))
+
+        if function_mode and (not has_def):
+            return "missing def"
+
+        if function_mode and require_function_input_from_context and (input_count <= 0):
+            return "function mode requires input style from subtitle/teacher description"
+
+        if function_mode and require_function_two_inputs and (input_count < 2):
+            return "function mode requires at least two inputs"
+
+        if function_mode and require_no_loop_in_function_from_context:
+            if _has_loop(solution_lines) or _re.search(r"\brange\s*\(", joined_lines):
+                return "function mode: loop syntax not allowed by subtitle/teacher context"
+
+        if function_mode and require_no_condition_in_function_from_context:
+            if has_if or has_elif or has_else:
+                return "function mode: condition syntax not allowed by subtitle/teacher context"
+
+        if function_mode and require_function_operator_dispatch:
+            if _re.search(r"\bwhile\b|\bfor\b|\brange\s*\(", joined_lines):
+                return "function operator mode: loop syntax not allowed"
+
+            has_op_param = bool(_re.search(r"def\s+\w+\s*\([^)]*\b(op|operator)\b", joined_lines))
+            if not has_op_param:
+                return "function operator mode: missing op/operator parameter"
+
+            op_patterns = [r"['\"]\+['\"]", r"['\"]-['\"]", r"['\"]\*['\"]", r"['\"]/['\"]"]
+            has_all_ops = all(_re.search(p, joined_lines) is not None for p in op_patterns)
+            if not has_all_ops:
+                return "function operator mode: missing one of + - * / branches"
+
+            if not (has_if and (has_elif or has_else)):
+                return "function operator mode: requires if/elif style operator dispatch"
+
+        if function_mode:
+            fp_ok, fp_reason = _validate_function_structure_profile(solution_lines, function_profile)
+            if not fp_ok:
+                return fp_reason or "function profile not met"
+
+        # [新增] 實現細節驗收：print vs return
+        if require_print_only:
+            has_print = "print(" in joined_lines
+            has_return = _re.search(r"\breturn\b", joined_lines) is not None
+            # 如果要求print_only，但有return卻沒有print → 不符
+            if has_return and not has_print:
+                return "output style mismatch: subtitle teaches print(), solution only has return"
+            # 函式mode下，應該在函式內使用print，而不是僅return
+            if function_mode and has_return and not has_print:
+                return "function mode: should output with print() inside function, not just return"
+
+        # [新增] 實現細節驗收：int(input())
+        if require_int_input_cast and input_count > 0:
+            # 移除所有被int/float/str包裝的input()，檢查是否還有input()剩下
+            without_cast = _re.sub(r'\b(?:int|float|str)\s*\(\s*input\s*\(\s*\)\s*\)', '', joined_lines)
+            has_uncast_input = 'input(' in without_cast
+            if has_uncast_input:
+                return "input casting mismatch: subtitle teaches int(input()), solution has uncast input()"
+
+        # [新增] 實現細節驗收：函式參數數量
+        if function_mode and require_function_param_count and expected_param_count is not None:
+            try:
+                tree = ast.parse(code)
+                func_defs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+                if func_defs:
+                    first_func = func_defs[0]
+                    actual_params = len(first_func.args.args)
+                    if actual_params != expected_param_count:
+                        return f"function param mismatch: subtitle teaches {expected_param_count} params, solution has {actual_params}"
+            except Exception as e:
+                # 若無法解析，寬鬆處理
+                pass
+
+        if function_mode and require_function_input_from_context:
+            # 避免 power(3, 4) 這種與教學輸入流程不一致的硬編碼呼叫
+            if _re.search(r"\b\w+\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)", joined_lines):
+                return "function mode: avoid hardcoded literal function call"
+
+        if (not function_mode) and has_def:
             return "contains def"
+
+        if (not function_mode) and require_if_from_context and (not has_if):
+            return "missing if (required by subtitle/teacher description)"
 
         if any(_re.search(r"^\s*class\s+", x) for x in solution_lines):
             return "contains class"
 
-        if not _has_loop(solution_lines):
+        if (not function_mode) and (not _has_loop(solution_lines)):
             return "missing loop"
 
-        if not _loop_has_body_indent(solution_lines):
+        if (not function_mode) and (not _loop_has_body_indent(solution_lines)):
             return "loop body indentation missing"
 
         if not _has_print(solution_lines):
@@ -2408,12 +4015,13 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         # ✅ 修正：圖形/for-range 類題目不需要 input() 也不需要結束條件
         # 判斷是否為「純輸出型」題（for range + print，無需互動）
         is_output_only = (
+            (not function_mode) and
             not _has_input(solution_lines) and
             _has_loop(solution_lines) and
             not _re.search(r"\bwhile\b", "\n".join(solution_lines))
         )
 
-        if not is_output_only:
+        if (not is_output_only) and (not function_mode):
             # 互動型題目才要求有 input
             if not _has_input(solution_lines):
                 return "missing input"
@@ -2437,12 +4045,25 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         if not _ast_safe(code):
             return "AST rejected"
 
+        if function_mode:
+            return ""
+
         # 純輸出型：不跑測資（無 input，exec 會卡住）；直接通過
         if is_output_only:
             return ""
 
         # 互動型：跑測資驗收
         test_inputs = (scenario_tests[:1] or [[]])
+
+        qmix = " ".join([
+            str(question_text or ""),
+            str(scenario_desc or ""),
+            str(teacher_description or ""),
+        ]).lower()
+
+        # 題目若明確要求 quit + 最後一次輸入值，額外加專用測資避免錯解通過
+        if (loop_style == "while_only") and ("quit" in qmix) and ("最後" in qmix or "last" in qmix):
+            test_inputs = [["12", "34", "quit"]]
         for inputs in test_inputs:
             try:
                 out = _run_with_inputs(code, inputs)
@@ -2456,6 +4077,12 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
                 print("[AI_VERIFY] output was:", repr(out))
                 return "output check failed"
 
+            sem_err = _while_semantic_check(question_text, out, inputs)
+            if sem_err:
+                print("[AI_VERIFY]", sem_err)
+                print("[AI_VERIFY] output was:", repr(out))
+                return sem_err
+
         return ""
 
     # ===============================
@@ -2466,7 +4093,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     banned_patterns = """
 請避免以下過度常見模板與禁止項：
 - 直到輸入 'ok' 為止（除非情境就是 ok sentinel）
-- def / class
+- class
 - 中文註解或中文程式碼
 
 - 盡量避免 while True + break（改用 while 條件式）
@@ -2485,6 +4112,53 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         )
     elif loop_style == "while_only":
         loop_style_rule = "- 本題必須使用 while 迴圈，禁止使用 for。"
+    elif function_mode:
+        loop_style_rule = "- 本題必須定義並使用至少一個函式（def），禁止使用 class。"
+
+    if_requirement_rule = ""
+    if require_if_from_context and (not function_mode):
+        if_requirement_rule = "- 字幕/老師描述提到條件判斷：solution_lines 必須包含至少一個 if。"
+
+    function_input_rule = ""
+    if require_function_input_from_context:
+        function_input_rule = "- 字幕/老師描述顯示為輸入導向：必須使用 input() 讀值，不可直接用固定常數呼叫函式（例如 power(3, 4)）。"
+        if require_function_two_inputs:
+            function_input_rule += "\n- 本題需至少讀取兩個輸入值（如底數與指數）。"
+
+    function_no_loop_rule = ""
+    if require_no_loop_in_function_from_context:
+        function_no_loop_rule = "- 字幕/老師描述未出現迴圈教學：禁止使用 for / while / range，請用函式與運算式完成。"
+
+    function_no_condition_rule = ""
+    if require_no_condition_in_function_from_context:
+        function_no_condition_rule = "- 字幕/老師描述未出現條件判斷教學：禁止使用 if / elif / else，請使用單純輸入、運算、return 與輸出。"
+
+    # [新增] 實現細節規則：print vs return、int轉型、輸出格式
+    output_style_rule = ""
+    if require_print_only:
+        output_style_rule = "- 字幕教學使用 print() 輸出結果：solution_lines 必須用 print()，禁止只用 return（函式應該內含 print）。"
+    
+    int_input_rule = ""
+    if require_int_input_cast:
+        int_input_rule = "- 字幕教學明確顯示 int(input()) 轉型：讀取輸入時必須使用 int() 轉換（而不是直接 input()）。"
+    
+    output_format_rule = ""
+    if output_format_style == "with_label":
+        output_format_rule = "- 字幕教學的輸出格式包含標籤（如 'Name: xxx')：請輸出相同格式的標籤。"
+    elif output_format_style == "custom":
+        output_format_rule = "- 字幕教學的輸出格式自訂：請依照字幕中的範例格式輸出。"
+
+    function_param_rule = ""
+    if require_function_param_count and function_mode:
+        function_param_rule = f"- 字幕教學定義函式有 {expected_param_count} 個參數：def 必須正好有 {expected_param_count} 個參數，呼叫時也必須提供 {expected_param_count} 個輸入值。"
+
+    function_operator_rule = ""
+    if function_mode and require_function_operator_dispatch:
+        function_operator_rule = (
+            "- 本題必須為運算子分派函式：def 需包含 op/operator 參數。\n"
+            "- 函式內需用 if/elif 依 '+', '-', '*', '/' 至少四種運算分支回傳結果。\n"
+            "- 主程式需讀入 x、y、op 三個輸入後呼叫函式並輸出。"
+        )
 
     # ✅ 根據老師描述判斷是否為「純輸出型」（圖形、數列），動態調整規則
     _td_lc = (teacher_description or "").lower()
@@ -2493,7 +4167,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         "數列", "列印", "輸出數字", "輸出星號",
     ])
 
-    if _is_pattern_task:
+    if _is_pattern_task and (not function_mode):
         loop_rules = (
             "- 使用 for 迴圈（可巢狀）\n"
             "- 迴圈內至少一行縮排（4 spaces）\n"
@@ -2501,6 +4175,30 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             "- 禁止使用 input() / while / break"
         )
         diversity_block = ""  # 圖形題不需要 sentinel/output_style 多樣化
+    elif function_mode:
+        loop_rules = (
+            "- 必須包含至少一個 def 函式定義\n"
+            "- 函式內至少一行縮排（4 spaces）\n"
+            "- 函式需被呼叫，且最終使用 print() 輸出結果\n"
+            "- 禁止使用 class"
+        )
+        if function_input_rule:
+            loop_rules += "\n" + function_input_rule
+        if int_input_rule:
+            loop_rules += "\n" + int_input_rule
+        if output_style_rule:
+            loop_rules += "\n" + output_style_rule
+        if output_format_rule:
+            loop_rules += "\n" + output_format_rule
+        if function_param_rule:
+            loop_rules += "\n" + function_param_rule
+        if function_operator_rule:
+            loop_rules += "\n" + function_operator_rule
+        if function_no_loop_rule:
+            loop_rules += "\n" + function_no_loop_rule
+        if function_no_condition_rule:
+            loop_rules += "\n" + function_no_condition_rule
+        diversity_block = ""
     else:
         loop_rules = (
             "- 迴圈（for 或 while）\n"
@@ -2512,6 +4210,12 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             " - 巢狀迴圈內的 print() 必須正確縮排"
             " 最後要輸出結果（print)"
         )
+        if if_requirement_rule:
+            loop_rules += "\n" + if_requirement_rule
+        if int_input_rule:
+            loop_rules += "\n" + int_input_rule
+        if output_format_rule:
+            loop_rules += "\n" + output_format_rule
         diversity_block = f"""
 【多樣化要求（本次 regenerate 變化）】
 - 變化種子：{variation_seed}
@@ -2524,7 +4228,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 
     base_prompt = f"""
 你要產生一題 Parsons 程式重組題（不是選擇題）。
-題型固定：迴圈，不得使用 def/class。
+題型固定：{('函式' if function_mode else '迴圈')}，不得使用 class。
 
 【情境】
 {scenario_desc}
@@ -2547,9 +4251,18 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 若老師有提供描述，請優先依照老師描述生成題目。
 不得違反老師指定的限制條件。
 {teacher_description}
+【字幕切片關鍵詞】
+{selector_keywords or "（自動）"}
+{strict_subtitle_rule}
+{unified_rule_text}
+{function_profile_summary}
 若老師描述明確，請優先依據描述生成題目。
 {loop_style_rule}
-{banned_patterns if not _is_pattern_task else ""}
+{if_requirement_rule}
+{function_input_rule}
+{function_no_loop_rule}
+{function_no_condition_rule}
+{banned_patterns if ((not _is_pattern_task) and (not function_mode)) else ""}
 {diversity_block}
 
 輸出 JSON 格式：
@@ -2571,10 +4284,13 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         base_prompt += "\n".join(concept_template_solution)
         base_prompt += "\n\n請依照此邏輯設計題目，但情境必須不同。"
 
-    MAX_RETRY = 3
+    # 控制成本：最多嘗試 2 次 AI 生成，失敗即交給外層本地 fallback。
+    MAX_RETRY = 2
     data = None
     last_error = ""
     last_candidate = None
+    success_attempt = 0
+    unified_policy_meta = {}
 
     for attempt in range(MAX_RETRY):
         if attempt == 0:
@@ -2590,13 +4306,15 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
                 err_hint = f"\n⚠️  {last_error}：請確認 solution_lines 包含所需語法元素。"
             elif "for_only" in last_error:
                 err_hint = "\n⚠️  不可使用 while 或 break，請改用 for i in range(n) 控制次數。"
+            elif "subtitle concept" in last_error:
+                err_hint = "\n⚠️  題目與程式概念沒有對齊字幕重點，請補強關鍵詞語意。"
             user_msg = f"""
 你上一版未通過自動驗收：{last_error}{err_hint}
 
 【只修正 solution_lines】（保持同一情境方向）
 - solution_lines 必須是合法 Python，可以 compile 執行
-- 禁止中文、禁止 # 註解、禁止 def/class
-- 必須包含 for 或 while 迴圈，迴圈內縮排 4 spaces
+- 禁止中文、禁止 # 註解、禁止 class
+- {('必須包含 def 並正確呼叫函式' if function_mode else '必須包含 for 或 while 迴圈，迴圈內縮排 4 spaces')}
 - 只輸出合法 JSON（欄位仍是 question_text + solution_lines）
 
 上一版 question_text（參考）：{prev_q}
@@ -2625,27 +4343,45 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         sol = _sanitize_solution_lines(sol)  # [新增]
         cand["solution_lines"] = sol
 
-        grade_err = _auto_grade(sol)
+        grade_err = _auto_grade(sol, q)
         if grade_err:
             last_error = grade_err
             continue
+
+        if function_mode:
+            fp_ok, fp_reason = _validate_function_structure_profile(sol, function_profile)
+            if not fp_ok:
+                last_error = fp_reason or "function profile not met"
+                continue
 
         ok_align, align_reason = _loop_semantic_guard(subtitle_text, q, sol, video_title)
         if not ok_align:
             last_error = align_reason
             continue
 
+        concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
+            plan,
+            trace.get("keywords", []),
+            trace.get("subtitle_text_used", subtitle_text),
+            q,
+            sol,
+        )
+        if not concept_ok:
+            last_error = "subtitle concept alignment not met: " + ", ".join(concept_missing[:5])
+            continue
+
+        policy_ok, policy_meta = _validate_unified_generation_policy(q, sol, unified_policy)
+        if not policy_ok:
+            last_error = str(policy_meta.get("reason") or "unified policy not met")
+            continue
+        unified_policy_meta = policy_meta
+
         data = cand
+        success_attempt = attempt + 1
         break
 
     if not data:
-        if concept_template_solution:
-            data = {
-                "question_text": f"請根據題意完成一題與「{scenario_hint or theme_word}」相關的迴圈程式重組。",
-                "solution_lines": concept_template_solution[:]
-            }
-        else:
-            raise RuntimeError(f"AI generation failed: {last_error}")
+        raise RuntimeError(f"AI generation failed: {last_error}")
 
     question_text = (data.get("question_text") or "").strip()
     solution_lines = data["solution_lines"]
@@ -2854,6 +4590,7 @@ solution_lines：{solution_lines}
     semantic_model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
 
     sem_labels = _ai_generate_semantic_labels(solution_lines, question_text, semantic_model, temperature=0.0)
+    contextual_sem_labels = _build_contextual_semantic_labels(solution_lines, question_text)
     for i, b in enumerate(solution_blocks):
         if i < len(sem_labels):
             b["semantic_zh"] = _soften_semantic_hint(sem_labels[i], b.get("text", ""), is_distractor=False)
@@ -2861,7 +4598,7 @@ solution_lines：{solution_lines}
     template_slots = [
         {
             "label": _soften_semantic_hint(
-                sem_labels[i] if i < len(sem_labels) else _label_for_code_line(solution_lines[i]),
+                sem_labels[i] if i < len(sem_labels) else contextual_sem_labels[i],
                 solution_lines[i],
                 is_distractor=False,
             ),
@@ -2882,7 +4619,7 @@ solution_lines：{solution_lines}
         if i < len(dis_labels):
             b["semantic_zh"] = _soften_semantic_hint(dis_labels[i], b.get("text", ""), is_distractor=True)
 
-    pool = distractor_blocks + solution_blocks
+    pool = _mix_pool_blocks(solution_blocks, distractor_blocks, seed_text=question_text)
 
     ai_feedback = {
         "general": "請注意結束條件、統計更新與縮排層級是否正確。",
@@ -2904,9 +4641,52 @@ solution_lines：{solution_lines}
         "pool": pool, # 結合 solution_blocks 與 distractor_blocks 的題庫（可用於洗牌出題）
         "template_slots": template_slots, # 每行程式碼對應的 slot（包含中文語意提示）
         "ai_feedback": ai_feedback, # AI 生成的整體反饋（包含一般建議、常見錯誤與提示）
+        "source_subtitle": {
+            "subtitle_range": selected_subtitle_range,
+            "trace_range": trace.get("subtitle_range") or {},
+            "text_used": _selected_subtitle_text or (trace.get("subtitle_text_used") or ""),
+            "selector_keywords": selected_meta.get("keywords") or [],
+        },
+        "subtitle_range": selected_subtitle_range,
+        "subtitle_text_used": _selected_subtitle_text or (trace.get("subtitle_text_used") or ""),
+        "key_sentences": key_sentences,
+        "key_sentences_typed": key_sentences_typed,
+        "selector_meta": selector_meta,
+        "unified_policy_meta": unified_policy_meta,
+        "function_profile": function_profile if function_mode else {},
+        "alignment_confidence": _build_alignment_confidence(selector_meta, key_sentences_typed, seg_map, slot_hints),
         "ai_segment_map": seg_map, # AI 生成的程式碼行與字幕時間戳對齊資訊（包含證據）
         "ai_slot_hints": slot_hints, # AI 生成的每行程式碼提示（基於對齊資訊，提供學生錯誤時的提示）
         "ai_segments_compact": segs_compact, # 用於 AI 生成的字幕片段簡化版本（含時間戳與文字），供對齊任務使用
+        "debug_meta": {
+            "selector_keywords": (selected_meta.get("keywords") or []),
+            "selector_best_index": selected_meta.get("best_idx"),
+            "selector_best_score": selected_meta.get("best_score"),
+            "selector_fallback": selected_meta.get("fallback"),
+            "selector_hit_ratio": selector_meta.get("hit_ratio"),
+            "selector_keyword_coverage_ratio": selector_meta.get("keyword_coverage_ratio"),
+            "policy_anchor_hits": (unified_policy_meta.get("anchor_hits") or []),
+            "policy_anchor_missing": (unified_policy_meta.get("anchor_missing") or []),
+            "policy_off_topic_ratio": unified_policy_meta.get("off_topic_ratio"),
+            "policy_reason": unified_policy_meta.get("reason"),
+            "selected_subtitle_count": len(selected_segs or []),
+            "selected_subtitle_preview": selected_preview,
+            "require_if_from_context": bool(require_if_from_context),
+            "require_function_input_from_context": bool(require_function_input_from_context),
+            "require_function_two_inputs": bool(require_function_two_inputs),
+            "require_function_param_count": bool(require_function_param_count),
+            "expected_param_count": expected_param_count,
+            "require_no_loop_in_function_from_context": bool(require_no_loop_in_function_from_context),
+            "require_no_condition_in_function_from_context": bool(require_no_condition_in_function_from_context),
+            "heuristic_allow_condition_for_function": bool(function_mode and _should_func_allow_condition(subtitle_text, teacher_description)),
+            "require_print_only": bool(require_print_only),
+            "require_int_input_cast": bool(require_int_input_cast),
+            "output_format_style": str(output_format_style or "simple"),
+            "function_profile": function_profile if function_mode else {},
+            "max_retry": int(MAX_RETRY),
+            "success_attempt": int(success_attempt),
+            "last_error_before_success": str(last_error or ""),
+        },
     }
 
 
@@ -2973,6 +4753,32 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         else:
             ai = ai_generate_parsons_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=stable_mode)
 
+        # 切片品質太低時，最多再重試一次（固定用 stable_mode=True）提升穩定性。
+        first_selector_meta = dict(ai.get("selector_meta") or {})
+        selector_retried = False
+        if _selector_quality_low(first_selector_meta):
+            selector_retried = True
+            try:
+                if constraints.get("unit_type") == "condition":
+                    ai_retry = ai_generate_condition_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=True)
+                elif constraints.get("unit_type") == "io":
+                    ai_retry = ai_generate_io_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=True)
+                else:
+                    ai_retry = ai_generate_parsons_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=True)
+
+                retry_selector_meta = dict(ai_retry.get("selector_meta") or {})
+                if (not _selector_quality_low(retry_selector_meta)) or (
+                    int(retry_selector_meta.get("best_score") or 0) >= int(first_selector_meta.get("best_score") or 0)
+                ):
+                    ai = ai_retry
+            except Exception:
+                pass
+
+        ai.setdefault("debug_meta", {})
+        ai["debug_meta"]["selector_retry_once"] = bool(selector_retried)
+        ai["debug_meta"]["selector_quality_low_first"] = bool(_selector_quality_low(first_selector_meta))
+        ai["debug_meta"]["selector_quality_final"] = dict(ai.get("selector_meta") or {})
+
         gen_source = "openai"
     except Exception as e:
         ai = simple_fallback_generate(sub_text, unit, video_title, level=level, teacher_description=teacher_description)
@@ -3025,6 +4831,12 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         "source_subtitle": ai.get("source_subtitle"),
         "subtitle_range": ai.get("subtitle_range"),
         "subtitle_text_used": ai.get("subtitle_text_used"),
+        "key_sentences": ai.get("key_sentences", []),
+        "key_sentences_typed": ai.get("key_sentences_typed", []),
+        "selector_meta": ai.get("selector_meta", {}),
+        "unified_policy_meta": ai.get("unified_policy_meta", {}),
+        "function_profile": ai.get("function_profile", {}),
+        "alignment_confidence": ai.get("alignment_confidence", {}),
         "ai_generated": True if gen_source == "openai" else False,
         "ai_segment_map": ai.get("ai_segment_map", {}) or {},
         "ai_slot_hints": ai.get("ai_slot_hints", {}) or {},
@@ -3033,6 +4845,7 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         "active": True,
         "gen_source": gen_source,
         "gen_error": gen_error,
+        "fallback_source": ai.get("fallback_source") if gen_source == "fallback" else None,
         "env": env,
         "ai_debug": {
             "alignment_ok": bool(_align_ok),
@@ -3044,6 +4857,7 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
             "stable_mode": bool(stable_mode),
             "gen_source": gen_source,
             "gen_error": gen_error,
+            "generation_debug": ai.get("debug_meta", {}) or {},
         },
     }
 

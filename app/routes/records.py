@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify, Response
 from app.db import db
+from datetime import datetime, timezone
 
 records_bp = Blueprint("records", __name__)
 
@@ -147,6 +148,169 @@ def learning_events():
 @records_bp.get("/analytics")
 def analytics():
     return jsonify({"ok": True, "completion_rate": 0, "avg_score": 0, "parsons_completed": 0})
+
+
+def _safe_dt(v):
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str) and v.strip():
+        s = v.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+@records_bp.get("/corrected_success.csv")
+def export_corrected_success_csv():
+    """
+    GET /api/records/corrected_success.csv?class_name=資工系A&student_id=11461127&task_id=...&rq3_only=1
+
+    以 (student_id, task_id) 分組，依 created_at 排序：
+    - 若先出現 is_correct=false，後續又出現 is_correct=true，則 corrected_success=1
+    - 其餘為 corrected_success=0
+    - rq3_eligible=1 代表此組至少曾出現錯誤（可納入「錯後修正」分析）
+    """
+    import io
+    import csv
+
+    class_name = (request.args.get("class_name") or "").strip()
+    student_id_arg = (request.args.get("student_id") or "").strip()
+    task_id_arg = (request.args.get("task_id") or "").strip()
+    rq3_only = str(request.args.get("rq3_only") or "").strip().lower() in ("1", "true", "yes")
+
+    q = {}
+    if student_id_arg:
+        q["student_id"] = student_id_arg
+    if task_id_arg:
+        q["task_id"] = task_id_arg
+
+    user_map = {}
+    student_ids_in_class = None
+    if "users" in db.list_collection_names():
+        uq = {"role": "student"}
+        if class_name:
+            uq["class_name"] = class_name
+        for u in db.users.find(uq, {"_id": 0, "student_id": 1, "name": 1, "class_name": 1}):
+            sid = str(u.get("student_id") or "").strip()
+            if sid:
+                user_map[sid] = {
+                    "name": u.get("name") or "",
+                    "class_name": u.get("class_name") or "",
+                }
+        if class_name:
+            student_ids_in_class = set(user_map.keys())
+
+    if class_name:
+        if student_ids_in_class is None:
+            student_ids_in_class = set()
+        if student_id_arg and student_id_arg not in student_ids_in_class:
+            q["student_id"] = "__NO_MATCH__"
+        elif not student_id_arg:
+            q["student_id"] = {"$in": list(student_ids_in_class) or ["__NO_MATCH__"]}
+
+    projection = {
+        "_id": 1,
+        "student_id": 1,
+        "task_id": 1,
+        "is_correct": 1,
+        "created_at": 1,
+    }
+    attempts = list(db.parsons_attempts.find(q, projection))
+
+    groups = {}
+    for a in attempts:
+        sid = str(a.get("student_id") or "").strip()
+        tid = str(a.get("task_id") or "").strip()
+        if not sid or sid.lower() == "unknown" or not tid:
+            continue
+        key = (sid, tid)
+        groups.setdefault(key, []).append(a)
+
+    rows = []
+    for (sid, tid), items in groups.items():
+        items_sorted = sorted(
+            items,
+            key=lambda x: (_safe_dt(x.get("created_at")), str(x.get("_id") or ""))
+        )
+
+        seen_wrong = False
+        corrected_success = 0
+        first_wrong_at = ""
+        first_correct_at = ""
+        first_is_correct = None
+
+        for idx, it in enumerate(items_sorted):
+            is_ok = bool(it.get("is_correct", False))
+            c_at = it.get("created_at")
+            c_at_s = c_at.isoformat() if isinstance(c_at, datetime) else str(c_at or "")
+
+            if idx == 0:
+                first_is_correct = 1 if is_ok else 0
+
+            if not is_ok and not first_wrong_at:
+                first_wrong_at = c_at_s
+                seen_wrong = True
+                continue
+
+            if is_ok and not first_correct_at:
+                first_correct_at = c_at_s
+
+            if is_ok and seen_wrong:
+                corrected_success = 1
+                break
+
+        rq3_eligible = 1 if first_is_correct == 0 else 0
+        if rq3_only and rq3_eligible == 0:
+            continue
+
+        rows.append({
+            "student_id": sid,
+            "name": (user_map.get(sid) or {}).get("name", ""),
+            "class_name": (user_map.get(sid) or {}).get("class_name", ""),
+            "task_id": tid,
+            "attempt_count": len(items_sorted),
+            "first_is_correct": first_is_correct if first_is_correct is not None else "",
+            "first_wrong_at": first_wrong_at,
+            "first_correct_at": first_correct_at,
+            "rq3_eligible": rq3_eligible,
+            "corrected_success": corrected_success,
+        })
+
+    rows.sort(key=lambda r: (r.get("student_id", ""), r.get("task_id", "")))
+
+    headers = [
+        "student_id",
+        "name",
+        "class_name",
+        "task_id",
+        "attempt_count",
+        "first_is_correct",
+        "first_wrong_at",
+        "first_correct_at",
+        "rq3_eligible",
+        "corrected_success",
+    ]
+
+    output = io.StringIO()
+    w = csv.DictWriter(output, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+
+    csv_text = "\ufeff" + output.getvalue()
+    output.close()
+
+    return Response(
+        csv_text,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": "attachment; filename=corrected_success.csv; filename*=UTF-8''corrected_success.csv"
+        },
+    )
 
 
 # =========================================================

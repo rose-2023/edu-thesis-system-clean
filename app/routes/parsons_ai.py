@@ -6,6 +6,7 @@
 import os
 import json
 import re
+import time
 from typing import Any, Dict, Optional, Tuple, List
 from dotenv import load_dotenv
 
@@ -35,14 +36,85 @@ OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 
 
+def _runtime_ai_enabled() -> bool:
+    return _env_bool("AI_ENABLED", default=AI_ENABLED)
+
+
+def _runtime_model() -> str:
+    return (os.getenv("OPENAI_MODEL") or OPENAI_MODEL or "gpt-4.1-mini").strip()
+
+
+def _runtime_api_key() -> str:
+    return (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY or "").strip()
+
+
+def _runtime_timeout() -> float:
+    raw = (os.getenv("OPENAI_TIMEOUT_SEC") or "60").strip()
+    try:
+        return max(5.0, float(raw))
+    except Exception:
+        return 45.0
+
+
+def _runtime_max_retries() -> int:
+    raw = (os.getenv("OPENAI_MAX_RETRIES") or "3").strip()
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 2
+
+
+def _runtime_base_url() -> str:
+    return (os.getenv("OPENAI_BASE_URL") or "").strip()
+
+
 def _ensure_client() -> "OpenAI":
-    if not AI_ENABLED:
+    if not _runtime_ai_enabled():
         raise RuntimeError("AI_ENABLED=false（目前 AI 關閉）")
     if OpenAI is None:
         raise RuntimeError("openai 套件未安裝：請在 venv 執行 pip install openai")
-    if not OPENAI_API_KEY:
+    api_key = _runtime_api_key()
+    if not api_key:
         raise RuntimeError("OPENAI_API_KEY 未設定（.env 沒讀到或 key 空）")
-    return OpenAI(api_key=OPENAI_API_KEY)
+
+    kwargs: Dict[str, Any] = {
+        "api_key": api_key,
+        "timeout": _runtime_timeout(),
+        "max_retries": _runtime_max_retries(),
+    }
+    base_url = _runtime_base_url()
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
+
+
+def _responses_create_with_retry(client: "OpenAI", **kwargs):
+    """Retry transient connection failures before surfacing a detailed error."""
+    attempts = 3
+    wait_schedule = [0.8, 1.6, 2.5]
+    last_err: Optional[Exception] = None
+
+    for i in range(attempts):
+        try:
+            return client.responses.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            name = e.__class__.__name__.lower()
+            msg = str(e).lower()
+            transient = (
+                "connection" in name
+                or "timeout" in name
+                or "apiconnection" in name
+                or "read timed out" in msg
+                or "temporarily unavailable" in msg
+            )
+            if (not transient) or i >= attempts - 1:
+                break
+            time.sleep(wait_schedule[min(i, len(wait_schedule) - 1)])
+
+    err_name = (last_err.__class__.__name__ if last_err else "OpenAIError")
+    err_msg = (str(last_err) if last_err else "unknown error")
+    raise RuntimeError(f"OpenAI request failed [{err_name}]: {err_msg}")
 
 
 # =========================
@@ -58,9 +130,10 @@ def call_openai_output_text(
 ) -> str:
     """回傳純文字（適合一般生成）"""
     client = _ensure_client()
-    m = (model or OPENAI_MODEL).strip()
+    m = (model or _runtime_model()).strip()
 
-    resp = client.responses.create(
+    resp = _responses_create_with_retry(
+        client,
         model=m,
         input=[
             {"role": "system", "content": system},
@@ -82,9 +155,10 @@ def call_openai_json(
 ) -> Dict[str, Any]:
     """回傳 JSON（支援 fenced json 或裸 json）"""
     client = _ensure_client()
-    m = (model or OPENAI_MODEL).strip()
+    m = (model or _runtime_model()).strip()
 
-    resp = client.responses.create(
+    resp = _responses_create_with_retry(
+        client,
         model=m,
         input=[
             {"role": "system", "content": system},

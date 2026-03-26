@@ -20,10 +20,11 @@
             v-for="(slot, idx) in templateSlots"
             :key="slot.slot"
             class="cloze-row"
-            :class="{ wrong: wrongIndices.includes(idx) }"
+            :class="{ wrong: isPrimaryWrong(idx), affected: isAffectedWrong(idx) }"
           >
-            <div class="hint">
-              {{ idx + 1 }}. {{ filled[slot.slot]?.meaning_zh || slot.label || "" }}
+            <div class="hint" v-if="effectiveShowSemanticZh && (slot.expected_meaning_zh || filled[slot.slot]?.meaning_zh)">
+              <span v-if="isAffectedWrong(idx)" class="hint-affected-icon" aria-hidden="true">⚠</span>
+              {{ idx + 1 }}. {{ slot.expected_meaning_zh || filled[slot.slot]?.meaning_zh }}
             </div>
 
             <div
@@ -95,33 +96,37 @@
       @click.self="dismissFeedbackModal"
     >
       <div class="fb-modal" role="dialog" aria-modal="true" aria-label="作答回饋">
-        <div class="fb-title">❌ 你錯在：{{ feedbackModal.slotLabel }}</div>
+        <div class="fb-title">❌ {{ feedbackModal.headline }}</div>
 
         <div class="fb-section">
-          <div class="fb-label">錯誤類型</div>
-          <div class="fb-text">{{ feedbackModal.diagnosis }}</div>
+          <div class="fb-label">💡 你可以選擇：</div>
+          <div class="fb-actions pick">
+            <button class="btn ghost" @click="onToggleHintOpen">
+              {{ feedbackModal.hintOpen ? "收起提示" : "查看提示" }}
+            </button>
+            <button class="btn submit" @click="onToggleReviewOpen">
+              {{ feedbackModal.reviewOpen ? "收起影片" : "查看影片" }}
+            </button>
+          </div>
         </div>
 
-        <div class="fb-section">
-          <div class="fb-label">概念提示</div>
-          <div class="fb-text">{{ feedbackModal.conceptHint }}</div>
+        <div class="fb-section" v-if="feedbackModal.hintOpen">
+          <div class="fb-label">💡 AI提示</div>
+          <div class="fb-text">{{ feedbackModal.hintQuestion }}</div>
+          <div class="fb-more">👉 還需要更完整說明嗎？</div>
+          <div class="fb-actions pick">
+            <button class="btn submit" @click="openReviewFromHint">回看影片</button>
+          </div>
         </div>
 
-        <div class="fb-section">
-          <div class="fb-label">引導問題</div>
-          <ol class="fb-list">
-            <li v-for="(q, i) in feedbackModal.reflectionQuestions" :key="`${i}-${q}`">{{ q }}</li>
-          </ol>
-        </div>
-
-        <div class="fb-section fb-review">
-          <div class="fb-label">建議回看影片</div>
+        <div class="fb-section fb-review" v-if="feedbackModal.reviewOpen">
+          <div class="fb-label">🎬 建議回看片段</div>
           <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
-        </div>
-
-        <div class="fb-actions">
-          <button class="btn ghost" @click="dismissFeedbackModal">稍後再看</button>
-          <button class="btn submit" @click="goReviewFromModal">前往複習片段</button>
+          <div class="fb-focus">重點：{{ feedbackModal.reviewFocus }}</div>
+          <div v-if="feedbackModal.debugText" class="fb-debug">{{ feedbackModal.debugText }}</div>
+          <div class="fb-actions">
+            <button class="btn submit" @click="goReviewFromModal">前往影片</button>
+          </div>
         </div>
       </div>
     </div>
@@ -159,7 +164,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } from "vue";
 import { useRoute, useRouter } from "vue-router";
-
 const API_BASE = "http://127.0.0.1:5000";
 
 const route = useRoute();
@@ -213,6 +217,8 @@ const review_attempt_id = computed(() => {
 const task = ref(null);
 const poolBlocks = ref([]);
 const templateSlots = ref([]);
+const teacherForcedHideSemantic = ref(false);
+const effectiveShowSemanticZh = computed(() => !teacherForcedHideSemantic.value);
 
 // ====== 拖曳狀態 ======
 const dragging = ref(null);
@@ -235,8 +241,8 @@ let _docKeydownHandler = null;
 
 const INDENT_STEP_PX = 24;
 const INDENT_UNIT_PX = Math.max(1, Math.round(INDENT_STEP_PX / 4));
-const INDENT_MAX_PX = INDENT_STEP_PX * 2;
-const INDENT_MAX_LEVEL = 2;
+const INDENT_MAX_LEVEL = 3;
+const INDENT_MAX_PX = INDENT_STEP_PX * INDENT_MAX_LEVEL;
 
 function setActiveSlotKey(k) {
   if (k == null) return;
@@ -315,10 +321,10 @@ async function bindBlankFocusHandlers() {
 
   await applyIndentStylesToDOM();
 }
-
 // ====== 作答結果 ======
 const result = ref(null);
 const wrongIndices = ref([]);
+const primaryWrongIndex = ref(null);
 
 // ====== UI 狀態 ======
 const state = reactive({
@@ -330,17 +336,27 @@ const state = reactive({
 
 const feedbackModal = reactive({
   open: false,
+  headline: "",
+  locationText: "",
+  hintQuestion: "",
   slotLabel: "",
   diagnosis: "",
   conceptHint: "",
   reflectionQuestions: [],
+  impactHint: "",
   reviewRange: "（未提供）",
+  reviewFocus: "",
+  hintOpen: false,
+  reviewOpen: false,
   start: null,
   end: null,
   jumpVideoId: "",
   attemptId: "",
   reviewAttemptId: "",
   taskId: "",
+  hintClicked: false,
+  videoClicked: false,
+  debugText: "",
 });
 
 const successModal = reactive({
@@ -358,11 +374,27 @@ const RESTORE_MSG_KEY = "parsons_restore_msg_v1";
 function resetFilled() {
   for (const k of Object.keys(filled)) delete filled[k];
   wrongIndices.value = [];
+  primaryWrongIndex.value = null;
   result.value = null;
   state.err = "";
 
   for (const k of Object.keys(slotIndentLevel)) delete slotIndentLevel[k];
   activeSlotKey.value = null;
+}
+
+function isPrimaryWrong(idx) {
+  if (primaryWrongIndex.value == null || primaryWrongIndex.value === "") return false;
+  const p = Number(primaryWrongIndex.value);
+  if (!Number.isFinite(p)) return false;
+  return p === Number(idx);
+}
+
+function isAffectedWrong(idx) {
+  if (!Array.isArray(wrongIndices.value) || !wrongIndices.value.length) return false;
+  const n = Number(idx);
+  if (!Number.isFinite(n)) return false;
+  const hasMatch = wrongIndices.value.some((v) => Number(v) === n);
+  return hasMatch && !isPrimaryWrong(n);
 }
 
 function isUsed(blockId) {
@@ -499,64 +531,161 @@ function fmtTime(sec) {
   return `${mm}:${ss}`;
 }
 
+function debugFeedback(payload) {
+  if (!import.meta.env.DEV) return;
+  try {
+    console.groupCollapsed("[parsons-feedback-debug]");
+    console.table(payload);
+    console.groupEnd();
+  } catch (_) {
+    // Keep debug logging best-effort only.
+  }
+}
+
 function buildWrongFeedbackParts(r) {
   const indentErrors = Array.isArray(r?.indent_errors) ? r.indent_errors : [];
   const hasIndentError = indentErrors.length > 0;
+  const isWrongAnswer = r?.is_correct === false || hasIndentError || Number.isInteger(r?.wrong_index) || (Array.isArray(r?.wrong_indices) && r.wrong_indices.length > 0);
   const wrongIndex = Number.isInteger(r?.wrong_index) ? Number(r.wrong_index) : null;
-  const focusIndex = hasIndentError
-    ? Number(indentErrors[0])
-    : (wrongIndex != null ? wrongIndex : null);
+  const focusIndex = (wrongIndex != null) ? wrongIndex : (hasIndentError ? Number(indentErrors[0]) : null);
   const slotNum = (focusIndex != null && focusIndex >= 0) ? (focusIndex + 1) : null;
+  const backendErrorType = String(r?.error_type || "").trim().toLowerCase();
 
-  const slotLabel = hasIndentError
-    ? `第${slotNum || "?"}格的程式區塊縮排不正確`
-    : (r?.slot_label ? `${String(r.slot_label)}的程式區塊位置不正確` : `第${slotNum || "?"}格的程式區塊位置不正確`);
+  const aiDetail = (r?.ai_feedback_detail && typeof r.ai_feedback_detail === "object") ? r.ai_feedback_detail : {};
+  const aiDiagnosisSummary = String(r?.ai_diagnosis_summary || "").trim();
+  const aiConceptHint = String(aiDetail?.concept_hint || aiDetail?.concept_explanation || r?.hint || "").trim();
+  const aiGuidingQuestion = String(aiDetail?.guiding_question || "").trim();
+  const aiImpactHint = String(aiDetail?.impact || "").trim();
 
-  const startSec = r?.jump?.start ?? r?.review_t ?? null;
-  const endSec = r?.jump?.end ?? null;
-  const reviewRange = (startSec != null && endSec != null)
-    ? `${fmtTime(startSec)}–${fmtTime(endSec)}`
-    : "（未提供）";
-
-  const possibleCauses = Array.isArray(r?.ai_feedback_detail?.possible_causes)
-    ? r.ai_feedback_detail.possible_causes
-        .map((x) => String(x || "").trim())
-        .filter(Boolean)
+  const possibleCauses = Array.isArray(aiDetail?.possible_causes)
+    ? aiDetail.possible_causes.map((x) => String(x || "").trim()).filter(Boolean)
     : [];
-
-  const reflectionQuestions = Array.isArray(r?.ai_feedback_detail?.reflection_questions)
-    ? r.ai_feedback_detail.reflection_questions
-        .map((x) => String(x || "").trim())
-        .filter(Boolean)
-        .slice(0, 3)
+  const reflectionQuestions = Array.isArray(aiDetail?.reflection_questions)
+    ? aiDetail.reflection_questions.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 3)
     : [];
+  if (!reflectionQuestions.length && aiGuidingQuestion) {
+    reflectionQuestions.push(aiGuidingQuestion);
+  }
 
-  const diagnosis = hasIndentError
-    ? `縮排錯誤（共 ${indentErrors.length} 格）`
-    : "程式區塊錯誤";
+  const startSec = Number.isFinite(Number(r?.jump?.start)) ? Number(r.jump.start) : 0;
+  const endSec = Number.isFinite(Number(r?.jump?.end)) ? Number(r.jump.end) : 0;
+  const reviewRange = (endSec > startSec) ? `${fmtTime(startSec)} - ${fmtTime(endSec)}` : "（未提供）";
 
-  const conceptHint = hasIndentError
-    ? "Python 中 if 條件成立時，\n其程式區塊需要使用縮排表示。"
-    : (
-        (r?.ai_feedback_detail?.concept_hint && String(r.ai_feedback_detail.concept_hint).trim()) ||
-        (r?.hint && String(r.hint).trim()) ||
-        (r?.ai_feedback_detail?.concept_explanation && String(r.ai_feedback_detail.concept_explanation).trim()) ||
-        "請重新檢查這一格在整體程式流程中的角色。"
-      );
+  const hasIfElseStructure = (poolBlocks.value || []).some((b) => String(b?.text || "").trim() === "else:")
+    && (poolBlocks.value || []).some((b) => /^\s*if\s+.+:\s*$/.test(String(b?.text || "")));
+  const actualText = String(r?.actual_text || "").trim();
+  const expectedText = String(r?.expected_text || "").trim();
+  const hasElseToken = /(^|\W)else\s*:/i.test(actualText) || /(^|\W)else\s*:/i.test(expectedText);
+  const hasInlineIfPrint = /if\s+.+:\s*print\s*\(/i.test(actualText);
+  const hasConditionToken = /(^|\W)if\s+.+:/i.test(actualText) || /(^|\W)if\s+.+:/i.test(expectedText);
+  const hasLogicPriorityIssue = hasInlineIfPrint || hasConditionToken;
+  const hasMixedLogicAndIndent = hasLogicPriorityIssue && hasIndentError;
 
-  const guidingQuestion1 = hasIndentError
-    ? "這一行程式是否只應在條件成立時執行？"
-    : (reflectionQuestions[0] || ((r?.ai_feedback_detail?.guiding_question && String(r.ai_feedback_detail.guiding_question).trim()) || "這一格程式在流程中的主要目的為何？"));
+  let errorClass = (hasIfElseStructure && hasElseToken && !hasLogicPriorityIssue)
+    ? "branch_error"
+    : (hasLogicPriorityIssue
+        ? "logic_error"
+        : (hasIndentError ? "indentation_error" : "logic_error"));
 
-  const guidingQuestion2 = hasIndentError
-    ? "如果沒有縮排，程式會在哪些情況執行？"
-    : (reflectionQuestions[1] || (possibleCauses[0] ? `你覺得這次是否出現這個狀況：${possibleCauses[0]}？` : "這行程式放在目前位置，會不會提早或延後執行？"));
+  // 後端已完成主錯誤判定時，優先採用後端類型，避免前端啟發式誤判。
+  if (backendErrorType === "syntax") {
+    errorClass = "indentation_error";
+  } else if (backendErrorType === "structure") {
+    errorClass = "structure_error";
+  } else if (backendErrorType === "logic") {
+    if (hasIfElseStructure && hasElseToken) errorClass = "branch_error";
+    else if (hasLogicPriorityIssue) errorClass = "logic_error";
+    else errorClass = "logic_error";
+  }
+
+  let slotLabel = `第${slotNum || "?"}格的條件邏輯錯誤`;
+  if (hasMixedLogicAndIndent) {
+    slotLabel = `第${slotNum || "?"}格的條件判斷錯誤（含縮排）`;
+  } else if (errorClass === "indentation_error") {
+    slotLabel = `第${slotNum || "?"}格的縮排錯誤`;
+  } else if (errorClass === "structure_error") {
+    slotLabel = `第${slotNum || "?"}格的結構順序錯誤`;
+  } else if (errorClass === "branch_error") {
+    slotLabel = `第${slotNum || "?"}格的 if-else 結構錯誤`;
+  }
+
+  let diagnosis = "邏輯錯誤";
+  if (hasMixedLogicAndIndent) {
+    diagnosis = "條件判斷錯誤（並伴隨縮排問題）";
+  } else if (errorClass === "indentation_error") {
+    diagnosis = "縮排錯誤";
+  } else if (errorClass === "structure_error") {
+    diagnosis = "結構順序錯誤";
+  } else if (errorClass === "branch_error") {
+    diagnosis = "if-else 結構錯誤";
+  }
+
+  let conceptHint = "請檢查條件成立時應輸出的內容是否正確，並確認輸出語句是否放在正確的判斷區塊中。";
+  if (hasMixedLogicAndIndent) {
+    conceptHint = "請檢查條件成立時應輸出的內容是否正確，並確認輸出語句是否放在正確的判斷區塊中。\n另外，這行程式也需要正確縮排，才能表示它屬於該判斷區塊。";
+  } else if (errorClass === "indentation_error") {
+    conceptHint = "在 Python 中，if 判斷成立時需要透過縮排表示該區塊的程式碼。\n請檢查輸出語句是否應該放在 if 判斷內部。";
+  } else if (errorClass === "structure_error") {
+    conceptHint = "請先確認主程式與函式呼叫的先後順序，避免把定義或呼叫放錯位置。";
+  } else if (errorClass === "branch_error") {
+    conceptHint = "if 與 else 應該構成完整的條件分支結構，當條件不成立時，程式會執行 else 區塊。";
+  }
+  if (aiConceptHint) {
+    conceptHint = aiConceptHint;
+  }
+
+  let guidingQuestion1 = "當條件成立時，應該輸出哪一句訊息？";
+  if (hasMixedLogicAndIndent) {
+    guidingQuestion1 = "當條件成立時，你希望輸出哪一句訊息？這句輸出目前是否放在正確區塊中？";
+  } else if (errorClass === "indentation_error") {
+    guidingQuestion1 = "這行輸出語句是否應該在 if 判斷成立時才執行？";
+  } else if (errorClass === "structure_error") {
+    guidingQuestion1 = "這一行應該先於哪一行執行？目前順序是否顛倒？";
+  }
+  if (aiGuidingQuestion) {
+    guidingQuestion1 = aiGuidingQuestion;
+  }
+
+  let guidingQuestion2 = "目前的輸出語句是否放在正確的 if / else 判斷區塊中？";
+  if (hasMixedLogicAndIndent) {
+    guidingQuestion2 = "如果這行沒有正確縮排，是否會在不該執行時也被執行？";
+  } else if (errorClass === "branch_error") {
+    guidingQuestion2 = "當條件不成立時，哪一句訊息應該放在 else 區塊？";
+  } else if (errorClass === "indentation_error") {
+    guidingQuestion2 = "如果不縮排，這行程式會不會在不該執行時也被執行？";
+  } else if (errorClass === "structure_error") {
+    guidingQuestion2 = "若把這行放在目前位置，是否會造成函式尚未定義就被呼叫？";
+  }
+
+  const impactHint = (errorClass === "branch_error" || hasMixedLogicAndIndent)
+    ? "這個錯誤可能會影響後續程式區塊的排列結果，請先從主錯誤格開始調整，並留意 if / else 區塊中的縮排"
+    : "這個錯誤可能會影響後續程式區塊的排列結果，請先從主錯誤格開始調整。";
+
+  debugFeedback({
+    focusIndex,
+    wrongIndex,
+    hasIndentError,
+    indentErrorCount: indentErrors.length,
+    hasIfElseStructure,
+    errorClass,
+    hasElseToken,
+    hasInlineIfPrint,
+    hasConditionToken,
+    hasMixedLogicAndIndent,
+    diagnosis,
+    slotLabel,
+    actualText,
+    expectedText,
+  });
 
   return {
+    focusIndex,
     slotLabel,
     diagnosis,
+    errorClass,
     conceptHint,
     reflectionQuestions: [guidingQuestion1, guidingQuestion2],
+    impactHint,
     reviewRange,
     startSec,
     endSec,
@@ -584,6 +713,57 @@ function buildWrongFeedback(r) {
     "建議回看影片",
     parts.reviewRange,
   ].join("\n");
+}
+
+function getSlotNumberFromLabel(label) {
+  const m = String(label || "").match(/第\s*(\d+)\s*格/);
+  return m ? Number(m[1]) : null;
+}
+
+function buildFeedbackHeadline(parts) {
+  const n = getSlotNumberFromLabel(parts?.slotLabel);
+  const numText = Number.isFinite(n) ? `第${n}格` : "此格";
+  if (String(parts?.slotLabel || "").includes("含縮排")) {
+    return `${numText}有錯誤（條件判斷 + 縮排）`;
+  }
+  return `${numText}有錯誤（${parts?.diagnosis || "邏輯錯誤"}）`;
+}
+
+function buildFeedbackLocation(parts) {
+  const n = getSlotNumberFromLabel(parts?.slotLabel);
+  const numText = Number.isFinite(n) ? `第${n}格` : "此格";
+  if (String(parts?.slotLabel || "").includes("條件")) {
+    return `${numText}（if 判斷區塊）`;
+  }
+  return `${numText}（程式區塊）`;
+}
+
+function buildFeedbackReviewFocus(parts) {
+  if (String(parts?.slotLabel || "").includes("條件") && String(parts?.slotLabel || "").includes("縮排")) {
+    return "if 與縮排";
+  }
+  if (String(parts?.slotLabel || "").includes("縮排")) {
+    return "縮排層級與執行範圍";
+  }
+  if (String(parts?.slotLabel || "").includes("條件")) {
+    return "條件判斷流程";
+  }
+  return "程式區塊流程";
+}
+
+function buildHintQuestion(parts) {
+  const q1 = Array.isArray(parts?.reflectionQuestions) ? String(parts.reflectionQuestions[0] || "").trim() : "";
+  if (q1) return q1;
+  if (String(parts?.slotLabel || "").includes("條件") && String(parts?.slotLabel || "").includes("縮排")) {
+    return "這一行輸出應該在 if 區塊內嗎？";
+  }
+  if (String(parts?.slotLabel || "").includes("條件")) {
+    return "這一行應該屬於條件判斷區塊嗎？";
+  }
+  if (String(parts?.slotLabel || "").includes("縮排")) {
+    return "這一行是否需要再往右縮排一層？";
+  }
+  return "這一行在目前流程中的位置正確嗎？";
 }
 
 async function resolveNextVideoInUnit(curVideoId) {
@@ -657,18 +837,55 @@ function goNextUnit() {
 
 function openFeedbackModal(r, taskId) {
   const parts = buildWrongFeedbackParts(r || {});
+  primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
   feedbackModal.open = true;
+  feedbackModal.headline = buildFeedbackHeadline(parts);
+  feedbackModal.locationText = buildFeedbackLocation(parts);
+  feedbackModal.hintQuestion = buildHintQuestion(parts);
   feedbackModal.slotLabel = parts.slotLabel;
   feedbackModal.diagnosis = parts.diagnosis;
   feedbackModal.conceptHint = parts.conceptHint;
   feedbackModal.reflectionQuestions = parts.reflectionQuestions;
+  feedbackModal.impactHint = parts.impactHint;
   feedbackModal.reviewRange = parts.reviewRange;
+  feedbackModal.reviewFocus = buildFeedbackReviewFocus(parts);
+  feedbackModal.hintOpen = false;
+  feedbackModal.reviewOpen = false;
   feedbackModal.start = parts.startSec;
   feedbackModal.end = parts.endSec;
   feedbackModal.jumpVideoId = String(r?.jump?.video_id || "");
   feedbackModal.attemptId = String(r?.attempt_id || "");
   feedbackModal.reviewAttemptId = String(r?.review_attempt_id || r?.attempt_id || "");
   feedbackModal.taskId = String(taskId || "");
+  feedbackModal.hintClicked = false;
+  feedbackModal.videoClicked = false;
+  feedbackModal.debugText = "";
+
+  if (import.meta.env.DEV) {
+    const src = String(r?.segment_source || "");
+    const concept = String(r?.segment_concept || "");
+    const wrongIdx = Number.isFinite(Number(r?.wrong_index)) ? Number(r.wrong_index) : null;
+    const traceArr = Array.isArray(r?.alignment_trace) ? r.alignment_trace : [];
+    const traceText = traceArr.map((x) => {
+      const step = String(x?.step || "?");
+      const fbSrc = String(x?.fallback_source || "").trim();
+      const reason = String(x?.reason || x?.segment_source || "");
+      if (fbSrc) {
+        return `${step}:${reason || "n/a"}(${fbSrc})`;
+      }
+      return reason ? `${step}:${reason}` : step;
+    }).join(" | ");
+    feedbackModal.debugText = `debug src=${src || "n/a"}, concept=${concept || "n/a"}, wrong_index=${wrongIdx != null ? wrongIdx : "n/a"}${traceText ? `\ntrace ${traceText}` : ""}`;
+  }
+
+  debugFeedback({
+    modalOpen: true,
+    taskId: String(taskId || ""),
+    primaryWrongIndex: primaryWrongIndex.value,
+    wrongIndices: (wrongIndices.value || []).join(","),
+    modalDiagnosis: feedbackModal.diagnosis,
+    modalSlotLabel: feedbackModal.slotLabel,
+  });
 }
 
 async function dismissFeedbackModal() {
@@ -676,6 +893,11 @@ async function dismissFeedbackModal() {
     await sendChoice(feedbackModal.attemptId, "no");
   }
   feedbackModal.open = false;
+  feedbackModal.hintOpen = false;
+  feedbackModal.reviewOpen = false;
+  feedbackModal.hintClicked = false;
+  feedbackModal.videoClicked = false;
+  feedbackModal.debugText = "";
 }
 
 async function goReviewFromModal() {
@@ -694,6 +916,8 @@ async function goReviewFromModal() {
   const taskId = feedbackModal.taskId;
 
   feedbackModal.open = false;
+  feedbackModal.hintClicked = false;
+  feedbackModal.videoClicked = false;
 
   router.push({
     path: `/learn/video/${jumpVideoId}`,
@@ -707,7 +931,35 @@ async function goReviewFromModal() {
   });
 }
 
-async function sendChoice(attempt_id, choice) {
+async function onToggleHintOpen() {
+  const nextOpen = !feedbackModal.hintOpen;
+  feedbackModal.hintOpen = nextOpen;
+  if (nextOpen && !feedbackModal.hintClicked && feedbackModal.attemptId) {
+    feedbackModal.hintClicked = true;
+    await sendChoice(feedbackModal.attemptId, "no", { click_type: "hint" });
+  }
+}
+
+async function onToggleReviewOpen() {
+  const nextOpen = !feedbackModal.reviewOpen;
+  feedbackModal.reviewOpen = nextOpen;
+  if (nextOpen && !feedbackModal.videoClicked && feedbackModal.attemptId) {
+    feedbackModal.videoClicked = true;
+    await sendChoice(feedbackModal.attemptId, "no", { click_type: "video" });
+  }
+}
+
+async function openReviewFromHint() {
+  if (!feedbackModal.reviewOpen) {
+    feedbackModal.reviewOpen = true;
+  }
+  if (!feedbackModal.videoClicked && feedbackModal.attemptId) {
+    feedbackModal.videoClicked = true;
+    await sendChoice(feedbackModal.attemptId, "no", { click_type: "video" });
+  }
+}
+
+async function sendChoice(attempt_id, choice, extra = {}) {
   if (!attempt_id) return;
   try {
     await fetch(`${API_BASE}/api/parsons/review_choice`, {
@@ -716,7 +968,8 @@ async function sendChoice(attempt_id, choice) {
       body: JSON.stringify({
         attempt_id,
         student_id: (localStorage.getItem("student_id") || ""),
-        student_choice: choice
+        student_choice: choice,
+        ...extra,
       }),
     });
   } catch (_) {}
@@ -730,7 +983,12 @@ function savePracticeState(extra = {}) {
       task_id: task.value?.task_id || task.value?._id || "",
       filled_map: (templateSlots.value || []).map((s) => filled[String(s.slot)]?.id || null),
       slot_indent_map: JSON.parse(JSON.stringify(slotIndentLevel || {})),
-      wrong_indices: Array.isArray(wrongIndices.value) ? wrongIndices.value : [],
+      wrong_indices: Array.isArray(wrongIndices.value)
+        ? wrongIndices.value.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+        : [],
+      primary_wrong_index: Number.isFinite(Number(primaryWrongIndex.value))
+        ? Number(primaryWrongIndex.value)
+        : null,
       saved_at: Date.now(),
       ...extra,
     };
@@ -782,7 +1040,18 @@ function restorePracticeStateIfMatch(loadedTask) {
       if (b && slotKey != null) filled[String(slotKey)] = normalizeFilledBlock(b);
     });
 
-    wrongIndices.value = Array.isArray(st.wrong_indices) ? st.wrong_indices : [];
+    // 回到同題時保留上次錯誤標記，直到學生修正正確為止。
+    const restoredWrong = Array.isArray(st.wrong_indices)
+      ? st.wrong_indices.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+      : [];
+    wrongIndices.value = restoredWrong;
+
+    const restoredPrimary = Number(st.primary_wrong_index);
+    if (Number.isFinite(restoredPrimary)) {
+      primaryWrongIndex.value = restoredPrimary;
+    } else {
+      primaryWrongIndex.value = restoredWrong.length ? restoredWrong[0] : null;
+    }
 
     try {
       const m = st.slot_indent_map || {};
@@ -816,6 +1085,7 @@ async function submit() {
   state.err = "";
   result.value = null;
   wrongIndices.value = [];
+  primaryWrongIndex.value = null;
 
   // 每次送出前先清空 AI 回饋
   aiFeedbackDetail.value = null;
@@ -966,6 +1236,9 @@ async function submit() {
       ? r.wrong_indices
       : (r?.wrong_index != null ? [r.wrong_index] : []);
 
+    const parts = buildWrongFeedbackParts(r || {});
+    primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
+
     if (r?.ok && r?.is_correct === true) {
       localStorage.removeItem(PRACTICE_STATE_KEY);
       localStorage.removeItem(RESTORE_ONCE_KEY);
@@ -1008,10 +1281,19 @@ function normalizeTaskPayload(apiJson) {
     }
   }
 
+  const hideSemanticZh = !!t.hide_semantic_zh;
+
   let pool = Array.isArray(t.pool) ? t.pool : [];
+  const rawDist = Array.isArray(t.distractor_blocks) ? t.distractor_blocks : [];
+  const hiddenDistractorIds = new Set(
+    rawDist
+      .filter((b) => b && b.enabled === false)
+      .map((b) => String(b?.id ?? b?._id ?? ""))
+      .filter(Boolean)
+  );
   if (!pool.length) {
     const core = Array.isArray(t.solution_blocks) ? t.solution_blocks : [];
-    const dist = Array.isArray(t.distractor_blocks) ? t.distractor_blocks : [];
+    const dist = rawDist.filter((b) => b?.enabled !== false);
     const blocks = Array.isArray(t.blocks) ? t.blocks : [];
     pool = (core.length || dist.length) ? [...core, ...dist] : blocks;
   }
@@ -1020,9 +1302,13 @@ function normalizeTaskPayload(apiJson) {
     id: b?.id != null ? String(b.id) : `b${i + 1}`,
     text: b?.text != null ? String(b.text) : "",
     type: b?.type ? String(b.type) : (b?.is_distractor ? "distractor" : "core"),
-    meaning_zh: b?.meaning_zh != null ? String(b.meaning_zh) : (b?.semantic_zh != null ? String(b.semantic_zh) : ""),
+    meaning_zh: hideSemanticZh ? "" : (b?.meaning_zh != null ? String(b.meaning_zh) : (b?.semantic_zh != null ? String(b.semantic_zh) : "")),
     ...b,
   }));
+
+  if (hiddenDistractorIds.size) {
+    pool = pool.filter((b) => !hiddenDistractorIds.has(String(b?.id ?? "")));
+  }
 
   let slots = Array.isArray(t.template_slots) ? t.template_slots : [];
   if (!slots.length) {
@@ -1034,13 +1320,30 @@ function normalizeTaskPayload(apiJson) {
       label: `第 ${idx + 1} 格`,
     }));
   } else {
+    const _poolMap = new Map((pool || []).map((b) => [String(b?.id ?? ""), b]));
+    const _solMap = new Map(((Array.isArray(t.solution_blocks) ? t.solution_blocks : []) || []).map((b) => [String(b?.id ?? ""), b]));
+
     slots = slots.map((s, idx) => ({
-      slot: s?.slot != null ? String(s.slot) : `s${idx + 1}`,
-      label: s?.label != null ? String(s.label) : `第 ${idx + 1} 格`,
       ...s,
+      slot: s?.slot != null ? String(s.slot) : `s${idx + 1}`,
+      // 學生端避免暴露 template_slots 的語意提示，統一顯示中性槽位名稱。
+      label: `第 ${idx + 1} 格`,
+      expected_meaning_zh: (() => {
+        if (hideSemanticZh) return "";
+        const eid = s?.expected_id != null ? String(s.expected_id) : "";
+        if (!eid) return "";
+        const fromSol = _solMap.get(eid) || {};
+        const fromPool = _poolMap.get(eid) || {};
+        return String(
+          fromSol.meaning_zh || fromSol.semantic_zh || fromSol.zh ||
+          fromPool.meaning_zh || fromPool.semantic_zh || fromPool.zh ||
+          ""
+        );
+      })(),
     }));
   }
 
+  t.hide_semantic_zh = hideSemanticZh;
   t.template_slots = slots;
   return { taskObj: t, pool, slots };
 }
@@ -1102,6 +1405,7 @@ async function loadTask() {
       const norm = normalizeTaskPayload(r);
       task.value = norm.taskObj;
       poolBlocks.value = norm.pool;
+      teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
       // 前後測不顯示中文提示：清空 label
       templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
 
@@ -1127,6 +1431,7 @@ async function loadTask() {
     const norm = normalizeTaskPayload(r);
     task.value = norm.taskObj;
     poolBlocks.value = norm.pool;
+    teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
     templateSlots.value = norm.slots;
 
     const restored = restorePracticeStateIfMatch(task.value);
@@ -1160,7 +1465,15 @@ onMounted(() => {
       const k = pickTargetSlotKey();
       if (!k) return;
       e.preventDefault();
-      const changed = indentBoxPx(k, +INDENT_STEP_PX);
+      const cur = clampIndentPx(slotIndentLevel[String(k)] || 0);
+      const next = cur + INDENT_STEP_PX;
+      const wrapped = next > (INDENT_STEP_PX * INDENT_MAX_LEVEL);
+      const changed = wrapped
+        ? (() => {
+            slotIndentLevel[String(k)] = 0;
+            return cur !== 0;
+          })()
+        : indentBoxPx(k, +INDENT_STEP_PX);
       if (changed) applyIndentStylesToDOM();
       return;
     }
@@ -1341,6 +1654,30 @@ watch(
   box-shadow: 0 0 0 2px rgba(185, 28, 28, .12);
 }
 
+.cloze-row.affected .hint{
+  background: linear-gradient(90deg, #ffd888 0%, #ffc55a 100%);
+  color: #553a00;
+}
+.cloze-row.affected .blank{
+  border-color: #d97706 !important;
+  box-shadow: 0 0 0 2px rgba(217, 119, 6, .24);
+}
+
+.hint-affected-icon{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: 6px;
+  border-radius: 999px;
+  background: #b45309;
+  color: #fff7ed;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+}
+
 .pool{ display:grid; gap:10px; }
 .pill{
   padding: 13px 16px;
@@ -1421,6 +1758,11 @@ watch(
   margin-bottom: 10px;
 }
 
+.fb-divider{
+  border-top: 1px dashed #cbd5e1;
+  margin: 10px 0;
+}
+
 .fb-title.success{
   color: #047857;
 }
@@ -1474,6 +1816,17 @@ watch(
   color: #0f172a;
 }
 
+.fb-note{
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #7c2d12;
+  font-size: 14px;
+  font-weight: 800;
+}
+
 .fb-review{
   background: #f0f9ff;
   border-color: #bae6fd;
@@ -1486,11 +1839,29 @@ watch(
   letter-spacing: 0.4px;
 }
 
+.fb-focus{
+  margin-top: 8px;
+  font-size: 14px;
+  font-weight: 800;
+  color: #1e3a8a;
+}
+
+.fb-more{
+  margin-top: 10px;
+  font-size: 14px;
+  font-weight: 800;
+  color: #334155;
+}
+
 .fb-actions{
   margin-top: 14px;
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.fb-actions.pick{
+  justify-content: flex-start;
 }
 
 .btn.ghost{

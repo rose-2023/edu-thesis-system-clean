@@ -117,7 +117,7 @@
 
           <div class="unitHeader">
             <div class="unitBadge">課程單元</div>
-            <div class="unitName">{{ u.unit }} {{ u.name }}</div>
+            <div class="unitName">{{ u.name }}</div>
           </div>
 
           <div class="unitFooter">
@@ -194,6 +194,51 @@ const postDone = computed(() => {
 // ==============================
 // API：載入首頁資料（單元進度 + 後測狀態）
 // ==============================
+function normalizeUnitPrefix(rawUnit) {
+  const raw = String(rawUnit || "").trim();
+  const m = raw.match(/^(U\d+)/i);
+  return m ? m[1].toUpperCase() : raw.toUpperCase();
+}
+
+function unitDisplayName(rawUnit) {
+  const raw = String(rawUnit || "").trim();
+  const prefix = normalizeUnitPrefix(raw);
+  const m = raw.match(/^(U\d+)(?:[-_ ]*([A-Za-z]+))?(.*)$/i);
+  const subTag = (m?.[2] || "").toLowerCase();
+  const tail = String(m?.[3] || "").trim();
+
+  // 先保留同一主單元下的子題型差異（但不顯示 Ux- 代碼）
+  if (prefix === "U3") {
+    if (subTag === "for") return "for 迴圈";
+    if (subTag === "loop") return "迴圈觀念解析";
+  }
+  if (prefix === "U2") {
+    if (subTag === "if") return "if 條件判斷";
+    if (subTag === "ifelse") return "if-else 條件判斷";
+    if (subTag === "elif") return "elif 條件判斷";
+  }
+  if (prefix === "U1" && subTag === "io") {
+    return "輸入輸出";
+  }
+
+  // 若原字串含中文尾綴（例如 U7-Function函數觀念解析），優先用中文尾綴
+  if (tail) {
+    const cleanTail = tail.replace(/^[-_\s]+/, "").trim();
+    if (cleanTail) return cleanTail;
+  }
+
+  const nameMap = {
+    U1: "輸入輸出",
+    U2: "條件判斷",
+    U3: "迴圈觀念解析",
+    U4: "巢狀迴圈",
+    U5: "不定數迴圈",
+    U6: "串列與字典",
+    U7: "函數觀念解析",
+  };
+  return nameMap[prefix] || String(rawUnit || "").trim();
+}
+
 async function loadHomeData() {
   try {
     const student_id =
@@ -215,21 +260,17 @@ async function loadHomeData() {
 
     // 1) units
     // 後端會回：[{unit, progress, total_videos, done_videos}]
-    const nameMap = {
-      U1: "輸入輸出",
-      U2: "條件判斷",
-      U3: "迴圈觀念解析",
-      U4: "函式",
-      U5: "串列與字典",
-    };
     const themePool = ["blue", "green", "purple", "orange"];
 
     units.value = (data.units || []).map((u, idx) => ({
       unit: u.unit,
-      name: nameMap[u.unit] || u.unit,
+      name: unitDisplayName(u.unit),
       progress: Number(u.progress || 0),
       theme: themePool[idx % themePool.length],
     }));
+
+    const firstOngoing = units.value.find((u) => Number(u.progress || 0) < 100);
+    ongoingUnit.value = firstOngoing ? firstOngoing.name : "已完成";
 
     // 2) 點點（用平均 progress 估算）
     if (units.value.length > 0) {

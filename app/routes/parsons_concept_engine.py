@@ -155,7 +155,7 @@ SCENARIO_POOL: Dict[str, List[str]] = {
     ],
 
     # -------------------------
-    # U5: Function
+    # U7: Function
     # -------------------------
     "function_basic": [
         "撰寫函式顯示訊息",

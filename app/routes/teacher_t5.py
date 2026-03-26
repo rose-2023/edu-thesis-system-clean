@@ -112,10 +112,14 @@ def questions():
     sort = (request.args.get("sort", "newest") or "newest").strip().lower()
 
     vid = _oid(video_id)
-    if not vid:
+    if not video_id:
         return jsonify({"ok": False, "error": "invalid video_id"}), 400
 
-    q = {"video_id": vid}
+    # 相容手動匯入資料：video_id 可能是 ObjectId、字串，或寫在 video_id_str。
+    if vid:
+        q = {"$or": [{"video_id": vid}, {"video_id": video_id}, {"video_id_str": video_id}]}
+    else:
+        q = {"$or": [{"video_id": video_id}, {"video_id_str": video_id}]}
 
     # 排序
     sort_dir = -1 if sort == "newest" else 1
@@ -325,6 +329,20 @@ def get_question():
         "constraints": t.get("constraints", None),
         "rule_check": t.get("rule_check", None),
         "source_subtitle": t.get("source_subtitle", None),
+        "key_sentences": t.get("key_sentences", []) or [],
+        "key_sentences_typed": t.get("key_sentences_typed", []) or [],
+        "selector_meta": (
+            t.get("selector_meta")
+            or ((t.get("ai_debug") or {}).get("generation_debug") or {}).get("selector_quality_final")
+            or {}
+        ),
+        "unified_policy_meta": (
+            t.get("unified_policy_meta")
+            or ((t.get("ai_debug") or {}).get("generation_debug") or {}).get("unified_policy_meta")
+            or {}
+        ),
+        "function_profile": t.get("function_profile", {}) or {},
+        "alignment_confidence": t.get("alignment_confidence", {}) or {},
         "subtitle_range": {
             "start_index": (t.get("source_subtitle") or {}).get("start_index"),
             "end_index": (t.get("source_subtitle") or {}).get("end_index"),
@@ -336,6 +354,7 @@ def get_question():
         },
 
         "template_slots": template_slots,  # [新增] 方便老師端/除錯需要
+        "hide_semantic_zh": bool(t.get("hide_semantic_zh", False)),
         # 老師審核
         "review_tags": t.get("review_tags", []) or [],
         "review_note": t.get("review_note", "") or "",
@@ -361,6 +380,7 @@ def review_save():
     review_tags = body.get("review_tags") or []
     review_note = body.get("review_note") or ""
     distractor_keep = body.get("distractor_keep") or {}
+    hide_semantic_zh = body.get("hide_semantic_zh", None)
 
     # 1) 存老師審核欄位（不改 schema：只是加/更新欄位）
     update_doc = {
@@ -380,6 +400,10 @@ def review_save():
             if bid in distractor_keep:
                 b["enabled"] = bool(distractor_keep.get(bid))
         update_doc["distractor_blocks"] = dblocks
+
+    # 3) 中文語意提示顯示設定（老師端/學生端共用）
+    if hide_semantic_zh is not None:
+        update_doc["hide_semantic_zh"] = bool(hide_semantic_zh)
 
     db.parsons_tasks.update_one({"_id": tid}, {"$set": update_doc})
     return jsonify({"ok": True})

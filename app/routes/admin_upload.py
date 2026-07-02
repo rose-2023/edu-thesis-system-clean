@@ -785,13 +785,19 @@ def list_videos():
         q = {}
 
         if status == "deleted":
-            q["deleted"] = True
+            q["$or"] = [{"deleted": True}, {"is_deleted": True}]
         elif status == "inactive":
-            q["deleted"] = False
-            q["active"] = False
+            q["$and"] = [
+                {"deleted": {"$ne": True}},
+                {"is_deleted": {"$ne": True}},
+                {"active": False},
+            ]
         else:
-            q["deleted"] = False
-            q["active"] = True
+            q["$and"] = [
+                {"deleted": {"$ne": True}},
+                {"is_deleted": {"$ne": True}},
+                {"active": True},
+            ]
 
         if q_unit:
             q["unit"] = q_unit
@@ -821,6 +827,7 @@ def list_videos():
 
             v.setdefault("active", True)
             v.setdefault("deleted", False)
+            v.setdefault("is_deleted", False)
             v.setdefault("subtitle_verified", False)
             v.setdefault("subtitle_current_version", 1)
             v.setdefault("subtitle_versions_count", 1)

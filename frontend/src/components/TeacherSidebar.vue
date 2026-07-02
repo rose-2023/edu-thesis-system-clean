@@ -21,6 +21,7 @@
 
 <script setup>
 import { useRouter } from "vue-router";
+import { logoutCurrentSession } from "../sessionAuth";
 
 defineProps({
   active: {
@@ -35,10 +36,9 @@ function go(path) {
   router.push(path);
 }
 
-function logout() {
-  localStorage.removeItem("user");
-  localStorage.removeItem("token");
-  router.push("/login");
+async function logout() {
+  await logoutCurrentSession();
+  router.replace("/login");
 }
 </script>
 

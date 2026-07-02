@@ -1,14 +1,27 @@
+import os
+
 from dotenv import load_dotenv
+
+
 load_dotenv()
+
 from app import create_app
+
+
 app = create_app()
 
-print("=== ROUTES CONTAIN test/submit ===")
-for r in app.url_map.iter_rules():
-    if "test/submit" in str(r.rule):
-        print(r, r.methods)
-print("=== END ===")
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=True)
+    try:
+        from waitress import serve
+    except ImportError as exc:
+        raise SystemExit(
+            "Waitress is required. Run: pip install -r requirements.txt"
+        ) from exc
 
+    serve(
+        app,
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "5000")),
+        threads=max(4, int(os.environ.get("WAITRESS_THREADS", "8"))),
+    )

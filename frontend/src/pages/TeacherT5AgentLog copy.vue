@@ -4,7 +4,7 @@
     <aside class="sidebar">
       <div class="profile">
         <div class="avatar"></div>
-        <div class="hello">您好，老師</div>
+        <div class="hello">您好，管理員</div>
       </div>
 
       <nav class="menu">

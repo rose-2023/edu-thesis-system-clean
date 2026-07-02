@@ -110,7 +110,7 @@ import { ref, reactive, computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import TeacherSidebar from "../components/TeacherSidebar.vue";
 
-const API_BASE = "http://127.0.0.1:5000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
 const router = useRouter();
 
 const overview = reactive({ weekly_sessions: 0, avg_accuracy: 0, top_misconceptions: [] });

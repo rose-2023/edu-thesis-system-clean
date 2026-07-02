@@ -846,6 +846,7 @@ def parse_srt_segments(srt_text: str) -> list:
     while i < len(lines):
         line = lines[i].strip()
         if line.isdigit():
+            seg_id = int(line)
             i += 1
             if i >= len(lines):
                 break
@@ -862,7 +863,7 @@ def parse_srt_segments(srt_text: str) -> list:
                 i += 1
             txt = " ".join(text_buf).strip()
             if txt:
-                segs.append({"start": start, "end": end, "text": txt})
+                segs.append({"id": seg_id, "start": start, "end": end, "text": txt})
         i += 1
     return segs
 
@@ -2696,7 +2697,15 @@ def ai_generate_condition_from_subtitle(subtitle_text: str, unit: str, video_tit
 # ========================
 # ✅ AI Generate IO from Subtitle (with constraints, traceability, rule check, anti-copy guard)
 # ========================
-def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str, teacher_description: str = "", level: str = "L1", stable_mode: bool = False) -> Dict[str, Any]:
+def ai_generate_io_from_subtitle(
+    subtitle_text: str,
+    unit: str,
+    video_title: str,
+    teacher_description: str = "",
+    level: str = "L1",
+    stable_mode: bool = False,
+    alignment_teacher_description: Optional[str] = None,
+) -> Dict[str, Any]:
     # [新增] Debug：先印目前 AI 環境狀態
     print("\n========== AI DEBUG START ==========")
     print("[AI DEBUG] unit =", unit)
@@ -2881,7 +2890,8 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
         unit,
     )
 
-    align_ok, missing_kws = _teacher_alignment_check(teacher_description, question_text, solution_lines)
+    alignment_text = teacher_description if alignment_teacher_description is None else alignment_teacher_description
+    align_ok, missing_kws = _teacher_alignment_check(alignment_text, question_text, solution_lines)
     concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
         plan,
         trace.get("keywords", []),
@@ -2931,7 +2941,7 @@ def ai_generate_io_from_subtitle(subtitle_text: str, unit: str, video_title: str
             unit,
         )
         rc = build_rule_check(solution_lines, constraints)
-        align_ok, missing_kws = _teacher_alignment_check(teacher_description, question_text, solution_lines)
+        align_ok, missing_kws = _teacher_alignment_check(alignment_text, question_text, solution_lines)
         concept_ok, concept_missing, _required_concepts = _subtitle_concept_alignment_check(
             plan,
             trace.get("keywords", []),
@@ -4701,6 +4711,27 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
     subtitle_path = pick_latest_subtitle_path(video_doc, video_id_str)
     sub_text = read_subtitle_text(subtitle_path)
 
+    formal_chapters = video_doc.get("concept_chapters_formal") or video_doc.get("teacher_concept_chapters") or []
+    formal_version_key = str(video_doc.get("teacher_concept_version_key") or "").strip().lower()
+    formal_chapter_source = "teacher_confirmed_formal" if formal_chapters else ""
+
+    if not formal_chapters:
+        vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
+        q = {
+            "$and": [
+                {"$or": [
+                    {"concept_chapters_formal": {"$exists": True, "$ne": []}},
+                    {"teacher_concept_chapters": {"$exists": True, "$ne": []}},
+                ]},
+                ({"$or": [{"video_id": vid_oid}, {"video_id_str": video_id_str}]} if vid_oid else {"video_id_str": video_id_str}),
+            ]
+        }
+        latest_formal = db.parsons_tasks.find_one(q, sort=[("updated_at", -1), ("created_at", -1)])
+        if latest_formal:
+            formal_chapters = latest_formal.get("concept_chapters_formal") or latest_formal.get("teacher_concept_chapters") or []
+            formal_version_key = str(latest_formal.get("teacher_concept_version_key") or latest_formal.get("concept_align_version_key") or "").strip().lower()
+            formal_chapter_source = str(latest_formal.get("concept_align_source") or latest_formal.get("chapter_source") or "teacher_confirmed_formal").strip().lower()
+
     # 若字幕檔讀取失敗，回退到資料庫中的 preview/text/blocks，避免 AI 在空字幕下退化。
     if not (sub_text or "").strip():
         sub_text = (
@@ -4720,16 +4751,19 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
     vid_oid = video_doc.get("_id") or maybe_oid(video_id_str)
     video_id_match = {"$or": [{"video_id": video_id_str}] + ([{"video_id": vid_oid}] if vid_oid else [])}
     teacher_description = ""
+    teacher_alignment_description = ""
+    teacher_description_source = "none"
     if video_doc:
         teacher_description = (video_doc.get("description") or "").strip()
+        if teacher_description:
+            teacher_alignment_description = teacher_description
+            teacher_description_source = "manual"
         # ✅ 修正：若老師沒填 description，改用 video_title 作為題目主題方向
         # 這樣影片標題「直角三角形」才能被 has_teacher_desc 路徑正確使用
         if not teacher_description and video_title:
-            teacher_description = (
-        video_doc.get("description")
-        or video_doc.get("title")
-        or ""
-        ).strip()
+            teacher_description = video_title.strip()
+            teacher_alignment_description = ""
+            teacher_description_source = "video_title_hint"
 
     db.parsons_tasks.update_many({**video_id_match, "level": level, "active": True}, {"$set": {"active": False}})
 
@@ -4749,7 +4783,15 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         if constraints.get("unit_type") == "condition":
             ai = ai_generate_condition_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=stable_mode)
         elif constraints.get("unit_type") == "io":
-            ai = ai_generate_io_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=stable_mode)
+            ai = ai_generate_io_from_subtitle(
+                sub_text,
+                unit,
+                video_title,
+                level=level,
+                teacher_description=teacher_description,
+                stable_mode=stable_mode,
+                alignment_teacher_description=teacher_alignment_description,
+            )
         else:
             ai = ai_generate_parsons_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=stable_mode)
 
@@ -4762,7 +4804,15 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
                 if constraints.get("unit_type") == "condition":
                     ai_retry = ai_generate_condition_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=True)
                 elif constraints.get("unit_type") == "io":
-                    ai_retry = ai_generate_io_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=True)
+                    ai_retry = ai_generate_io_from_subtitle(
+                        sub_text,
+                        unit,
+                        video_title,
+                        level=level,
+                        teacher_description=teacher_description,
+                        stable_mode=True,
+                        alignment_teacher_description=teacher_alignment_description,
+                    )
                 else:
                     ai_retry = ai_generate_parsons_from_subtitle(sub_text, unit, video_title, level=level, teacher_description=teacher_description, stable_mode=True)
 
@@ -4793,11 +4843,11 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
             if isinstance(b, dict)
         ]
         _align_ok, _missing_kws = _teacher_alignment_check(
-            teacher_description,
+            teacher_alignment_description,
             str(ai.get("question_text") or ""),
             _sol_lines_for_debug,
         )
-        _focus_kws = _extract_focus_keywords(teacher_description, max_keywords=6)
+        _focus_kws = _extract_focus_keywords(teacher_alignment_description, max_keywords=6)
         _hay = (str(ai.get("question_text") or "") + "\n" + "\n".join(_sol_lines_for_debug)).lower()
         _hit_kws = [k for k in _focus_kws if k in _hay]
     except Exception:
@@ -4815,6 +4865,8 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
             "unit": unit,
             "video_title": video_title,
             "teacher_description": teacher_description,
+            "teacher_description_source": teacher_description_source,
+            "teacher_alignment_description": teacher_alignment_description,
             "subtitle_path": subtitle_path,
             "subtitle_preview": sub_text[:500],
             "stable_mode": bool(stable_mode),
@@ -4841,6 +4893,11 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
         "ai_segment_map": ai.get("ai_segment_map", {}) or {},
         "ai_slot_hints": ai.get("ai_slot_hints", {}) or {},
         "ai_segments_compact": ai.get("ai_segments_compact", "") or "",
+        "concept_chapters_formal": formal_chapters or [],
+        "teacher_concept_chapters": formal_chapters or [],
+        "teacher_concept_version_key": formal_version_key,
+        "concept_align_status": "teacher_confirmed_formal" if formal_chapters else "pending_teacher_review",
+        "concept_align_source": formal_chapter_source,
         "created_at": now_utc(),
         "active": True,
         "gen_source": gen_source,
@@ -4853,6 +4910,8 @@ def create_task_for_video(video_doc: dict, video_id_str: str, level: str, force_
             "teacher_keyword_hits": _hit_kws,
             "teacher_missing_keywords": _missing_kws,
             "teacher_description_len": len(teacher_description or ""),
+            "teacher_description_source": teacher_description_source,
+            "teacher_alignment_description_len": len(teacher_alignment_description or ""),
             "subtitle_chars": len(sub_text or ""),
             "stable_mode": bool(stable_mode),
             "gen_source": gen_source,

@@ -1,7 +1,8 @@
 import axios from "axios";
+import { installAxiosSessionHandling } from "./sessionAuth";
 
 export const api = axios.create({
-  baseURL: "http://127.0.0.1:5000",
+  baseURL: import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000",
   timeout: 15000
 });
 export default api;
@@ -17,3 +18,5 @@ api.interceptors.request.use(
   },
   (error) => Promise.reject(error)
 );
+
+installAxiosSessionHandling(api);

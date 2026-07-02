@@ -75,5 +75,5 @@ for user_data in test_users:
 print("\n=== 測試用戶登入資訊 ===")
 print("學號: 11461127, 密碼: 123456 (角色: student)")
 print("學號: admin, 密碼: admin123 (角色: admin/老師)")
-print("學號: A123456789, 密碼: password123 (角色: student)")
+print("測試學生帳號已建立（未輸出密碼）。")
 

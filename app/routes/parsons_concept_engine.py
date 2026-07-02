@@ -1,3 +1,6 @@
+'''
+parsons 生題規則
+'''
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +11,7 @@ from typing import Dict, Any, Optional, List
 # =========================================================
 # Concept -> scenario pool
 # =========================================================
+# 每個 concept 對應多個 scenario，讓 AI 有更多選擇空間，避免每次都出同一題。
 SCENARIO_POOL: Dict[str, List[str]] = {
     # -------------------------
     # U1: Input / Output
@@ -179,7 +183,8 @@ SCENARIO_POOL: Dict[str, List[str]] = {
     ],
 }
 
-
+# 大單元 → 細部概念
+# 只會在這些相關概念裡挑選，不會跑去判斷成 list 或 function 其他單元
 TRACK_CONCEPTS: Dict[str, List[str]] = {
     "io": ["io_basic", "io_two_inputs", "io_calculation", "io_swap", "io_format"],
     "condition": ["if_basic", "if_else", "if_compare", "if_grade", "if_range", "if_mod"],
@@ -189,7 +194,7 @@ TRACK_CONCEPTS: Dict[str, List[str]] = {
     "function": ["function_basic", "function_return", "function_two_params", "function_calculation"],
 }
 
-
+# 細部概念 → 關鍵字對應
 CONCEPT_KEYWORDS: Dict[str, List[str]] = {
     "io_basic": ["輸入", "輸出", "顯示", "print", "input"],
     "io_two_inputs": ["兩個", "兩位", "two", "兩次輸入"],
@@ -222,11 +227,11 @@ CONCEPT_KEYWORDS: Dict[str, List[str]] = {
     "function_calculation": ["計算", "面積", "平均", "折扣"],
 }
 
-
+# 文本標準化，用於關鍵字比對，避免因為大小寫或前後空白導致漏掉關鍵字。
 def _norm_text(s: str) -> str:
     return (s or "").strip().lower()
 
-
+# 根據課程單元和文本內容推測主要概念類別，作為後續挑選題型的依據。
 def _infer_track(unit: str, subtitle_text: str, teacher_description: str = "", video_title: str = "") -> str:
     u = (unit or "").strip().upper()
     all_text = _norm_text("\n".join([subtitle_text or "", teacher_description or "", video_title or ""]))
@@ -350,6 +355,7 @@ def build_generation_plan(unit: str, subtitle_text: str, video_title: str = "", 
 # template solution builder
 # 目的：讓系統更穩，不必每次都讓 AI 自由生 code
 # =========================================================
+# 每個 concept 對應一個範例解法，包含程式碼行和對應的解題步驟說明，作為 AI 生成的參考藍本。
 def build_template_solution(concept: str) -> Optional[Dict[str, Any]]:
     if concept == "range_sum":
         return {

@@ -96,38 +96,62 @@
       @click.self="dismissFeedbackModal"
     >
       <div class="fb-modal" role="dialog" aria-modal="true" aria-label="作答回饋">
-        <div class="fb-title">❌ {{ feedbackModal.headline }}</div>
+        <template v-if="feedbackModal.stage === 'choice'">
+          <div class="fb-title">❌ 作答有誤</div>
 
-        <div class="fb-section">
-          <div class="fb-label">💡 你可以選擇：</div>
-          <div class="fb-actions pick">
-            <button class="btn ghost" @click="onToggleHintOpen">
-              {{ feedbackModal.hintOpen ? "收起提示" : "查看提示" }}
-            </button>
-            <button class="btn submit" @click="onToggleReviewOpen">
-              {{ feedbackModal.reviewOpen ? "收起影片" : "查看影片" }}
-            </button>
+          <div class="fb-section">
+            <div class="fb-label">💡 你可以選擇：</div>
+            <div class="fb-actions pick">
+              <button class="btn submit" @click="onToggleHintOpen" :disabled="feedbackModal.hintLoading || (!feedbackModal.hintOpen && feedbackModal.hintLimitReached)">
+                {{ feedbackModal.hintLoading ? "提示中..." : (feedbackModal.hintOpen ? "收起提示" : (feedbackModal.hintLimitReached ? "提示已達上限" : "查看提示")) }}
+              </button>
+            </div>
           </div>
-        </div>
+        </template>
 
-        <div class="fb-section" v-if="feedbackModal.hintOpen">
-          <div class="fb-label">💡 AI提示</div>
-          <div class="fb-text">{{ feedbackModal.hintQuestion }}</div>
-          <div class="fb-more">👉 還需要更完整說明嗎？</div>
-          <div class="fb-actions pick">
-            <button class="btn submit" @click="openReviewFromHint">回看影片</button>
-          </div>
-        </div>
+        <template v-else>
+          <div class="fb-title">❌ {{ feedbackModal.headline }}</div>
 
-        <div class="fb-section fb-review" v-if="feedbackModal.reviewOpen">
-          <div class="fb-label">🎬 建議回看片段</div>
-          <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
-          <div class="fb-focus">重點：{{ feedbackModal.reviewFocus }}</div>
-          <div v-if="feedbackModal.debugText" class="fb-debug">{{ feedbackModal.debugText }}</div>
-          <div class="fb-actions">
-            <button class="btn submit" @click="goReviewFromModal">前往影片</button>
+          <div class="fb-section">
+            <div class="fb-label">💡 你可以選擇：</div>
+            <div class="fb-actions pick">
+              <button class="btn submit" @click="onToggleHintOpen" :disabled="feedbackModal.hintLoading || (!feedbackModal.hintOpen && feedbackModal.hintLimitReached)">
+                {{ feedbackModal.hintLoading ? "提示中..." : (feedbackModal.hintOpen ? "收起提示" : (feedbackModal.hintLimitReached ? "提示已達上限" : "查看提示")) }}
+              </button>
+              <button v-if="showReviewVideoFeature" class="btn submit" @click="onToggleReviewOpen">
+                {{ feedbackModal.reviewOpen ? "收起影片" : "查看影片" }}
+              </button>
+            </div>
           </div>
-        </div>
+
+          <div class="fb-section" v-if="feedbackModal.hintOpen">
+            <div class="fb-label">💡 AI提示</div>
+            <div class="fb-text">{{ feedbackModal.hintQuestion || "提示產生中..." }}</div>
+            <div class="fb-actions pick">
+              <button
+                class="btn ghost"
+                :disabled="!feedbackModal.hintLoaded || feedbackModal.hintLoading || hintRemaining <= 0 || isRegeneratingHint"
+                @click="handleRetryHint"
+              >
+                {{ hintRemaining <= 0 ? "已使用提示" : (isRegeneratingHint ? "提示中..." : `再次提示(${hintRemaining})`) }}
+              </button>
+            </div>
+            <div v-if="showReviewVideoFeature" class="fb-actions pick">
+              <button class="btn submit" @click="openReviewFromHint">回看影片</button>
+            </div>
+          </div>
+
+          <div class="fb-section fb-review" v-if="showReviewVideoFeature && feedbackModal.reviewOpen">
+            <div class="fb-label">🎬 建議回看片段</div>
+            <div class="fb-focus" v-if="feedbackModal.reviewMode === 'chapter_recommendation'">模式：章節推薦</div>
+            <div class="fb-focus" v-else>模式：秒級字幕對齊</div>
+            <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
+            <div v-if="feedbackModal.debugText" class="fb-debug">{{ feedbackModal.debugText }}</div>
+            <div class="fb-actions">
+              <button class="btn submit" @click="goReviewFromModal">前往影片</button>
+            </div>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -164,7 +188,8 @@
 <script setup>
 import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } from "vue";
 import { useRoute, useRouter } from "vue-router";
-const API_BASE = "http://127.0.0.1:5000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
+const showReviewVideoFeature = false;
 
 const route = useRoute();
 const router = useRouter();
@@ -186,6 +211,89 @@ const testRole = computed(() => String(route.query.test_role || "pre").toLowerCa
 const testCycleId = computed(() => String(route.query.test_cycle_id || "default"));
 const studentId = computed(() => String(localStorage.getItem("student_id") || localStorage.getItem("studentId") || "").trim());
 const participantId = computed(() => String(localStorage.getItem("participant_id") || "").trim());
+
+const LEARNING_SESSION_ID_KEY = "parsons_learning_session_id_v1";
+const LEARNING_SESSION_STUDENT_KEY = "parsons_learning_session_student_v1";
+const LEARNING_SESSION_STARTED_KEY = "parsons_learning_session_started_v1";
+
+function createLearningSessionId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `session_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function getLearningSessionId() {
+  const currentStudentId = String(studentId.value || "");
+  try {
+    const storedStudentId = String(sessionStorage.getItem(LEARNING_SESSION_STUDENT_KEY) || "");
+    let sessionId = String(sessionStorage.getItem(LEARNING_SESSION_ID_KEY) || "");
+    if (!sessionId || storedStudentId !== currentStudentId) {
+      sessionId = createLearningSessionId();
+      sessionStorage.setItem(LEARNING_SESSION_ID_KEY, sessionId);
+      sessionStorage.setItem(LEARNING_SESSION_STUDENT_KEY, currentStudentId);
+      sessionStorage.removeItem(LEARNING_SESSION_STARTED_KEY);
+    }
+    return sessionId;
+  } catch (_) {
+    return createLearningSessionId();
+  }
+}
+
+const learningSessionId = getLearningSessionId();
+
+function currentTaskId() {
+  return String(task.value?.task_id || task.value?._id || "").trim() || null;
+}
+
+function currentTargetConcept() {
+  const raw = task.value?.target_concept ?? task.value?.concept;
+  if (raw != null && String(raw).trim()) return String(raw).trim();
+  const tags = Array.isArray(task.value?.tags) ? task.value.tags : [];
+  return tags.length && String(tags[0] || "").trim() ? String(tags[0]).trim() : null;
+}
+
+async function logLearningEvent(eventType, extra = {}) {
+  if (!studentId.value) return null;
+  const body = {
+    session_id: learningSessionId,
+    student_id: String(studentId.value),
+    event_type: String(eventType || ""),
+    page: "parsons",
+    activity_type: isTestMode.value ? "test" : "practice",
+    test_role: isTestMode.value ? String(testRole.value || "") : null,
+    task_id: currentTaskId(),
+    target_concept: currentTargetConcept(),
+    event_at: new Date().toISOString(),
+    ...extra,
+  };
+  try {
+    const response = await fetch(`${API_BASE}/api/learning_logs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) return null;
+    return await response.json().catch(() => null);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function initializeLearningLogging() {
+  let alreadyStarted = false;
+  try {
+    alreadyStarted = sessionStorage.getItem(LEARNING_SESSION_STARTED_KEY) === learningSessionId;
+  } catch (_) {}
+
+  if (!alreadyStarted) {
+    const result = await logLearningEvent("session_start", { task_id: null, target_concept: null });
+    if (result?.ok) {
+      try { sessionStorage.setItem(LEARNING_SESSION_STARTED_KEY, learningSessionId); } catch (_) {}
+    }
+  }
+  await logLearningEvent("page_view", { task_id: null, target_concept: null });
+}
 
 // AI 回饋（練習模式用）
 const aiFeedbackDetail = ref(null);
@@ -336,6 +444,7 @@ const state = reactive({
 
 const feedbackModal = reactive({
   open: false,
+  stage: "choice",
   headline: "",
   locationText: "",
   hintQuestion: "",
@@ -345,19 +454,43 @@ const feedbackModal = reactive({
   reflectionQuestions: [],
   impactHint: "",
   reviewRange: "（未提供）",
+  reviewMode: "subtitle_alignment",
+  subtitleHealth: null,
+  chapterRecommendation: null,
+  chapterLabel: "",
   reviewFocus: "",
   hintOpen: false,
+  hintLoading: false,
+  hintLoaded: false,
+  hintError: "",
+  hintLimitReached: false,
   reviewOpen: false,
   start: null,
   end: null,
+  chapterStart: null,
+  chapterEnd: null,
   jumpVideoId: "",
   attemptId: "",
+  attemptV2Id: "",
+  attemptNo: null,
   reviewAttemptId: "",
   taskId: "",
+  targetConcept: "",
   hintClicked: false,
   videoClicked: false,
+  source: "default",
+  firstHint: "",
+  secondHint: "",
+  possibleCauses: [],
+  actualText: "",
+  expectedText: "",
   debugText: "",
 });
+
+const maxHintRetry = 1;
+const hintRetryUsed = ref(0);
+const isRegeneratingHint = ref(false);
+const hintRemaining = computed(() => Math.max(0, maxHintRetry - hintRetryUsed.value));
 
 const successModal = reactive({
   open: false,
@@ -410,7 +543,22 @@ function findSlotKeyByBlockId(blockId) {
 }
 
 // ====== 拖曳事件 ======
+let taskStartLoggedFor = "";
+
+async function recordTaskOpen() {
+  taskStartLoggedFor = "";
+  await logLearningEvent("task_open");
+}
+
+function recordTaskStartOnce() {
+  const key = currentTaskId() || "unknown_task";
+  if (taskStartLoggedFor === key) return;
+  taskStartLoggedFor = key;
+  logLearningEvent("task_start").catch(() => {});
+}
+
 function onDragStart(block) {
+  recordTaskStartOnce();
   const fromSlotKey = findSlotKeyByBlockId(block?.id);
   dragging.value = { block, fromSlotKey };
 }
@@ -500,6 +648,7 @@ async function advanceTestAfterSubmit() {
         result.value = null;
         state.err = "";
         await bindBlankFocusHandlers();
+        await recordTaskOpen();
         return;
       }
     } catch (innerErr) {
@@ -550,12 +699,16 @@ function buildWrongFeedbackParts(r) {
   const focusIndex = (wrongIndex != null) ? wrongIndex : (hasIndentError ? Number(indentErrors[0]) : null);
   const slotNum = (focusIndex != null && focusIndex >= 0) ? (focusIndex + 1) : null;
   const backendErrorType = String(r?.error_type || "").trim().toLowerCase();
+  const wrongType = String(r?.wrong_type || "").trim();
+  const conceptTag = String(r?.concept_tag || "").trim();
 
   const aiDetail = (r?.ai_feedback_detail && typeof r.ai_feedback_detail === "object") ? r.ai_feedback_detail : {};
   const aiDiagnosisSummary = String(r?.ai_diagnosis_summary || "").trim();
   const aiConceptHint = String(aiDetail?.concept_hint || aiDetail?.concept_explanation || r?.hint || "").trim();
   const aiGuidingQuestion = String(aiDetail?.guiding_question || "").trim();
   const aiImpactHint = String(aiDetail?.impact || "").trim();
+  const aiFirstHint = String(aiDetail?.first_hint || r?.hint || "").trim();
+  const aiSecondHint = String(aiDetail?.second_hint || "").trim();
 
   const possibleCauses = Array.isArray(aiDetail?.possible_causes)
     ? aiDetail.possible_causes.map((x) => String(x || "").trim()).filter(Boolean)
@@ -566,10 +719,17 @@ function buildWrongFeedbackParts(r) {
   if (!reflectionQuestions.length && aiGuidingQuestion) {
     reflectionQuestions.push(aiGuidingQuestion);
   }
+  const hasUsableAi = Boolean(aiDiagnosisSummary || aiConceptHint || aiFirstHint || aiSecondHint || reflectionQuestions.length || possibleCauses.length || aiImpactHint);
 
   const startSec = Number.isFinite(Number(r?.jump?.start)) ? Number(r.jump.start) : 0;
   const endSec = Number.isFinite(Number(r?.jump?.end)) ? Number(r.jump.end) : 0;
-  const reviewRange = (endSec > startSec) ? `${fmtTime(startSec)} - ${fmtTime(endSec)}` : "（未提供）";
+  const subtitleHealth = (r?.subtitle_health && typeof r.subtitle_health === "object") ? r.subtitle_health : null;
+  const chapterRecommendation = (r?.chapter_recommendation && typeof r.chapter_recommendation === "object") ? r.chapter_recommendation : null;
+  const reviewMode = String(r?.review_mode || subtitleHealth?.mode || (chapterRecommendation ? "chapter_recommendation" : "subtitle_alignment") || "subtitle_alignment").trim() || "subtitle_alignment";
+  const chapterLabel = buildChapterLabel(chapterRecommendation);
+  const reviewRange = (reviewMode === "chapter_recommendation")
+    ? (chapterLabel || "（章節推薦）")
+    : ((endSec > startSec) ? `${fmtTime(startSec)} - ${fmtTime(endSec)}` : "（未提供）");
 
   const hasIfElseStructure = (poolBlocks.value || []).some((b) => String(b?.text || "").trim() === "else:")
     && (poolBlocks.value || []).some((b) => /^\s*if\s+.+:\s*$/.test(String(b?.text || "")));
@@ -633,6 +793,9 @@ function buildWrongFeedbackParts(r) {
   if (aiConceptHint) {
     conceptHint = aiConceptHint;
   }
+  if (aiDiagnosisSummary) {
+    diagnosis = aiDiagnosisSummary;
+  }
 
   let guidingQuestion1 = "當條件成立時，應該輸出哪一句訊息？";
   if (hasMixedLogicAndIndent) {
@@ -676,7 +839,11 @@ function buildWrongFeedbackParts(r) {
     slotLabel,
     actualText,
     expectedText,
+    wrongType,
+    conceptTag,
   });
+
+  const resolvedReflections = reflectionQuestions.length ? reflectionQuestions : [guidingQuestion1, guidingQuestion2].filter(Boolean);
 
   return {
     focusIndex,
@@ -684,18 +851,33 @@ function buildWrongFeedbackParts(r) {
     diagnosis,
     errorClass,
     conceptHint,
-    reflectionQuestions: [guidingQuestion1, guidingQuestion2],
-    impactHint,
+    reflectionQuestions: resolvedReflections,
+    impactHint: aiImpactHint || impactHint,
     reviewRange,
     startSec,
     endSec,
     hasIndentError,
     indentErrorCount: indentErrors.length,
+    source: hasUsableAi ? "ai" : "default",
+    firstHint: aiFirstHint,
+    secondHint: aiSecondHint,
+    possibleCauses,
+    actualText,
+    expectedText,
+    wrongType,
+    conceptTag,
+    reviewMode,
+    subtitleHealth,
+    chapterRecommendation,
+    chapterLabel,
   };
 }
 
 function buildWrongFeedback(r) {
   const parts = buildWrongFeedbackParts(r);
+  const reviewLabel = String(parts.reviewMode || "").trim() === "chapter_recommendation"
+    ? "建議回看章節"
+    : "建議回看影片";
 
   return [
     `❌ 你錯在：${parts.slotLabel}`,
@@ -710,7 +892,7 @@ function buildWrongFeedback(r) {
     `1 ${parts.reflectionQuestions[0] || "請重新檢查此格在流程中的執行條件。"}`,
     `2 ${parts.reflectionQuestions[1] || "這行程式若放在目前位置，執行時機是否正確？"}`,
     "",
-    "建議回看影片",
+    reviewLabel,
     parts.reviewRange,
   ].join("\n");
 }
@@ -739,6 +921,9 @@ function buildFeedbackLocation(parts) {
 }
 
 function buildFeedbackReviewFocus(parts) {
+  if (String(parts?.reviewMode || "").trim() === "chapter_recommendation") {
+    return String(parts?.chapterLabel || parts?.conceptTag || "章節推薦");
+  }
   if (String(parts?.slotLabel || "").includes("條件") && String(parts?.slotLabel || "").includes("縮排")) {
     return "if 與縮排";
   }
@@ -752,6 +937,8 @@ function buildFeedbackReviewFocus(parts) {
 }
 
 function buildHintQuestion(parts) {
+  const firstHint = String(parts?.firstHint || "").trim();
+  if (firstHint) return firstHint;
   const q1 = Array.isArray(parts?.reflectionQuestions) ? String(parts.reflectionQuestions[0] || "").trim() : "";
   if (q1) return q1;
   if (String(parts?.slotLabel || "").includes("條件") && String(parts?.slotLabel || "").includes("縮排")) {
@@ -764,6 +951,146 @@ function buildHintQuestion(parts) {
     return "這一行是否需要再往右縮排一層？";
   }
   return "這一行在目前流程中的位置正確嗎？";
+}
+
+const CONCEPT_TAG_ZH = {
+  loop_count_control: "迴圈次數控制",
+  loop_reverse_range: "反向 range 迴圈",
+  nested_loop_structure: "巢狀迴圈結構",
+  if_condition_logic: "條件判斷邏輯",
+  if_branch_order: "分支順序",
+  edge_case_condition: "邊界條件",
+  star_formula_2i_minus_1: "星號公式 2i-1",
+  space_formula_n_minus_i: "空白公式 n-i",
+  input_int_cast: "輸入轉整數",
+  print_separator: "輸出分隔格式",
+  python_syntax: "Python 語法",
+};
+
+function toConceptZh(tag) {
+  const key = String(tag || "").trim().toLowerCase();
+  if (!key) return "";
+  return CONCEPT_TAG_ZH[key] || String(tag || "").trim();
+}
+
+function buildChapterLabel(ch) {
+  const title = String(ch?.chapter_title || ch?.chapter_name || ch?.title || "").trim();
+  const conceptLabel = String(ch?.concept_label || ch?.chapter_label || "").trim();
+  const family = String(ch?.family || "").trim();
+  const conceptTags = Array.isArray(ch?.concept_tags)
+    ? ch.concept_tags.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  const conceptTagsZh = conceptTags.map((tag) => toConceptZh(tag)).filter(Boolean);
+  const _num = (v) => {
+    if (v === null || v === undefined) return null;
+    const t = String(v).trim();
+    if (!t) return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
+  // 章節模式應優先使用秒數欄位，不應把 slot_start/slot_end（格位索引）當時間。
+  const chapterStartSec = _num(ch?.start_sec) ?? _num(ch?.start);
+  const chapterEndSec = _num(ch?.end_sec) ?? _num(ch?.end);
+  const rangeText = (chapterStartSec != null && chapterEndSec != null && chapterEndSec > chapterStartSec)
+    ? `${fmtTime(chapterStartSec)} - ${fmtTime(chapterEndSec)}`
+    : "";
+  const head = title || conceptLabel || family || conceptTagsZh[0] || "章節推薦";
+  let tail = "";
+  if (conceptLabel && conceptLabel !== head) {
+    tail = `・${conceptLabel}`;
+  } else if (!conceptLabel && conceptTagsZh.length) {
+    const tagsText = conceptTagsZh.slice(0, 2).join("／");
+    if (tagsText && tagsText !== head) {
+      tail = `・${tagsText}`;
+    }
+  }
+  return `${head}${tail}${rangeText ? `（${rangeText}）` : ""}`;
+}
+
+function getChapterBoundary(ch, keys) {
+  for (const key of keys) {
+    const raw = ch?.[key];
+    if (raw === null || raw === undefined) continue;
+    const text = String(raw).trim();
+    if (!text) continue;
+    const n = Number(text);
+    if (Number.isFinite(n)) {
+      return n;
+    }
+  }
+  return null;
+}
+
+function buildReviewRangeText(parts) {
+  if (String(parts?.reviewMode || "").trim() === "chapter_recommendation") {
+    return String(parts?.chapterLabel || "").trim() || "（章節推薦）";
+  }
+  return String(parts?.reviewRange || "").trim() || "（未提供）";
+}
+
+function buildRetryHintQuestion(parts, usedCount = 1) {
+  const secondHint = String(parts?.secondHint || "").trim();
+  if (secondHint) return secondHint;
+
+  const reflectionQuestions = Array.isArray(parts?.reflectionQuestions)
+    ? parts.reflectionQuestions.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  if (usedCount === 1 && reflectionQuestions.length >= 2) {
+    return reflectionQuestions[1];
+  }
+
+  const possibleCauses = Array.isArray(parts?.possibleCauses)
+    ? parts.possibleCauses.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  if (possibleCauses.length > 0) {
+    return possibleCauses[0];
+  }
+
+  const actualText = String(parts?.actualText || "").trim();
+  const expectedText = String(parts?.expectedText || "").trim();
+  if (actualText && expectedText && actualText !== expectedText) {
+    if (actualText.includes("print(")) {
+      return "目前這行只呈現部分輸出內容，請檢查是否同時包含固定文字與變數資訊。";
+    }
+    return "目前這一行與題目要求不完全一致，請檢查是否少了一部分必要資訊。";
+  }
+
+  const conceptHint = String(parts?.conceptHint || "").trim();
+  if (conceptHint) return conceptHint;
+
+  return "請重新比對題目要求與目前輸出結果。";
+}
+
+async function handleRetryHint() {
+  if (hintRemaining.value <= 0) return;
+  if (isRegeneratingHint.value) return;
+  if (!feedbackModal.open) return;
+  if (!feedbackModal.hintLoaded || feedbackModal.hintLoading) return;
+
+  try {
+    isRegeneratingHint.value = true;
+    const parts = {
+      secondHint: feedbackModal.secondHint,
+      reflectionQuestions: feedbackModal.reflectionQuestions,
+      possibleCauses: feedbackModal.possibleCauses,
+      conceptHint: feedbackModal.conceptHint,
+      actualText: feedbackModal.actualText,
+      expectedText: feedbackModal.expectedText,
+    };
+    const nextUsed = hintRetryUsed.value + 1;
+    feedbackModal.hintQuestion = buildRetryHintQuestion(parts, nextUsed);
+    hintRetryUsed.value = nextUsed;
+    if (feedbackModal.attemptId) {
+      await sendChoice(feedbackModal.attemptId, "no", {
+        click_type: "hint_retry",
+        hint_retry_count: nextUsed,
+      });
+    }
+  } catch (err) {
+    console.error("handleRetryHint error:", err);
+  } finally {
+    isRegeneratingHint.value = false;
+  }
 }
 
 async function resolveNextVideoInUnit(curVideoId) {
@@ -839,44 +1166,68 @@ function openFeedbackModal(r, taskId) {
   const parts = buildWrongFeedbackParts(r || {});
   primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
   feedbackModal.open = true;
+  feedbackModal.stage = "detail";
   feedbackModal.headline = buildFeedbackHeadline(parts);
   feedbackModal.locationText = buildFeedbackLocation(parts);
-  feedbackModal.hintQuestion = buildHintQuestion(parts);
+  feedbackModal.hintQuestion = "";
   feedbackModal.slotLabel = parts.slotLabel;
   feedbackModal.diagnosis = parts.diagnosis;
   feedbackModal.conceptHint = parts.conceptHint;
   feedbackModal.reflectionQuestions = parts.reflectionQuestions;
   feedbackModal.impactHint = parts.impactHint;
-  feedbackModal.reviewRange = parts.reviewRange;
+  feedbackModal.source = String(parts.source || "default");
+  feedbackModal.firstHint = String(parts.firstHint || "");
+  feedbackModal.secondHint = String(parts.secondHint || "");
+  feedbackModal.possibleCauses = Array.isArray(parts.possibleCauses) ? parts.possibleCauses : [];
+  feedbackModal.actualText = String(parts.actualText || "");
+  feedbackModal.expectedText = String(parts.expectedText || "");
+  feedbackModal.reviewMode = String(parts.reviewMode || "subtitle_alignment");
+  feedbackModal.subtitleHealth = parts.subtitleHealth || null;
+  feedbackModal.chapterRecommendation = parts.chapterRecommendation || null;
+  feedbackModal.chapterLabel = buildChapterLabel(parts.chapterRecommendation);
+  feedbackModal.reviewRange = buildReviewRangeText({ ...parts, chapterLabel: feedbackModal.chapterLabel });
   feedbackModal.reviewFocus = buildFeedbackReviewFocus(parts);
   feedbackModal.hintOpen = false;
+  feedbackModal.hintLoading = false;
+  feedbackModal.hintLoaded = false;
+  feedbackModal.hintError = "";
+  feedbackModal.hintLimitReached = false;
   feedbackModal.reviewOpen = false;
   feedbackModal.start = parts.startSec;
   feedbackModal.end = parts.endSec;
+  feedbackModal.chapterStart = getChapterBoundary(parts.chapterRecommendation, ["start", "start_sec"]);
+  feedbackModal.chapterEnd = getChapterBoundary(parts.chapterRecommendation, ["end", "end_sec"]);
   feedbackModal.jumpVideoId = String(r?.jump?.video_id || "");
   feedbackModal.attemptId = String(r?.attempt_id || "");
+  feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
+  feedbackModal.attemptNo = Number.isFinite(Number(r?.attempt_no)) ? Number(r.attempt_no) : null;
   feedbackModal.reviewAttemptId = String(r?.review_attempt_id || r?.attempt_id || "");
   feedbackModal.taskId = String(taskId || "");
+  feedbackModal.targetConcept = String(r?.target_concept || currentTargetConcept() || "");
   feedbackModal.hintClicked = false;
   feedbackModal.videoClicked = false;
   feedbackModal.debugText = "";
+  hintRetryUsed.value = 0;
+  isRegeneratingHint.value = false;
 
-  if (import.meta.env.DEV) {
-    const src = String(r?.segment_source || "");
-    const concept = String(r?.segment_concept || "");
-    const wrongIdx = Number.isFinite(Number(r?.wrong_index)) ? Number(r.wrong_index) : null;
-    const traceArr = Array.isArray(r?.alignment_trace) ? r.alignment_trace : [];
-    const traceText = traceArr.map((x) => {
-      const step = String(x?.step || "?");
-      const fbSrc = String(x?.fallback_source || "").trim();
-      const reason = String(x?.reason || x?.segment_source || "");
-      if (fbSrc) {
-        return `${step}:${reason || "n/a"}(${fbSrc})`;
-      }
-      return reason ? `${step}:${reason}` : step;
-    }).join(" | ");
-    feedbackModal.debugText = `debug src=${src || "n/a"}, concept=${concept || "n/a"}, wrong_index=${wrongIdx != null ? wrongIdx : "n/a"}${traceText ? `\ntrace ${traceText}` : ""}`;
-  }
+  // if (import.meta.env.DEV) {
+  //   const src = String(r?.segment_source || "");
+  //   const concept = String(r?.segment_concept || "");
+  //   const wrongType = String(r?.wrong_type || "");
+  //   const conceptTag = String(r?.concept_tag || "");
+  //   const wrongIdx = Number.isFinite(Number(r?.wrong_index)) ? Number(r.wrong_index) : null;
+  //   const traceArr = Array.isArray(r?.alignment_trace) ? r.alignment_trace : [];
+  //   const traceText = traceArr.map((x) => {
+  //     const step = String(x?.step || "?");
+  //     const fbSrc = String(x?.fallback_source || "").trim();
+  //     const reason = String(x?.reason || x?.segment_source || "");
+  //     if (fbSrc) {
+  //       return `${step}:${reason || "n/a"}(${fbSrc})`;
+  //     }
+  //     return reason ? `${step}:${reason}` : step;
+  //   }).join(" | ");
+  //   feedbackModal.debugText = `debug src=${src || "n/a"}, concept=${concept || "n/a"}, wrong_type=${wrongType || "n/a"}, concept_tag=${conceptTag || "n/a"}, wrong_index=${wrongIdx != null ? wrongIdx : "n/a"}${traceText ? `\ntrace ${traceText}` : ""}`;
+  // }
 
   debugFeedback({
     modalOpen: true,
@@ -888,16 +1239,157 @@ function openFeedbackModal(r, taskId) {
   });
 }
 
-async function dismissFeedbackModal() {
+function applyAiHintToFeedbackModal(data = {}) {
+  const detail = (data?.ai_feedback_detail && typeof data.ai_feedback_detail === "object")
+    ? data.ai_feedback_detail
+    : {};
+
+  aiFeedbackDetail.value = detail;
+  aiConceptExplanation.value = String(detail?.concept_explanation || detail?.concept_hint || "");
+  aiPossibleCauses.value = Array.isArray(detail?.possible_causes) ? detail.possible_causes : [];
+  aiImpact.value = String(detail?.impact || "");
+  aiGuidingQuestion.value = String(detail?.guiding_question || "");
+
+  feedbackModal.source = String(data?.source || "ai");
+  feedbackModal.conceptHint = String(detail?.concept_hint || detail?.concept_explanation || feedbackModal.conceptHint || "");
+  feedbackModal.firstHint = String(detail?.first_hint || data?.hint || feedbackModal.firstHint || "");
+  feedbackModal.secondHint = String(detail?.second_hint || feedbackModal.secondHint || "");
+  feedbackModal.possibleCauses = Array.isArray(detail?.possible_causes) ? detail.possible_causes : feedbackModal.possibleCauses;
+  feedbackModal.reflectionQuestions = Array.isArray(detail?.reflection_questions) ? detail.reflection_questions : feedbackModal.reflectionQuestions;
+  feedbackModal.impactHint = String(detail?.impact || feedbackModal.impactHint || "");
+
+  feedbackModal.hintQuestion = String(
+    detail?.first_hint
+    || data?.hint
+    || detail?.guiding_question
+    || detail?.concept_explanation
+    || detail?.concept_hint
+    || "請先確認這一格在程式流程中的角色與位置。"
+  );
+}
+
+async function loadAiHintForModal() {
+  if (feedbackModal.hintLoaded || feedbackModal.hintLoading) return;
+  if (!feedbackModal.attemptId) {
+    feedbackModal.hintQuestion = buildHintQuestion({
+      firstHint: feedbackModal.firstHint,
+      reflectionQuestions: feedbackModal.reflectionQuestions,
+      slotLabel: feedbackModal.slotLabel,
+    });
+    feedbackModal.hintLoaded = true;
+    return;
+  }
+
+  feedbackModal.hintLoading = true;
+  feedbackModal.hintError = "";
+  feedbackModal.hintQuestion = "提示產生中...";
+
+  try {
+    const res = await fetch(`${API_BASE}/api/parsons/hint`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        attempt_id: feedbackModal.attemptId,
+        task_id: feedbackModal.taskId,
+        student_id: String(studentId.value || ""),
+        participant_id: String(participantId.value || ""),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.ok === false) {
+      throw new Error(data?.message || "提示產生失敗");
+    }
+    applyAiHintToFeedbackModal(data);
+    feedbackModal.hintLoaded = true;
+  } catch (err) {
+    feedbackModal.hintError = err?.message || "提示產生失敗";
+    feedbackModal.hintQuestion = "AI 提示暫時無法產生，請稍後再試。";
+  } finally {
+    feedbackModal.hintLoading = false;
+  }
+}
+
+function feedbackLearningContext(metadata) {
+  return {
+    task_id: feedbackModal.taskId || currentTaskId(),
+    attempt_id: feedbackModal.attemptV2Id || null,
+    attempt_no: feedbackModal.attemptNo,
+    target_concept: feedbackModal.targetConcept || currentTargetConcept(),
+    metadata,
+  };
+}
+
+async function closeHintReview(closeMethod) {
+  if (!feedbackModal.hintOpen) return false;
+  feedbackModal.hintOpen = false;
+  await logLearningEvent("review_close", feedbackLearningContext({
+    review_type: "ai_hint",
+    close_method: closeMethod,
+  }));
+  return true;
+}
+
+async function closeHintAndReturnToTask(closeMethod) {
+  const learningContext = feedbackLearningContext({
+    review_type: "ai_hint",
+    return_method: closeMethod,
+  });
+  const closed = await closeHintReview(closeMethod);
+  if (!closed) return;
   if (feedbackModal.attemptId) {
     await sendChoice(feedbackModal.attemptId, "no");
   }
   feedbackModal.open = false;
+  await logLearningEvent("return_to_task", learningContext);
+}
+
+async function dismissFeedbackModal() {
+  const hadOpenHint = feedbackModal.hintOpen;
+  const learningContext = feedbackLearningContext({
+    review_type: "ai_hint",
+    close_method: "click_blank_area",
+  });
+  if (hadOpenHint) {
+    feedbackModal.hintOpen = false;
+    await logLearningEvent("review_close", learningContext);
+  }
+  if (feedbackModal.attemptId) {
+    await sendChoice(feedbackModal.attemptId, "no");
+  }
+  feedbackModal.open = false;
+  feedbackModal.stage = "choice";
   feedbackModal.hintOpen = false;
+  feedbackModal.hintLoading = false;
+  feedbackModal.hintLoaded = false;
+  feedbackModal.hintError = "";
+  feedbackModal.hintLimitReached = false;
   feedbackModal.reviewOpen = false;
+  feedbackModal.attemptV2Id = "";
+  feedbackModal.attemptNo = null;
+  feedbackModal.targetConcept = "";
   feedbackModal.hintClicked = false;
   feedbackModal.videoClicked = false;
   feedbackModal.debugText = "";
+  feedbackModal.source = "default";
+  feedbackModal.reviewMode = "subtitle_alignment";
+  feedbackModal.subtitleHealth = null;
+  feedbackModal.chapterRecommendation = null;
+  feedbackModal.chapterLabel = "";
+  feedbackModal.chapterStart = null;
+  feedbackModal.chapterEnd = null;
+  feedbackModal.firstHint = "";
+  feedbackModal.secondHint = "";
+  feedbackModal.possibleCauses = [];
+  feedbackModal.actualText = "";
+  feedbackModal.expectedText = "";
+  hintRetryUsed.value = 0;
+  isRegeneratingHint.value = false;
+  if (hadOpenHint) {
+    await logLearningEvent("return_to_task", {
+      ...learningContext,
+      metadata: { review_type: "ai_hint", return_method: "click_blank_area" },
+    });
+  }
 }
 
 async function goReviewFromModal() {
@@ -909,8 +1401,13 @@ async function goReviewFromModal() {
   await sendChoice(feedbackModal.attemptId, "yes");
   savePracticeState({ attempt_id: feedbackModal.attemptId || "" });
 
-  const start = feedbackModal.start ?? 0;
-  const end = feedbackModal.end ?? 0;
+  const useChapterMode = String(feedbackModal.reviewMode || "").trim() === "chapter_recommendation";
+  const start = useChapterMode && Number.isFinite(Number(feedbackModal.chapterStart))
+    ? Number(feedbackModal.chapterStart)
+    : (feedbackModal.start ?? 0);
+  const end = useChapterMode && Number.isFinite(Number(feedbackModal.chapterEnd))
+    ? Number(feedbackModal.chapterEnd)
+    : (feedbackModal.end ?? 0);
   const jumpVideoId = feedbackModal.jumpVideoId;
   const attemptId = feedbackModal.reviewAttemptId;
   const taskId = feedbackModal.taskId;
@@ -924,6 +1421,7 @@ async function goReviewFromModal() {
     query: {
       start,
       end,
+      review_mode: useChapterMode ? "chapter_recommendation" : "subtitle_alignment",
       attempt_id: String(attemptId || ""),
       task_id: String(taskId || ""),
       level: route.query.level ? String(route.query.level) : "L1",
@@ -932,12 +1430,30 @@ async function goReviewFromModal() {
 }
 
 async function onToggleHintOpen() {
-  const nextOpen = !feedbackModal.hintOpen;
-  feedbackModal.hintOpen = nextOpen;
-  if (nextOpen && !feedbackModal.hintClicked && feedbackModal.attemptId) {
-    feedbackModal.hintClicked = true;
-    await sendChoice(feedbackModal.attemptId, "no", { click_type: "hint" });
+  if (feedbackModal.hintOpen) {
+    await closeHintAndReturnToTask("click_ai_hint_again");
+    return;
   }
+
+  feedbackModal.stage = "detail";
+  const openEvent = await logLearningEvent("review_open", feedbackLearningContext({
+    review_type: "ai_hint",
+    trigger_method: "click_ai_hint",
+    button_name: "AI提示",
+  }));
+  const hintMetadata = openEvent?.metadata || {};
+  if (hintMetadata.hint_limit_reached === true) {
+    feedbackModal.hintOpen = false;
+    feedbackModal.hintLimitReached = true;
+    return;
+  }
+  feedbackModal.hintOpen = true;
+  feedbackModal.hintLimitReached = Number(hintMetadata.hint_no) >= Number(hintMetadata.max_hint_count || 2);
+  if (!feedbackModal.hintClicked && feedbackModal.attemptId) {
+    feedbackModal.hintClicked = true;
+    sendChoice(feedbackModal.attemptId, "no", { click_type: "hint" }).catch(() => {});
+  }
+  await loadAiHintForModal();
 }
 
 async function onToggleReviewOpen() {
@@ -1081,6 +1597,7 @@ function clearAiFeedback() {
 
 // ====== 送出作答 ======
 async function submit() {
+  if (state.submitting || state.noTask) return;
   state.submitting = true;
   state.err = "";
   result.value = null;
@@ -1111,11 +1628,17 @@ async function submit() {
         return;
       }
 
+      const submittedAt = new Date();
+      const startedAtIso = testMeta.started_at_ms
+        ? new Date(Number(testMeta.started_at_ms)).toISOString()
+        : null;
       const duration_sec = testMeta.started_at_ms
-        ? Math.max(0, Math.round((Date.now() - Number(testMeta.started_at_ms)) / 1000))
+        ? Math.max(0, Math.round((submittedAt.getTime() - Number(testMeta.started_at_ms)) / 1000))
         : 0;
 
       const body = {
+        session_id: learningSessionId,
+        page: "parsons",
         student_id: String(studentId.value || ""),
         participant_id: String(participantId.value || ""),
         test_cycle_id: String(testCycleId.value || ""),
@@ -1126,6 +1649,8 @@ async function submit() {
         answer_ids: Array.isArray(answer_ids.value)
           ? answer_ids.value.filter(Boolean)
           : [],
+        started_at: startedAtIso,
+        submitted_at: submittedAt.toISOString(),
         duration_sec,
       };
 
@@ -1147,6 +1672,12 @@ async function submit() {
       }
 
       const r = await res.json();
+
+      if (!res.ok) {
+        state.err = r?.message || "答案送出失敗，請稍後再試。";
+        result.value = { is_correct: false, feedback: state.err };
+        return;
+      }
 
       // 前後測：完全不顯示任何回饋
       aiFeedbackDetail.value = null;
@@ -1179,7 +1710,7 @@ async function submit() {
     }
 
     // ==============================
-    // 一般練習模式：顯示 AI 回饋 + 回看影片
+    // 一般練習模式：送出時只做系統判斷；AI 提示由「查看提示」按鈕延後載入
     // ==============================
     const task_id = task.value?.task_id || task.value?._id;
     if (!task_id) {
@@ -1188,7 +1719,18 @@ async function submit() {
       return;
     }
 
+    const submittedAt = new Date();
+    const startedAtMs = Number(testStartedAt.value || 0);
+    const startedAtIso = startedAtMs
+      ? new Date(startedAtMs).toISOString()
+      : null;
+    const duration_sec = startedAtMs
+      ? Math.max(0, Math.round((submittedAt.getTime() - startedAtMs) / 1000))
+      : null;
+
     const body = {
+      session_id: learningSessionId,
+      page: "parsons",
       task_id,
       answer_ids: answer_ids.value,
       answer_lines: buildAnswerLines(),
@@ -1197,6 +1739,9 @@ async function submit() {
       review_attempt_id: review_attempt_id.value,
       student_id: String(studentId.value || ""),
       participant_id: String(participantId.value || ""),
+      started_at: startedAtIso,
+      submitted_at: submittedAt.toISOString(),
+      duration_sec,
     };
 
     const res = await fetch(`${API_BASE}/api/parsons/submit`, {
@@ -1206,6 +1751,12 @@ async function submit() {
     });
 
     const r = await res.json();
+
+    if (!res.ok) {
+      state.err = r?.message || "答案送出失敗，請稍後再試。";
+      result.value = { is_correct: false, feedback: state.err };
+      return;
+    }
 
     // AI 回饋優先覆蓋 hint
     if (r?.ai_feedback_detail) {
@@ -1246,7 +1797,7 @@ async function submit() {
       await openSuccessModal(r);
     }
 
-    if (r?.ok && r?.is_correct === false && r?.jump?.video_id) {
+    if (r?.ok && r?.is_correct === false) {
       openFeedbackModal(r, task_id);
       return;
     }
@@ -1355,6 +1906,7 @@ async function loadTask() {
   state.noTask = false;
 
   resetFilled();
+  testStartedAt.value = Date.now();
 
   try {
     if (isTestMode.value) {
@@ -1410,6 +1962,7 @@ async function loadTask() {
       templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
 
       await bindBlankFocusHandlers();
+      await recordTaskOpen();
       return;
     }
 
@@ -1437,6 +1990,7 @@ async function loadTask() {
     const restored = restorePracticeStateIfMatch(task.value);
 
     await bindBlankFocusHandlers();
+    await recordTaskOpen();
 
     if (restored) {
       const once = localStorage.getItem(RESTORE_ONCE_KEY);
@@ -1454,7 +2008,10 @@ async function loadTask() {
 }
 
 // ====== 生命週期 ======
-onMounted(loadTask);
+onMounted(async () => {
+  await initializeLearningLogging();
+  await loadTask();
+});
 
 onMounted(() => {
   _docKeydownHandler = (e) => {

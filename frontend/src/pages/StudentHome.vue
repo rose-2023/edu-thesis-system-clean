@@ -3,15 +3,24 @@
     <!-- 上方資訊列 -->
     <header class="topBar">
       <div class="leftProfile">
-        <div class="avatar">
-          <img
-            v-if="avatarUrl"
-            :src="avatarUrl"
-            alt="avatar"
-            class="avatarImg"
-          />
-          <div v-else class="avatarPlaceholder"></div>
-        </div>
+        <button
+          class="avatar"
+          :class="`avatar-${studentSexj || 'unknown'}`"
+          type="button"
+          :aria-label="`${avatarLabel}，點擊更換頭像`"
+          @click="openAvatarModal"
+        >
+          <span class="avatarMedia">
+            <img
+              v-if="currentAvatarImageUrl"
+              class="avatarImg"
+              :src="currentAvatarImageUrl"
+              alt=""
+            />
+            <span v-else class="avatarSymbol" aria-hidden="true">{{ currentAvatarEmoji }}</span>
+          </span>
+          <span class="avatarEditIcon" aria-hidden="true">✎</span>
+        </button>
 
         <div class="profileText">
           <div class="hello">你好，{{ studentName }}同學</div>
@@ -54,6 +63,63 @@
         </button>
       </div>
     </header>
+
+    <div v-if="avatarModalOpen" class="modalBackdrop" @click.self="closeAvatarModal">
+      <section class="avatarModal" role="dialog" aria-modal="true" aria-labelledby="avatar-modal-title">
+        <header class="avatarModalHeader">
+          <h2 id="avatar-modal-title">選擇頭像</h2>
+          <button
+            class="modalCloseButton"
+            type="button"
+            aria-label="關閉頭像選擇"
+            :disabled="avatarSaving"
+            @click="closeAvatarModal"
+          >
+            ×
+          </button>
+        </header>
+
+        <div class="avatarModalBody">
+          <div v-if="avatarError" class="avatarError">{{ avatarError }}</div>
+          <div v-if="avatarOptionsLoading" class="avatarLoading">載入頭像...</div>
+
+          <template v-else>
+            <section
+              v-for="group in avatarGroups"
+              :key="group.group_label"
+              class="avatarSection"
+            >
+              <h3>{{ group.group_label }}</h3>
+              <div class="avatarOptions">
+                <button
+                  v-for="option in group.avatars"
+                  :key="option.avatar_key"
+                  class="avatarOption"
+                  :class="{ selected: option.avatar_key === avatarKey }"
+                  type="button"
+                  :disabled="avatarSaving"
+                  @click="selectAvatar(option.avatar_key)"
+                >
+                  <span
+                    v-if="option.avatar_type === 'emoji'"
+                    class="avatarOptionEmoji"
+                    aria-hidden="true"
+                  >
+                    {{ option.avatar_src }}
+                  </span>
+                  <img v-else :src="avatarAssetUrl(option.avatar_src)" alt="" />
+                  <span>{{ option.label }}</span>
+                </button>
+              </div>
+            </section>
+          </template>
+        </div>
+
+        <footer class="avatarModalFooter">
+          頭像樣式由 DiceBear 提供。部分樣式採用 CC0 1.0 授權；Bottts 和 Avataaars 的樣式可免費用於個人和商業用途。
+        </footer>
+      </section>
+    </div>
 
     <!-- 單元列表 -->
     <main class="main">
@@ -141,6 +207,7 @@
 import { ref, computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import axios from "axios";
+import { logoutCurrentSession } from "../sessionAuth";
 
 // ✅ 固定打後端（避免相對路徑打到 Vite 5173 回傳 index.html => <!doctype html>）
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
@@ -150,8 +217,102 @@ const router = useRouter();
 // ==============================
 // 基本資訊（維持原本畫面用）
 // ==============================
-const avatarUrl = ref("");
 const studentName = ref("");
+const studentSexj = ref(null);
+const avatarType = ref(null);
+const avatarKey = ref(null);
+const avatarSrc = ref(null);
+const avatarGroups = ref([]);
+const avatarModalOpen = ref(false);
+const avatarOptionsLoading = ref(false);
+const avatarSaving = ref(false);
+const avatarError = ref("");
+const currentAvatarEmoji = computed(() => {
+  if (avatarType.value === "emoji" && ["👨", "👩"].includes(avatarSrc.value)) {
+    return avatarSrc.value;
+  }
+  return "👨";
+});
+const currentAvatarImageUrl = computed(() => (
+  avatarType.value === "image" ? avatarAssetUrl(avatarSrc.value) : ""
+));
+const avatarLabel = computed(() => {
+  if (currentAvatarImageUrl.value) return "學生圖片頭像";
+  if (currentAvatarEmoji.value === "👩") return "女學生頭像";
+  if (currentAvatarEmoji.value === "👨") return "男學生頭像";
+  return "學生頭像";
+});
+
+function avatarAssetUrl(value) {
+  const path = String(value || "").trim();
+  const allowedPath = /^\/static\/avatars\/(?:bot_0[1-6]|bottts(?:_neutral)?_0[1-6]|initial_face_0[1-6]|lorelei(?:_neutral)?_0[1-6]|notionists(?:_neutral)?_0[1-6]|avataaars(?:_neutral)?_0[1-6])\.svg$/;
+  if (!allowedPath.test(path)) return "";
+  return `${API_BASE.replace(/\/$/, "")}${path}`;
+}
+
+function applyAvatar(avatar) {
+  avatarType.value = avatar?.avatar_type || null;
+  avatarKey.value = avatar?.avatar_key || null;
+  avatarSrc.value = (
+    avatar?.avatar_src || avatar?.avatar_url || avatar?.avatar_value || null
+  );
+}
+
+async function loadAvatarOptions() {
+  avatarOptionsLoading.value = true;
+  avatarError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/api/avatars`);
+    const data = await response.json();
+    if (!response.ok || !data?.ok) throw new Error(data?.message || "載入頭像失敗");
+    avatarGroups.value = Array.isArray(data.groups) ? data.groups : [];
+  } catch (error) {
+    avatarError.value = error?.message || "載入頭像失敗";
+  } finally {
+    avatarOptionsLoading.value = false;
+  }
+}
+
+async function openAvatarModal() {
+  avatarModalOpen.value = true;
+  avatarError.value = "";
+  if (!avatarGroups.value.length) await loadAvatarOptions();
+}
+
+function closeAvatarModal() {
+  if (avatarSaving.value) return;
+  avatarModalOpen.value = false;
+  avatarError.value = "";
+}
+
+async function selectAvatar(selectedAvatarKey) {
+  const token = localStorage.getItem("token") || "";
+  if (!token) {
+    avatarError.value = "登入資訊已失效，請重新登入。";
+    return;
+  }
+
+  avatarSaving.value = true;
+  avatarError.value = "";
+  try {
+    const response = await fetch(`${API_BASE}/api/users/me/avatar`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ avatar_key: selectedAvatarKey }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data?.ok) throw new Error(data?.message || "更新頭像失敗");
+    applyAvatar(data.avatar);
+    avatarModalOpen.value = false;
+  } catch (error) {
+    avatarError.value = error?.message || "更新頭像失敗";
+  } finally {
+    avatarSaving.value = false;
+  }
+}
 
 // ==============================
 // 單元列表（動態）
@@ -266,8 +427,9 @@ async function loadHomeData() {
       unit: u.unit,
       name: unitDisplayName(u.unit),
       progress: Number(u.progress || 0),
+      total_videos: Number(u.total_videos || 0),
       theme: themePool[idx % themePool.length],
-    }));
+    })).filter((u) => u.total_videos > 0);
 
     const firstOngoing = units.value.find((u) => Number(u.progress || 0) < 100);
     ongoingUnit.value = firstOngoing ? firstOngoing.name : "已完成";
@@ -308,13 +470,9 @@ function goPostTest() {
   });
 }
 
-function logout() {
-  localStorage.removeItem("student_id");
-  localStorage.removeItem("studentId");
-  localStorage.removeItem("token");
-  localStorage.removeItem("access_token");
-  localStorage.removeItem("refresh_token");
-  router.replace("/");
+async function logout() {
+  await logoutCurrentSession(API_BASE);
+  router.replace("/login");
 }
 
 onMounted(async () => {
@@ -336,15 +494,18 @@ onMounted(async () => {
     console.warn("pretest status check failed:", e);
   }
 
-  // [修改] 用 API_BASE，避免打到錯的 host/port
-  const res = await fetch(`${API_BASE}/api/records/students?page=1&page_size=100`);
-  const data = await res.json();
-
-  if (data.ok) {
-    const found = data.students.find((s) => s.student_id === id);
-    if (found) {
-      studentName.value = found.name;
+  try {
+    const profileRes = await fetch(
+      `${API_BASE}/api/student/profile?student_id=${encodeURIComponent(id)}`,
+    );
+    const profileData = await profileRes.json();
+    if (profileData?.ok && profileData.student) {
+      studentName.value = profileData.student.name || id;
+      studentSexj.value = profileData.student.sexj || null;
+      applyAvatar(profileData.student);
     }
+  } catch (error) {
+    console.warn("student profile load failed:", error);
   }
 
   loadHomeData();
@@ -377,15 +538,60 @@ onMounted(async () => {
 }
 
 .avatar {
+  position: relative;
   width: 62px;
   height: 62px;
+  padding: 0;
   border-radius: 50%;
-  overflow: hidden;
-  background: #fde2d1;
+  overflow: visible;
+  background: #e2e8f0;
   display: grid;
   place-items: center;
-  box-shadow: 0 8px 18px rgba(246, 178, 74, 0.2);
+  box-shadow: 0 8px 18px rgba(71, 85, 105, 0.18);
   border: 3px solid rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  flex: 0 0 62px;
+  transition: box-shadow 160ms ease, transform 160ms ease;
+}
+
+.avatar:hover {
+  box-shadow: 0 10px 22px rgba(20, 108, 100, 0.24);
+  transform: translateY(-1px);
+}
+
+.avatar:focus-visible {
+  outline: 3px solid rgba(20, 108, 100, 0.35);
+  outline-offset: 3px;
+}
+
+.avatar-boy {
+  background: #dbeafe;
+  box-shadow: 0 8px 18px rgba(37, 99, 166, 0.2);
+}
+
+.avatar-girl {
+  background: #fce7f3;
+  box-shadow: 0 8px 18px rgba(190, 24, 93, 0.18);
+}
+
+.avatar-other,
+.avatar-unknown {
+  background: #e2e8f0;
+}
+
+.avatarSymbol {
+  font-size: 34px;
+  line-height: 1;
+}
+
+.avatarMedia {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 50%;
+  place-items: center;
+  background: inherit;
 }
 
 .avatarImg {
@@ -394,11 +600,174 @@ onMounted(async () => {
   object-fit: cover;
 }
 
-.avatarPlaceholder {
-  width: 36px;
-  height: 36px;
+.avatarEditIcon {
+  position: absolute;
+  z-index: 2;
+  right: -6px;
+  bottom: -5px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  border: 3px solid #fff;
   border-radius: 50%;
-  background: rgba(0, 0, 0, 0.15);
+  place-items: center;
+  color: #fff;
+  background: #0f766e;
+  box-shadow: 0 3px 8px rgba(15, 23, 42, 0.3);
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.modalBackdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  padding: 20px;
+  place-items: center;
+  background: rgba(15, 23, 42, 0.48);
+}
+
+.avatarModal {
+  display: flex;
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow: hidden;
+  box-sizing: border-box;
+  border: 1px solid #d8dee9;
+  border-radius: 8px;
+  padding: 0;
+  flex-direction: column;
+  background: #fff;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.2);
+}
+
+.avatarModalHeader {
+  display: flex;
+  padding: 20px 24px 12px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.avatarModalHeader h2 {
+  margin: 0;
+  color: #172033;
+  font-size: 20px;
+}
+
+.modalCloseButton {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  border: 1px solid #cbd5e1;
+  border-radius: 50%;
+  place-items: center;
+  color: #475569;
+  background: #fff;
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.modalCloseButton:disabled,
+.avatarOption:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.avatarModalBody {
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 0 24px 16px;
+  flex: 1 1 auto;
+}
+
+.avatarSection {
+  margin-top: 18px;
+}
+
+.avatarSection h3 {
+  margin: 0 0 10px;
+  color: #334155;
+  font-size: 14px;
+}
+
+.avatarOptions {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 10px;
+}
+
+.avatarOption {
+  display: flex;
+  height: 104px;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid #d8dee9;
+  border-radius: 8px;
+  padding: 10px 8px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: #475569;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.avatarOption:hover {
+  border-color: #72b6ad;
+  background: #f0fdfa;
+}
+
+.avatarOption.selected {
+  border-color: #146c64;
+  box-shadow: 0 0 0 2px rgba(20, 108, 100, 0.16);
+  background: #ecfdf5;
+}
+
+.avatarOptionEmoji {
+  font-size: 44px;
+  line-height: 1;
+}
+
+.avatarOption img {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+}
+
+.avatarModalFooter {
+  border-top: 1px solid #e5e7eb;
+  padding: 10px 24px 16px;
+  flex: 0 0 auto;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.avatarError {
+  margin-top: 12px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 9px 10px;
+  color: #991b1b;
+  background: #fee2e2;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.avatarLoading {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  color: #64748b;
+  font-size: 14px;
 }
 
 .profileText .hello {
@@ -729,6 +1098,35 @@ onMounted(async () => {
 
   .unitCard {
     width: min(420px, 100%);
+  }
+
+}
+
+@media (max-width: 640px) {
+  .modalBackdrop {
+    padding: 10px;
+  }
+
+  .avatarModal {
+    width: 94vw;
+    max-height: 86vh;
+  }
+
+  .avatarModalHeader {
+    padding: 16px 16px 10px;
+  }
+
+  .avatarModalBody {
+    max-height: 66vh;
+    padding: 0 16px 14px;
+  }
+
+  .avatarModalFooter {
+    padding: 10px 16px 14px;
+  }
+
+  .avatarOptions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

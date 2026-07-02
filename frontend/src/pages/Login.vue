@@ -4,7 +4,7 @@
       <div class="header">
         <div class="logo" aria-hidden="true">🧪</div>
         <div>
-          <h1>論文系統登入</h1>
+          <h1>影音學習平台</h1>
           <p>請使用學號與密碼登入</p>
         </div>
       </div>
@@ -49,10 +49,6 @@
           <span v-else>登入</span>
         </button>
       </form>
-
-      <div class="hint">
-        <p>提示：如果你忘記密碼，請聯絡老師。</p>
-      </div>
     </div>
   </div>
 </template>

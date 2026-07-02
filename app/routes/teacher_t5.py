@@ -40,13 +40,25 @@ def _safe_iso(dt):
         return ""
 
 
+def _is_soft_deleted(video_doc: dict) -> bool:
+    if not isinstance(video_doc, dict):
+        return False
+    v1 = video_doc.get("deleted")
+    v2 = video_doc.get("is_deleted")
+    true_like = {True, 1, "1", "true", "True", "TRUE"}
+    return (v1 in true_like) or (v2 in true_like)
+
+
 # =========================
 # A. units / videos / video_info
 # =========================
 @teacher_t5_bp.get("/units")
 def units():
     """取得所有單元"""
-    units_list = db.videos.distinct("unit", {"deleted": {"$ne": True}})
+    units_list = db.videos.distinct(
+        "unit",
+        {"deleted": {"$nin": [True, 1, "true", "True"]}, "is_deleted": {"$nin": [True, 1, "true", "True"]}},
+    )
     units_list = [u for u in units_list if u]
     units_list.sort()
 
@@ -61,18 +73,25 @@ def videos():
     """取得指定單元的影片"""
     unit_id = request.args.get("unit_id", "").strip()
 
-    query = {"deleted": {"$ne": True}}
+    query = {
+        "deleted": {"$nin": [True, 1, "true", "True"]},
+        "is_deleted": {"$nin": [True, 1, "true", "True"]},
+    }
     if unit_id:
         query["unit"] = unit_id
 
     videos_list = list(db.videos.find(query).sort("created_at", -1))
     result = []
     for v in videos_list:
+        if _is_soft_deleted(v):
+            continue
         result.append({
             "id": str(v["_id"]),
             "title": v.get("title", "未命名"),
             "unit": v.get("unit", ""),
-            "enabled": v.get("enabled", True)
+            "enabled": v.get("enabled", True),
+            "deleted": bool(v.get("deleted", False)),
+            "is_deleted": bool(v.get("is_deleted", False)),
         })
 
     return jsonify({"ok": True, "items": result})
@@ -89,6 +108,8 @@ def video_info():
     video = db.videos.find_one({"_id": vid})
     if not video:
         return jsonify({"ok": False, "error": "影片不存在"}), 404
+    if _is_soft_deleted(video):
+        return jsonify({"ok": False, "error": "影片已刪除"}), 404
 
     return jsonify({
         "ok": True,
@@ -121,11 +142,39 @@ def questions():
     else:
         q = {"$or": [{"video_id": video_id}, {"video_id_str": video_id}]}
 
+    # 軟刪除影片不應再出現在老師端題目列表（相容 deleted / is_deleted）。
+    if vid:
+        vdoc = db.videos.find_one({"_id": vid}, {"deleted": 1, "is_deleted": 1}) or {}
+        if vdoc and (vdoc.get("deleted") is True or vdoc.get("is_deleted") is True):
+            return jsonify({"ok": True, "items": []})
+
     # 排序
     sort_dir = -1 if sort == "newest" else 1
 
     items = []
+    _video_deleted_cache = {}
+
+    def _task_video_is_deleted(task_doc: dict) -> bool:
+        raw_vid = task_doc.get("video_id")
+        vid_oid = raw_vid if isinstance(raw_vid, ObjectId) else _oid(str(raw_vid or ""))
+        if not vid_oid:
+            vid_oid = _oid(str(task_doc.get("video_id_str") or ""))
+        if not vid_oid:
+            return False
+
+        key = str(vid_oid)
+        if key in _video_deleted_cache:
+            return _video_deleted_cache[key]
+
+        vdoc = db.videos.find_one({"_id": vid_oid}, {"deleted": 1, "is_deleted": 1}) or {}
+        is_del = bool(vdoc and (vdoc.get("deleted") is True or vdoc.get("is_deleted") is True))
+        _video_deleted_cache[key] = is_del
+        return is_del
+
     for t in db.parsons_tasks.find(q).sort("created_at", sort_dir):
+        if _task_video_is_deleted(t):
+            continue
+
         enabled = bool(t.get("enabled", False))
 
         # ===== 統一來源 =====
@@ -358,6 +407,22 @@ def get_question():
         # 老師審核
         "review_tags": t.get("review_tags", []) or [],
         "review_note": t.get("review_note", "") or "",
+        # [新增] 概念章節相關欄位（讓前端重新開啟 modal 時能顯示已儲存內容），概念草稿與ai輔助區塊
+        "concept_chapters_formal": t.get("concept_chapters_formal") or [],
+        "concept_chapters_draft": t.get("concept_chapters_draft") or [],
+        "teacher_concept_chapters": t.get("teacher_concept_chapters") or [],
+        "concept_chapters_warnings": t.get("concept_chapters_warnings") or [],
+        "concept_align_status": t.get("concept_align_status", "") or "draft",
+        "teaching_range_start": t.get("teaching_range_start"),
+        "teaching_range_end": t.get("teaching_range_end"),
+        "code_start_ts": t.get("code_start_ts") or t.get("teacher_code_start_ts"),
+        "block_chapter_map": t.get("block_chapter_map") or {},
+        "teacher_segment_map": t.get("teacher_segment_map") or {},
+        "ai_segment_map": t.get("ai_segment_map") or {},
+        "slot_concept_map": t.get("slot_concept_map") or {},
+        "chapter_recommendations": (
+            (t.get("subtitle_health") or {}).get("chapter_recommendations") or []
+        ),
     })
 
 
@@ -487,6 +552,8 @@ def regenerate():
     video_doc = db.videos.find_one({"_id": video_oid})
     if not video_doc:
         return jsonify({"ok": False, "error": "影片不存在"}), 404
+    if _is_soft_deleted(video_doc):
+        return jsonify({"ok": False, "error": "影片已刪除，無法重新生成"}), 400
 
     try:
         # [修改] 呼叫 parsons.py 的核心邏輯，這會讀取字幕並送往 OpenAI
@@ -555,7 +622,7 @@ def generation_status():
             "ok": True,
             "generated": False,
             "applied": False,
-            "message": "還未生成"
+            "message": "還未生成",
         })
 
     return jsonify({

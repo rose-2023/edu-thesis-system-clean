@@ -3,6 +3,7 @@ from flask import Blueprint, request, jsonify
 from bson import ObjectId
 from datetime import datetime, timezone
 from app.db import db
+from app.session_auth import current_participant_id
 
 events_bp = Blueprint("events", __name__)
 
@@ -26,7 +27,7 @@ def log_event():
     """
     data = request.get_json(silent=True) or {}
     etype = (data.get("type") or "").strip()
-    participant_id = (data.get("participant_id") or "").strip()
+    participant_id = current_participant_id()
     video_id = (data.get("video_id") or "").strip()
     meta = data.get("meta") or {}
 

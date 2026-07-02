@@ -101,6 +101,7 @@ import { ref, onMounted, nextTick } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import { computed } from "vue";
 import { onBeforeUnmount } from "vue";
+import { logoutCurrentSession } from "../sessionAuth";
 
 const router = useRouter();
 const route = useRoute();
@@ -195,7 +196,7 @@ function _bindPlayerWatchEvents() {
   });
 }
 
-const API_BASE = "http://127.0.0.1:5000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
 
 const units = ref([]);
 const openIndex = ref(0);
@@ -218,14 +219,23 @@ const showReturnBar = computed(() => {
   return route.query.start != null;
 });
 
-function _normalizeUnitPrefix(rawUnit) {
+function _normalizeRawUnit(rawUnit) {
   const raw = String(rawUnit || "").trim();
+  if (!raw) return "";
+
+  // 老師端有些資料會出現 AU1-IO / au1-io，學生端一律視為 U1-IO
+  const normalized = raw.replace(/^A(?=U\d+)/i, "");
+  return normalized.trim();
+}
+
+function _normalizeUnitPrefix(rawUnit) {
+  const raw = _normalizeRawUnit(rawUnit);
   const m = raw.match(/^(U\d+)/i);
   return m ? m[1].toUpperCase() : raw.toUpperCase();
 }
 
 function _normalizeUnitKey(rawUnit) {
-  const raw = String(rawUnit || "").trim();
+  const raw = _normalizeRawUnit(rawUnit);
   if (!raw) return "";
   const m = raw.match(/^(U\d+)(?:[-_\s]*([A-Za-z]+))?/i);
   if (m) {
@@ -237,7 +247,7 @@ function _normalizeUnitKey(rawUnit) {
 }
 
 function displayUnitName(rawUnit) {
-  const raw = String(rawUnit || "").trim();
+  const raw = _normalizeRawUnit(rawUnit);
   if (!raw) return "";
 
   const prefix = _normalizeUnitPrefix(raw);
@@ -288,10 +298,13 @@ function toggleUnit(idx) {
 function groupByUnit(videos) {
   const map = new Map();
   for (const v of videos) {
-    const rawUnit = String(v.unit || "未分類").trim();
+    const rawUnit = _normalizeRawUnit(v.unit || "未分類");
     const key = _normalizeUnitKey(rawUnit) || "未分類";
     if (!map.has(key)) map.set(key, { unit: rawUnit, unitKey: key, videos: [] });
-    map.get(key).videos.push(v);
+    map.get(key).videos.push({
+      ...v,
+      unit: rawUnit,
+    });
   }
   return [...map.values()].sort((a, b) =>
     (a.unitKey || a.unit).localeCompare((b.unitKey || b.unit), "en", { numeric: true })
@@ -368,17 +381,8 @@ function goHome() {
   router.push("/home");
 }
 
-function logout() {
-  try {
-    localStorage.removeItem("student_id");
-    localStorage.removeItem("studentId");
-    localStorage.removeItem("token");
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("refresh_token");
-    localStorage.removeItem("user");
-    sessionStorage.removeItem("token");
-    sessionStorage.removeItem("access_token");
-  } catch (_) {}
+async function logout() {
+  await logoutCurrentSession(API_BASE);
   router.replace("/login");
 }
 
@@ -418,6 +422,42 @@ async function seekToSegment(start, end) {
   else el.addEventListener("loadedmetadata", doSeek, { once: true });
 }
 
+async function fetchAllActiveVideos() {
+  const all = [];
+  let page = 1;
+  let totalPages = 1;
+
+  while (page <= totalPages) {
+    const qs = new URLSearchParams({
+      status: "active",
+      page: String(page),
+      per_page: "200",
+    });
+
+    const res = await fetch(`${API_BASE}/api/admin_upload/videos?${qs.toString()}`);
+    if (!res.ok) {
+      throw new Error(`影片清單讀取失敗（HTTP ${res.status}）`);
+    }
+
+    const data = await res.json();
+    const pageItems = Array.isArray(data)
+      ? data
+      : data.items || data.videos || [];
+
+    all.push(...pageItems);
+
+    const total = Number(data?.total || 0);
+    const perPage = Number(data?.per_page || 200) || 200;
+    totalPages = Number(data?.pages || Math.max(1, Math.ceil(total / perPage)) || 1);
+
+    if (!data || Array.isArray(data)) break;
+    if (!pageItems.length) break;
+    page += 1;
+  }
+
+  return all;
+}
+
 onMounted(async () => {
   await nextTick();
   await loadCompletedVideoIds();
@@ -428,12 +468,15 @@ onMounted(async () => {
   const start = Number(route.query.start);
   const end = Number(route.query.end);
 
-  // 讀影片列表
-  const res = await fetch(`${API_BASE}/api/admin_upload/videos`);
-  const data = await res.json();
-  const list = Array.isArray(data) ? data : data.items || data.videos || [];
+  // 讀影片列表（學生端不能只抓第一頁，否則單元/影片會漏）
+  const list = await fetchAllActiveVideos();
 
-  const filtered = list.filter((v) => v.active !== false && v.deleted !== true);
+  const filtered = list.filter((v) => (
+    v.active !== false
+    && v.is_active !== false
+    && v.deleted !== true
+    && v.is_deleted !== true
+  ));
 
   function resolveFileUrl(p, kind = "") {
     if (!p) return "";

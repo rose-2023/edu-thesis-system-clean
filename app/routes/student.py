@@ -1,14 +1,66 @@
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timezone
 from ..db import db
+from ..avatar_utils import resolve_avatar_src
+from ..session_auth import current_participant_id, current_student_id
 import os
 import re
 from openai import OpenAI
 from bson import ObjectId
 
-print("OPENAI_API_KEY =", os.environ.get("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 student_bp = Blueprint("student", __name__)
+
+
+@student_bp.get("/profile")
+def student_profile():
+    student_id = current_student_id()
+
+    user = db.users.find_one(
+        {"student_id": student_id, "role": "student"},
+        {
+            "_id": 0,
+            "student_id": 1,
+            "name": 1,
+            "class_name": 1,
+            "group_type": 1,
+            "sexj": 1,
+            "avatar_type": 1,
+            "avatar_key": 1,
+            "avatar_src": 1,
+            "avatar_value": 1,
+            "avatar_url": 1,
+            "avatar_style": 1,
+            "avatar_license": 1,
+            "avatar_updated_at": 1,
+        },
+    )
+    if not user:
+        return jsonify({"ok": False, "message": "找不到學生資料"}), 404
+
+    sexj = str(user.get("sexj") or "").strip().lower()
+    if sexj in {"male", "m", "男", "男性"}:
+        sexj = "boy"
+    elif sexj in {"female", "f", "女", "女性"}:
+        sexj = "girl"
+    elif sexj not in {"boy", "girl", "other"}:
+        sexj = None
+    return jsonify({
+        "ok": True,
+        "student": {
+            "student_id": user.get("student_id"),
+            "name": user.get("name") or "",
+            "class_name": user.get("class_name"),
+            "group_type": user.get("group_type"),
+            "sexj": sexj,
+            "avatar_type": user.get("avatar_type"),
+            "avatar_key": user.get("avatar_key"),
+            "avatar_src": resolve_avatar_src(user),
+            "avatar_style": user.get("avatar_style"),
+            "avatar_license": user.get("avatar_license"),
+            "avatar_updated_at": user.get("avatar_updated_at"),
+        },
+    })
 
 
 # =========================
@@ -18,12 +70,9 @@ student_bp = Blueprint("student", __name__)
 @student_bp.get("/completed_videos")
 def completed_videos():
     try:
-        student_id = (request.args.get("student_id") or "").strip()
-        participant_id = (request.args.get("participant_id") or "").strip()
-        sid = student_id or participant_id
-
-        if not sid:
-            return jsonify({"ok": False, "error": "missing student_id"}), 400
+        student_id = current_student_id()
+        participant_id = current_participant_id()
+        sid = student_id
 
         # 支援 student_id / participant_id 兩種傳法，盡量補齊對應學生學號。
         sid_candidates = {sid}
@@ -31,14 +80,6 @@ def completed_videos():
             sid_candidates.add(participant_id)
 
         # participant_id 若是 users._id，可回查 student_id
-        try:
-            if ObjectId.is_valid(participant_id or sid):
-                u = db.users.find_one({"_id": ObjectId(participant_id or sid)})
-                if u and u.get("student_id"):
-                    sid_candidates.add(str(u.get("student_id")).strip())
-        except Exception:
-            pass
-
         # 只算「答對」才完成。
         query = {
             "video_id": {"$ne": None},
@@ -74,7 +115,7 @@ def units_progress():
       - test_cycle_id (預設 default)
     """
     try:
-        student_id = (request.args.get("student_id") or request.args.get("participant_id") or "").strip()
+        student_id = current_student_id()
         test_cycle_id = (request.args.get("test_cycle_id") or "default").strip() or "default"
 
         if not student_id:
@@ -83,7 +124,7 @@ def units_progress():
         # 1) 取得影片（老師端上傳）=> 用 unit 分組
         videos = list(
             db.videos.find(
-                {"deleted": {"$ne": True}},
+                {"deleted": {"$ne": True}, "is_deleted": {"$ne": True}},
                 {"_id": 1, "unit": 1, "title": 1, "is_active": 1},
             )
         )
@@ -175,9 +216,7 @@ PRE_TOTAL = 10
 
 @student_bp.get("/entry")
 def entry():
-    participant_id = request.args.get("participant_id", "").strip()
-    if not participant_id:
-        return jsonify({"ok": False, "message": "缺少 participant_id"}), 400
+    participant_id = current_participant_id()
 
     # 已完成前測
     done = db.sessions.find_one({
@@ -224,7 +263,7 @@ def now_utc():
 @student_bp.post("/learning/start")
 def learning_start():
     data = request.get_json() or {}
-    participant_id = (data.get("participant_id") or "").strip()
+    participant_id = current_participant_id()
     unit = (data.get("unit") or "").strip()
 
     if not participant_id or not unit:
@@ -272,7 +311,16 @@ def learning_end():
     if understood is not None:
         update["understood"] = understood
 
-    db.learning_logs.update_one({"_id": oid}, {"$set": update})
+    result = db.learning_logs.update_one(
+        {"_id": oid, "participant_id": current_participant_id()},
+        {"$set": update},
+    )
+    if result.matched_count == 0:
+        return jsonify({
+            "ok": False,
+            "error": "learning_log_not_found",
+            "message": "找不到可更新的學習紀錄。",
+        }), 404
 
     return jsonify({"ok": True})
 
@@ -288,7 +336,10 @@ def unit_learning(unit):
         return jsonify({"ok": False, "message": "unit 不可為空"}), 400
 
     # 影片：從老師端 videos 找該 unit 的「啟用中」最新一筆
-    v = db.videos.find_one({"unit": unit, "deleted": False, "active": True}, sort=[("created_at", -1)])
+    v = db.videos.find_one(
+        {"unit": unit, "deleted": {"$ne": True}, "is_deleted": {"$ne": True}, "active": True},
+        sort=[("created_at", -1)],
+    )
     if not v:
         return jsonify({"ok": True, "video": None, "bullets": []})
 
@@ -316,7 +367,10 @@ def bullets_regenerate(unit):
     if not unit:
         return jsonify({"ok": False, "message": "unit 不可為空"}), 400
 
-    v = db.videos.find_one({"unit": unit, "deleted": False, "active": True}, sort=[("created_at", -1)])
+    v = db.videos.find_one(
+        {"unit": unit, "deleted": {"$ne": True}, "is_deleted": {"$ne": True}, "active": True},
+        sort=[("created_at", -1)],
+    )
     if not v:
         return jsonify({"ok": False, "message": f"{unit} 尚未有啟用影片"}), 404
 

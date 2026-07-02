@@ -13,6 +13,7 @@ venv/
 # Flask user uploads
 # ========================
 uploads/
+backups/
 *.bak.vue
 *.bak2.vue
 *.bak.*
@@ -28,3 +29,21 @@ dist/
 # VS Code (optional)
 # ========================
 .vscode/
+
+# ========================
+# Mongo DB 備份
+# ========================
+/MongoDB備份/
+/before_experiment_*/
+*.bson
+*.metadata.json
+
+# =========================
+# Research / exported data
+# =========================
+/formal_test_csv_check/
+*.csv
+# =========================
+# md檔不需要上傳
+# =========================
+AGENTS.md

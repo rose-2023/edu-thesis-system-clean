@@ -5,8 +5,8 @@
       <div class="leftProfile">
         <div class="avatar">
           <img
-            v-if="avatarUrl"
-            :src="avatarUrl"
+            v-if="avatarSrc"
+            :src="avatarSrc"
             alt="avatar"
             class="avatarImg"
           />
@@ -102,20 +102,15 @@
 import { ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import axios from "axios";
-
-const studentName = ref("許同學");
-const level = ref("L2");
-const avatarUrl = ref("");
-
 const ongoingUnit = ref("U1-2");
 
 const totalDots = 12;
 const doneDots = ref(8);
 
-const units = ref([
-  { unit: "U1", name: "迴圈基礎", progress: 80, theme: "blue" },
-  { unit: "U2", name: "串列與字串", progress: 20, theme: "green" },
-]);
+// const units = ref([
+//   { unit: "U1", name: "迴圈基礎", progress: 80, theme: "blue" },
+//   { unit: "U2", name: "串列與字串", progress: 20, theme: "green" },
+// ]);
 
 // ✅【新增】後測狀態（統一讀取 test_control）
 const testCycleId = ref("default");

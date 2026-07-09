@@ -1,6 +1,6 @@
 <template>
   <div class="page">
-    <TeacherSidebar active="upload" />
+    <TeacherSidebar class="uploadSidebar" active="upload" />
 
     <div class="card">
       <h2>老師端：上傳影片</h2>
@@ -177,7 +177,7 @@
         </div>
       </div>
 
-      <!-- ✅ 分頁控制（每頁 10 筆） -->
+      <!-- ✅ 分頁控制（每頁 5 筆） -->
       <div class="pager" v-if="totalPages > 1">
         <button class="btn2" :disabled="page <= 1 || loadingList" @click="goPage(1)">第一頁</button>
         <button class="btn2" :disabled="page <= 1 || loadingList" @click="goPage(page - 1)">上一頁</button>
@@ -225,7 +225,7 @@ const qTitle = ref("");
 
 /* ✅ 分頁 */
 const page = ref(1);
-const perPage = ref(10);
+const perPage = ref(5);
 const total = ref(0);
 
 /* ✅ 字幕檢核結果 */
@@ -408,13 +408,17 @@ function goPage(p) {
 /* 縮圖 URL */
 const BACKEND_BASE = api.defaults.baseURL?.replace(/\/$/, "") || "";
 function thumbSrc(v) {
-  const p = v?.thumbnail || "";
+  const p = String(v?.thumbnail || "").trim().replace(/\\/g, "/");
   if (!p) return "";
   if (p.startsWith("http://") || p.startsWith("https://")) return p;
-  
-  // 盡量用相對路徑（同網域/反向代理最穩）
-  if (p.startsWith("/")) return p;
-   return `${BACKEND_BASE}/api/admin_upload/uploads/${p.replace(/^\/+/, "")}`;
+
+  // DB 新舊資料可能是 thumbnails/...、uploads/thumbnails/... 或舊 API 路徑。
+  // 圖片標籤不會帶 axios 的 Authorization header，因此統一走靜態 /uploads 路由。
+  const relativePath = p
+    .replace(/^\/+/, "")
+    .replace(/^api\/admin_upload\/uploads\//, "")
+    .replace(/^uploads\//, "");
+  return `${BACKEND_BASE}/uploads/${relativePath}`;
 }
 
 function onThumbError(v) {
@@ -580,12 +584,13 @@ onMounted(() => {
   display: grid;
   grid-template-columns: 240px 1fr;
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
   padding: 0px;
   background: #f6f7fb;
 }
 
-.card { width: 100%; border: 1px solid #e6e6e6; border-radius: 16px; padding: 18px; background: #fff; box-shadow: 0 6px 26px rgba(0,0,0,.05); }
+.uploadSidebar { min-height: 100%; height: 100%; box-sizing: border-box; }
+.card { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid #e6e6e6; border-radius: 16px; padding: 18px; background: #fff; box-shadow: 0 6px 26px rgba(0,0,0,.05); }
 .row { margin: 12px 0; display: flex; flex-direction: column; gap: 6px; }
 input, textarea { padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
 .btn { width: 100%; padding: 10px; border: 0; border-radius: 10px; cursor: pointer; background: #111827; color: #fff; }
@@ -704,6 +709,11 @@ input, textarea { padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
   .sidebar {
     min-height: auto;
     position: static;
+  }
+
+  .uploadSidebar {
+    min-height: auto;
+    height: auto;
   }
 
   .thead { display: none; }

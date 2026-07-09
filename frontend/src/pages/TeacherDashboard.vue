@@ -34,19 +34,33 @@
 
         <!-- Overview（保留你原本，並加入② KPI） -->
         <section class="card">
-          <div class="card-title">數據概覽</div>
+          <div class="card-head">
+            <div>
+              <div class="card-title">數據概覽</div>
+              <div class="card-subtitle">{{ dateRangeText }}</div>
+            </div>
+            <div class="date-filter">
+              <label>
+                <span>開始日期</span>
+                <input v-model="startDate" type="date" @change="loadDashboard" />
+              </label>
+              <label>
+                <span>結束日期</span>
+                <input v-model="endDate" type="date" @change="loadDashboard" />
+              </label>
+              <button class="btn small" type="button" :disabled="dashboardLoading" @click="loadDashboard">
+                {{ dashboardLoading ? "查詢中" : "查詢" }}
+              </button>
+            </div>
+          </div>
+          <p v-if="dashboardError" class="error-text">{{ dashboardError }}</p>
           <div class="kpis">
             <div class="kpi">
-              <div class="kpi-label">本週學習人次</div>
-              <div class="kpi-value">{{ overview.weekly_sessions }}</div>
+              <div class="kpi-label">期間學習人數</div>
+              <div class="kpi-value">{{ periodLearners }}</div>
+              <div class="kpi-note">依 learning_logs 操作歷程統計</div>
             </div>
 
-            <div class="kpi">
-              <div class="kpi-label">平均正確率</div>
-              <div class="kpi-value">{{ overview.avg_accuracy }}%</div>
-            </div>
-
-            <!-- ✅ ② 新增 KPI：單元數/影片總數/練習總數 -->
             <div class="kpi">
               <div class="kpi-label">單元數</div>
               <div class="kpi-value">{{ unitsCount }}</div>
@@ -58,18 +72,18 @@
             </div>
 
             <div class="kpi">
-              <div class="kpi-label">練習總數</div>
+              <div class="kpi-label">練習題總數</div>
               <div class="kpi-value">{{ totalPractices }}</div>
             </div>
 
-            <div class="kpi wide">
-              <div class="kpi-label">常見錯誤概念</div>
-              <div class="chips">
-                <span v-for="(x,i) in overview.top_misconceptions" :key="i" class="chip">
-                  {{ mapTag(x) }}
-                </span>
-                <span v-if="!overview.top_misconceptions?.length" class="muted">尚無資料</span>
-              </div>
+            <div class="kpi">
+              <div class="kpi-label">前測題總數</div>
+              <div class="kpi-value">{{ pretestQuestionCount }}</div>
+            </div>
+
+            <div class="kpi">
+              <div class="kpi-label">後測題總數</div>
+              <div class="kpi-value">{{ posttestQuestionCount }}</div>
             </div>
           </div>
         </section>
@@ -113,8 +127,22 @@ import TeacherSidebar from "../components/TeacherSidebar.vue";
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
 const router = useRouter();
 
-const overview = reactive({ weekly_sessions: 0, avg_accuracy: 0, top_misconceptions: [] });
+const overview = reactive({
+  weekly_sessions: 0,
+  active_learners: 0,
+});
+const resourceCounts = reactive({
+  unit_count: 0,
+  video_count: 0,
+  practice_task_count: 0,
+  pretest_question_count: 0,
+  posttest_question_count: 0,
+});
 const units = ref([]);
+const startDate = ref("");
+const endDate = ref("");
+const dashboardLoading = ref(false);
+const dashboardError = ref("");
 
 // ✅ 你原本註解掉的 watch / fetchVideos 我不動（照你的要求）
 // watch(
@@ -122,17 +150,6 @@ const units = ref([]);
 //   () => fetchVideos(),
 //   { immediate: true }
 // );
-
-function mapTag(tag) {
-  const map = {
-    "float_vs_int": "輸入型別（float/int）",
-    "need_2dp": "輸出格式（小數兩位）",
-    "perimeter_missing_2": "周長乘以2",
-    "loop_condition": "迴圈條件",
-    "divmod": "整除/餘數",
-  };
-  return map[tag] || tag;
-}
 
 function go(path) { router.push(path); }
 
@@ -152,29 +169,80 @@ function goUnitDetail(unit) {
   router.push({ path: "/admin/upload", query: { unit } });
 }
 
-async function loadDashboard() {
-  const res = await fetch(`${API_BASE}/api/teacher_dashboard?range=week`);
-  const data = await res.json();
-  if (!data.ok) return;
-
-  overview.weekly_sessions = data.overview.weekly_sessions || 0;
-  overview.avg_accuracy = data.overview.avg_accuracy || 0;
-  overview.top_misconceptions = data.overview.top_misconceptions || [];
-  units.value = data.units || [];
+function dateInputValue(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
-/** ✅ ② KPI 新增：不改你原本資料結構，直接由 units 計算 */
-const unitsCount = computed(() => units.value.length);
+function setDefaultDateRange() {
+  const today = new Date();
+  const start = new Date(today);
+  start.setDate(today.getDate() - 6);
+  startDate.value = dateInputValue(start);
+  endDate.value = dateInputValue(today);
+}
 
-const totalVideos = computed(() =>
-  units.value.reduce((sum, u) => sum + Number(u.videos_count || 0), 0)
-);
+async function loadDashboard() {
+  dashboardLoading.value = true;
+  dashboardError.value = "";
+  try {
+    const params = new URLSearchParams();
+    if (startDate.value) params.set("start_date", startDate.value);
+    if (endDate.value) params.set("end_date", endDate.value);
+    if (!startDate.value && !endDate.value) params.set("range", "week");
+    params.set("_ts", String(Date.now()));
 
-const totalPractices = computed(() =>
-  units.value.reduce((sum, u) => sum + Number(u.practices_count || 0), 0)
-);
+    const res = await fetch(`${API_BASE}/api/teacher_dashboard?${params.toString()}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      throw new Error(data?.message || `Dashboard 載入失敗：${res.status}`);
+    }
+    if (!data.date_range || !data.resource_counts) {
+      throw new Error("Dashboard 後端仍是舊版，請重新啟動後端服務後再查詢。");
+    }
 
-onMounted(loadDashboard);
+    overview.weekly_sessions = data.overview.weekly_sessions || 0;
+    overview.active_learners = data.overview.active_learners ?? overview.weekly_sessions;
+    resourceCounts.unit_count = data.resource_counts.unit_count || 0;
+    resourceCounts.video_count = data.resource_counts.video_count || 0;
+    resourceCounts.practice_task_count = data.resource_counts.practice_task_count || 0;
+    resourceCounts.pretest_question_count = data.resource_counts.pretest_question_count || 0;
+    resourceCounts.posttest_question_count = data.resource_counts.posttest_question_count || 0;
+    units.value = data.units || [];
+
+    if (data.date_range?.start_date) startDate.value = data.date_range.start_date;
+    if (data.date_range?.end_date) endDate.value = data.date_range.end_date;
+  } catch (error) {
+    dashboardError.value = error?.message || String(error);
+  } finally {
+    dashboardLoading.value = false;
+  }
+}
+
+const unitsCount = computed(() => resourceCounts.unit_count || units.value.length);
+
+const totalVideos = computed(() => resourceCounts.video_count || 0);
+
+const totalPractices = computed(() => resourceCounts.practice_task_count || 0);
+
+const pretestQuestionCount = computed(() => resourceCounts.pretest_question_count || 0);
+
+const posttestQuestionCount = computed(() => resourceCounts.posttest_question_count || 0);
+
+const periodLearners = computed(() => overview.active_learners ?? overview.weekly_sessions ?? 0);
+
+const dateRangeText = computed(() => (
+  startDate.value && endDate.value
+    ? `目前統計期間：${startDate.value} 至 ${endDate.value}`
+    : "目前統計期間：最近 7 天"
+));
+
+onMounted(() => {
+  setDefaultDateRange();
+  loadDashboard();
+});
 
 function goVideos() {
   router.push("/admin/upload");
@@ -266,6 +334,59 @@ function manageUnit(unit) {
   color: #111;
 }
 
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.card-head .card-title {
+  margin-bottom: 4px;
+}
+
+.card-subtitle {
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.date-filter {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.date-filter label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.date-filter input {
+  border: 1px solid #d7dde7;
+  border-radius: 10px;
+  padding: 7px 9px;
+  min-height: 32px;
+  box-sizing: border-box;
+}
+
+.error-text {
+  margin: 0 0 12px;
+  color: #b42318;
+  background: #fff1f0;
+  border: 1px solid #ffccc7;
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-weight: 800;
+}
+
 .kpis {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -294,6 +415,14 @@ function manageUnit(unit) {
   font-weight: 900;
   margin-top: 6px;
   color: #0f172a;
+}
+
+.kpi-note {
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
 }
 
 .chips {
@@ -452,6 +581,20 @@ textarea {
   .layout {
     margin-left: 12px;
     margin-right: 12px;
+  }
+
+  .card-head {
+    flex-direction: column;
+  }
+
+  .date-filter {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .date-filter label {
+    flex: 1;
+    min-width: 140px;
   }
 
   .quick,

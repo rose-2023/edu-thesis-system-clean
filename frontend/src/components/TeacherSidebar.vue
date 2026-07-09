@@ -2,11 +2,11 @@
   <aside class="sidebar">
     <div class="profile">
       <div class="avatar">👩‍🏫</div>
-      <div class="hello">您好，老師</div>
+      <div class="hello">您好，管理員</div>
     </div>
 
     <div class="sidebar-menu">
-      <div class="navitem" :class="{ active: active === 'dashboard' }" @click="go('/admin/dashboard')">📚 老師儀錶板總覽</div>
+      <div class="navitem" :class="{ active: active === 'dashboard' }" @click="go('/admin/dashboard')">📚 儀錶板總覽</div>
       <div class="navitem" :class="{ active: active === 'upload' }" @click="go('/admin/upload')">📁 影片管理</div>
       <div class="navitem" :class="{ active: active === 'subtitle' }" @click="go('/admin/subtitle')">📝 字幕/逐字稿</div>
       <div class="navitem" :class="{ active: active === 'agentlog' }" @click="go('/admin/agentlog')">🧩 AI 管理生成紀錄檢視</div>

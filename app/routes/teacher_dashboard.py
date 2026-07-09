@@ -1,14 +1,143 @@
 # app/routes/teacher_dashboard.py
 from flask import Blueprint, request, jsonify
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, time, timezone, timedelta
 from bson import ObjectId
 from ..db import db
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - older Python fallback
+    ZoneInfo = None
+
 
 teacher_dashboard_bp = Blueprint("teacher_dashboard", __name__)
+FORMAL_GROUP_TYPES = ("control", "experimental")
+
+
+def _taipei_timezone():
+    if ZoneInfo:
+        try:
+            return ZoneInfo("Asia/Taipei")
+        except Exception:
+            pass
+    return timezone(timedelta(hours=8))
+
+
+TAIPEI_TZ = _taipei_timezone()
 
 def _utc_now():
     return datetime.now(timezone.utc)
+
+
+def _date_input(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _date_range_from_request(range_param):
+    start_date = _date_input(request.args.get("start_date"))
+    end_date = _date_input(request.args.get("end_date"))
+    today_taipei = _utc_now().astimezone(TAIPEI_TZ).date()
+
+    if not start_date and not end_date:
+        days = 30 if range_param == "month" else 7
+        end_date = today_taipei
+        start_date = today_taipei - timedelta(days=days - 1)
+    elif start_date and not end_date:
+        end_date = start_date
+    elif end_date and not start_date:
+        start_date = end_date
+
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    start_local = datetime.combine(start_date, time.min, tzinfo=TAIPEI_TZ)
+    end_local_exclusive = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=TAIPEI_TZ)
+    return {
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "start_utc": start_local.astimezone(timezone.utc),
+        "end_utc_exclusive": end_local_exclusive.astimezone(timezone.utc),
+    }
+
+
+def _formal_data_query():
+    return {
+        "is_test_data": {"$ne": True},
+        "group_type": {"$in": list(FORMAL_GROUP_TYPES)},
+    }
+
+
+def _time_query(field, date_range):
+    return {
+        field: {
+            "$gte": date_range["start_utc"],
+            "$lt": date_range["end_utc_exclusive"],
+        }
+    }
+
+
+def _learning_students_count(date_range):
+    if "learning_logs" not in db.list_collection_names():
+        return 0
+    query = {
+        **_formal_data_query(),
+        **_time_query("event_at", date_range),
+        "student_id": {"$nin": [None, ""]},
+    }
+    return len(db.learning_logs.distinct("student_id", query))
+
+
+def _collection_exists(name):
+    return name in db.list_collection_names()
+
+
+def _count_not_deleted(collection_name, extra_query=None):
+    if not _collection_exists(collection_name):
+        return 0
+    query = {"deleted": {"$ne": True}}
+    if extra_query:
+        query.update(extra_query)
+    return db[collection_name].count_documents(query)
+
+
+def _distinct_units():
+    units = set()
+    for collection_name in ("videos", "parsons_tasks", "units"):
+        if not _collection_exists(collection_name):
+            continue
+        for value in db[collection_name].distinct("unit", {"deleted": {"$ne": True}}):
+            text = str(value or "").strip()
+            if text:
+                units.add(text)
+    return sorted(units)
+
+
+def _legacy_test_task_count(test_role):
+    if not _collection_exists("parsons_test_tasks"):
+        return 0
+    task_ids = {
+        str(value)
+        for value in db.parsons_test_tasks.distinct("test_task_id", {"test_role": test_role})
+        if value
+    }
+    source_ids = {
+        str(value)
+        for value in db.parsons_test_tasks.distinct("source_task_id", {"test_role": test_role})
+        if value
+    }
+    return len(task_ids | source_ids)
+
+
+def _test_question_count(collection_name, legacy_role):
+    count = _count_not_deleted(collection_name)
+    return count if count else _legacy_test_task_count(legacy_role)
+
 
 @teacher_dashboard_bp.get("")
 def dashboard():
@@ -21,45 +150,46 @@ def dashboard():
     # 基本統計
     try:
         teacher = {
-            "name": "老師",
+            "name": "老師/管理員",
             "role": "admin"
         }
         
-        # 計算週期
-        if range_param == "week":
-            since = _utc_now() - timedelta(days=7)
-        elif range_param == "month":
-            since = _utc_now() - timedelta(days=30)
-        else:
-            since = _utc_now() - timedelta(days=7)
+        date_range = _date_range_from_request(range_param)
         
         # 影片統計
-        total_videos = db.videos.count_documents({})
-        enabled_videos = db.videos.count_documents({"enabled": True})
-        subtitle_uploaded = db.videos.count_documents({"subtitle_uploaded": True})
-        subtitle_verified = db.videos.count_documents({"subtitle_verified": True})
+        total_videos = _count_not_deleted("videos")
+        enabled_videos = _count_not_deleted("videos", {"enabled": True})
+        subtitle_uploaded = _count_not_deleted("videos", {"subtitle_uploaded": True})
+        subtitle_verified = _count_not_deleted("videos", {"subtitle_verified": True})
         
         # 練習統計
-        total_tasks = db.parsons_tasks.count_documents({}) if "parsons_tasks" in db.list_collection_names() else 0
-        enabled_tasks = db.parsons_tasks.count_documents({"enabled": True}) if total_tasks else 0
+        total_tasks = _count_not_deleted("parsons_tasks")
+        enabled_tasks = _count_not_deleted("parsons_tasks", {"enabled": True})
+        pretest_question_count = _test_question_count("pre_parsons_questions", "pre")
+        posttest_question_count = _test_question_count("post_parsons_questions", "post")
+        units_list = _distinct_units()
+        resource_counts = {
+            "unit_count": len(units_list),
+            "video_count": total_videos,
+            "practice_task_count": total_tasks,
+            "pretest_question_count": pretest_question_count,
+            "posttest_question_count": posttest_question_count,
+        }
         
-        # Overview 統計
+        active_learners = _learning_students_count(date_range)
+
+        # Overview 統計：learning_logs 用來計算期間學習人數。
+        # 正確率與常見錯誤概念已移到 Parsons 學習分析頁。
         overview = {
-            "weekly_sessions": 12,  # 這裡可以改成實際查詢
-            "avg_accuracy": 78.5,
-            "top_misconceptions": [
-                "float_vs_int",
-                "need_2dp",
-                "loop_condition"
-            ]
+            "weekly_sessions": active_learners,
+            "active_learners": active_learners,
         }
         
         # 單元列表
         units_data = []
-        units_list = db.videos.distinct("unit", {"deleted": {"$ne": True}})
-        for unit in sorted([u for u in units_list if u]):
-            videos_in_unit = db.videos.count_documents({"unit": unit})
-            practices_in_unit = db.parsons_tasks.count_documents({"unit": unit}) if "parsons_tasks" in db.list_collection_names() else 0
+        for unit in units_list:
+            videos_in_unit = _count_not_deleted("videos", {"unit": unit})
+            practices_in_unit = _count_not_deleted("parsons_tasks", {"unit": unit})
             units_data.append({
                 "unit": unit,
                 "title": f"{unit} 單元",
@@ -71,6 +201,11 @@ def dashboard():
             "ok": True,
             "teacher": teacher,
             "overview": overview,
+            "date_range": {
+                "start_date": date_range["start_date"],
+                "end_date": date_range["end_date"],
+                "timezone": "Asia/Taipei",
+            },
             "videos": {
                 "total": total_videos,
                 "enabled": enabled_videos,
@@ -79,8 +214,11 @@ def dashboard():
             },
             "parsons": {
                 "total_tasks": total_tasks,
-                "enabled_tasks": enabled_tasks
+                "enabled_tasks": enabled_tasks,
+                "pretest_question_count": pretest_question_count,
+                "posttest_question_count": posttest_question_count,
             },
+            "resource_counts": resource_counts,
             "units": units_data
         })
     except Exception as e:

@@ -30,6 +30,7 @@ teacher_io_bp = Blueprint("teacher_io", __name__)
 
 TAIPEI_TZ = timezone(timedelta(hours=8))
 VALID_GROUP_TYPES = {"experimental", "control"}
+VALID_USER_ROLES = {"student", "teacher", "admin"}
 MAX_USER_CSV_BYTES = 2 * 1024 * 1024
 SENSITIVE_CSV_FIELDS = frozenset({
     "password",
@@ -140,7 +141,10 @@ def _csv_response(headers, rows, filename):
         headers={
             "Content-Disposition": (
                 f"attachment; filename={filename}; filename*=UTF-8''{filename}"
-            )
+            ),
+            "Cache-Control": "no-store, private, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 
@@ -156,7 +160,10 @@ def _zip_csv_response(files, filename):
         headers={
             "Content-Disposition": (
                 f"attachment; filename={filename}; filename*=UTF-8''{filename}"
-            )
+            ),
+            "Cache-Control": "no-store, private, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 
@@ -484,10 +491,27 @@ def import_users_csv():
                 "reason": "invalid_is_test_data",
             })
             continue
-        if student_id == TEST_STUDENT_ID or group_type is None:
+        if student_id == TEST_STUDENT_ID:
             is_test_data = True
+        if group_type is None and not is_test_data:
+            skipped_count += 1
+            invalid_rows.append({
+                "row": row_number,
+                "student_id": student_id,
+                "reason": "missing_group_type",
+            })
+            continue
 
-        password = _optional_string(row.get("password"))
+        role = (_optional_string(row.get("role")) or "student").lower()
+        if role not in VALID_USER_ROLES:
+            skipped_count += 1
+            invalid_rows.append({
+                "row": row_number,
+                "student_id": student_id,
+                "reason": "invalid_role",
+            })
+            continue
+
         sexj_raw = _optional_string(row.get("sexj"))
         sexj = _normalize_sexj(sexj_raw)
         if sexj_raw and not sexj:
@@ -500,25 +524,31 @@ def import_users_csv():
             continue
         try:
             existing = db.users.find_one({"student_id": student_id})
+            now = datetime.now(timezone.utc)
             update_doc = {
                 "student_id": student_id,
+                "name": _optional_string(row.get("name")),
                 "class_name": _optional_string(row.get("class_name")),
+                "role": role,
                 "group_type": group_type,
                 "is_test_data": bool(is_test_data),
-                "role": "student",
+                "sexj": sexj,
+                "updated_at": now,
             }
-            if "sexj" in headers or not existing:
-                update_doc["sexj"] = sexj
-            if password:
-                update_doc["password_hash"] = generate_password_hash(password)
-            elif not existing:
-                update_doc["password_hash"] = generate_password_hash(student_id)
 
             if existing:
+                if not existing.get("password_hash"):
+                    update_doc["password_hash"] = generate_password_hash(student_id)
+                if "created_at" not in existing:
+                    update_doc["created_at"] = now
+                if "last_login_at" not in existing:
+                    update_doc["last_login_at"] = None
                 db.users.update_one({"_id": existing["_id"]}, {"$set": update_doc})
                 updated_count += 1
             else:
-                update_doc["created_at"] = datetime.now(timezone.utc)
+                update_doc["password_hash"] = generate_password_hash(student_id)
+                update_doc["created_at"] = now
+                update_doc["last_login_at"] = None
                 db.users.insert_one(update_doc)
                 inserted_count += 1
         except Exception:

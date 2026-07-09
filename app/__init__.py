@@ -11,6 +11,7 @@ from .session_auth import active_session_guard
 ROLE_PROTECTED_BLUEPRINTS = {
     "student": {"student"},
     "learning_logs": {"student"},
+    "video_rewatch_logs": {"student"},
     "events": {"student"},
     "teacher_analysis": {"teacher", "admin"},
     "teacher_io": {"teacher", "admin"},
@@ -38,6 +39,12 @@ def create_app():
     CORS(app, resources={r"/api/*": {"origins": configured_origins}})
 
     register_blueprints(app)
+
+    @app.before_request
+    def handle_api_preflight():
+        if request.method == "OPTIONS" and request.path.startswith("/api/"):
+            return ("", 204)
+        return None
 
     @app.before_request
     def enforce_blueprint_session():

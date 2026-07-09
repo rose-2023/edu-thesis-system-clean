@@ -102,6 +102,144 @@
         </div>
       </section>
 
+      <section class="overviewGrid">
+        <article class="overviewPanel">
+          <div class="sectionHeader compactHeader">
+            <h2>班級組別總覽</h2>
+            <span>來源：users</span>
+          </div>
+          <div class="overviewCards">
+            <div class="overviewCard">
+              <div class="overviewLabel">實驗組人數</div>
+              <div class="overviewValue">{{ userGroupOverview.experimental_count ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">控制組人數</div>
+              <div class="overviewValue">{{ userGroupOverview.control_count ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">測試帳號總人數</div>
+              <div class="overviewValue">{{ userGroupOverview.test_account_count ?? 0 }}</div>
+            </div>
+            <div class="overviewCard subtle">
+              <div class="overviewLabel">總人數</div>
+              <div class="overviewValue">{{ userGroupOverview.total_student_count ?? 0 }}</div>
+            </div>
+          </div>
+        </article>
+
+        <article v-if="isTestMode" class="overviewPanel">
+          <div class="sectionHeader compactHeader">
+            <h2>{{ selectedMode === "pretest" ? "前測完成總覽" : "後測完成總覽" }}</h2>
+            <span>來源：parsons_attempts_v2 / parsons_test_attempts</span>
+          </div>
+          <div class="overviewCards">
+            <div class="overviewCard">
+              <div class="overviewLabel">應完成學生</div>
+              <div class="overviewValue">{{ testCompletionOverview.total_students ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">已完成</div>
+              <div class="overviewValue">{{ testCompletionOverview.completed_students ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">未完成</div>
+              <div class="overviewValue">{{ testCompletionOverview.pending_students ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">完成率</div>
+              <div class="overviewValue">{{ formatPercent(testCompletionOverview.completion_rate) }}</div>
+            </div>
+            <div class="overviewCard subtle">
+              <div class="overviewLabel">測驗題數</div>
+              <div class="overviewValue">{{ testCompletionOverview.expected_task_count ?? 0 }}</div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="sectionHeader">
+          <h2>學生進度列表</h2>
+          <span>{{ studentProgressRows.length }} 位學生</span>
+        </div>
+        <div class="tableWrap analytics-table-wrapper">
+          <table class="dataTable analytics-table progress-table">
+            <colgroup>
+              <col style="width: 13%">
+              <col style="width: 16%">
+              <col style="width: 13%">
+              <col style="width: 11%">
+              <col style="width: 11%">
+              <col style="width: 13%">
+              <col style="width: 11%">
+              <col style="width: 12%">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>學號</th>
+                <th>姓名</th>
+                <th>班級</th>
+                <th>組別</th>
+                <th class="center">前測</th>
+                <th class="center">學習任務</th>
+                <th class="center">後測</th>
+                <th>最後操作時間</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in pagedStudentProgressRows" :key="row.student_id">
+                <td class="mono">{{ row.student_id }}</td>
+                <td>{{ row.name || "-" }}</td>
+                <td>{{ row.class_name || "-" }}</td>
+                <td>{{ formatGroupType(row) }}</td>
+                <td class="center">
+                  <span class="status-badge" :class="statusClass(row.pretest_status)">
+                    {{ formatProgressStatus(row.pretest_status) }}
+                  </span>
+                  <div class="progress-sub">{{ row.pretest_completed_tasks || 0 }}/{{ row.pretest_total_tasks || 0 }} 題</div>
+                </td>
+                <td class="center">
+                  <span class="status-badge" :class="statusClass(row.learning_status)">
+                    {{ formatProgressStatus(row.learning_status) }}
+                  </span>
+                  <div class="progress-sub">{{ row.learning_task_count || 0 }} 題有作答</div>
+                </td>
+                <td class="center">
+                  <span class="status-badge" :class="statusClass(row.posttest_status)">
+                    {{ formatProgressStatus(row.posttest_status) }}
+                  </span>
+                  <div class="progress-sub">{{ row.posttest_completed_tasks || 0 }}/{{ row.posttest_total_tasks || 0 }} 題</div>
+                </td>
+                <td>{{ formatDateTime(row.last_activity_at) }}</td>
+              </tr>
+              <tr v-if="!loading && studentProgressRows.length === 0">
+                <td class="empty" colspan="8">目前沒有符合條件的學生進度資料</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-if="hasPagination(studentProgressRows)" class="paginationControls">
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('studentProgress', studentProgressRows) <= 1"
+            @click="setPage('studentProgress', currentPage('studentProgress', studentProgressRows) - 1, studentProgressRows)"
+          >
+            上一頁
+          </button>
+          <span>{{ paginationText("studentProgress", studentProgressRows) }}</span>
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('studentProgress', studentProgressRows) >= pageCount(studentProgressRows)"
+            @click="setPage('studentProgress', currentPage('studentProgress', studentProgressRows) + 1, studentProgressRows)"
+          >
+            下一頁
+          </button>
+        </div>
+      </section>
+
       <template v-if="analysisView === 'table'">
       <section class="kpiGrid">
         <article v-for="item in kpiItems" :key="item.key" class="kpiCard">
@@ -131,14 +269,14 @@
             </thead>
             <tbody>
               <tr
-                v-for="row in studentRows"
+                v-for="row in pagedStudentRows"
                 :key="row.student_id"
                 :class="{ selected: selectedStudentId === row.student_id }"
                 @click="selectStudent(row.student_id)"
               >
                 <td>{{ row.student_id }}</td>
                 <td>{{ row.class_name || "-" }}</td>
-                <td>{{ row.group_type || "-" }}</td>
+                <td>{{ formatGroupType(row) }}</td>
                 <td>{{ row.task_count }}</td>
                 <td>{{ row.total_attempts }}</td>
                 <td>{{ row.correct_task_count }}</td>
@@ -150,6 +288,25 @@
               </tr>
             </tbody>
           </table>
+        </div>
+        <div v-if="hasPagination(studentRows)" class="paginationControls">
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('studentSummary', studentRows) <= 1"
+            @click="setPage('studentSummary', currentPage('studentSummary', studentRows) - 1, studentRows)"
+          >
+            上一頁
+          </button>
+          <span>{{ paginationText("studentSummary", studentRows) }}</span>
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('studentSummary', studentRows) >= pageCount(studentRows)"
+            @click="setPage('studentSummary', currentPage('studentSummary', studentRows) + 1, studentRows)"
+          >
+            下一頁
+          </button>
         </div>
       </section>
 
@@ -182,7 +339,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="row in taskRows" :key="row.task_id">
+                <tr v-for="row in pagedTaskRows" :key="row.task_id">
                   <td class="mono task-id-cell">{{ row.task_id }}</td>
                   <td>
                     <div class="cell-task-title" :title="row.task_title || '-'">
@@ -210,6 +367,25 @@
               </tbody>
             </table>
           </div>
+          <div v-if="hasPagination(taskRows)" class="paginationControls compactPagination">
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('taskErrors', taskRows) <= 1"
+              @click="setPage('taskErrors', currentPage('taskErrors', taskRows) - 1, taskRows)"
+            >
+              上一頁
+            </button>
+            <span>{{ paginationText("taskErrors", taskRows) }}</span>
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('taskErrors', taskRows) >= pageCount(taskRows)"
+              @click="setPage('taskErrors', currentPage('taskErrors', taskRows) + 1, taskRows)"
+            >
+              下一頁
+            </button>
+          </div>
         </article>
 
         <article class="panel">
@@ -229,7 +405,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="row in conceptRows" :key="row.target_concept">
+                <tr v-for="row in pagedConceptRows" :key="row.target_concept">
                   <td>{{ row.target_concept || "unknown" }}</td>
                   <td>{{ row.total_attempts }}</td>
                   <td>{{ row.wrong_attempts }}</td>
@@ -241,6 +417,25 @@
                 </tr>
               </tbody>
             </table>
+          </div>
+          <div v-if="hasPagination(conceptRows)" class="paginationControls compactPagination">
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('conceptErrors', conceptRows) <= 1"
+              @click="setPage('conceptErrors', currentPage('conceptErrors', conceptRows) - 1, conceptRows)"
+            >
+              上一頁
+            </button>
+            <span>{{ paginationText("conceptErrors", conceptRows) }}</span>
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('conceptErrors', conceptRows) >= pageCount(conceptRows)"
+              @click="setPage('conceptErrors', currentPage('conceptErrors', conceptRows) + 1, conceptRows)"
+            >
+              下一頁
+            </button>
           </div>
         </article>
       </section>
@@ -283,7 +478,7 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="(row, index) in studentAttempts" :key="`${row.task_id}-${row.attempt_no}-${index}`">
+                  <tr v-for="(row, index) in pagedStudentAttempts" :key="`${row.task_id}-${row.attempt_no}-${index}`">
                     <td class="compact">{{ formatTaipeiDateTime(row.submitted_at) }}</td>
                     <td class="mono">{{ row.task_id || "-" }}</td>
                     <td>
@@ -317,6 +512,25 @@
                 </tbody>
               </table>
             </div>
+            <div v-if="hasPagination(studentAttempts)" class="paginationControls compactPagination">
+              <button
+                class="pageBtn"
+                type="button"
+                :disabled="currentPage('studentAttempts', studentAttempts) <= 1"
+                @click="setPage('studentAttempts', currentPage('studentAttempts', studentAttempts) - 1, studentAttempts)"
+              >
+                上一頁
+              </button>
+              <span>{{ paginationText("studentAttempts", studentAttempts) }}</span>
+              <button
+                class="pageBtn"
+                type="button"
+                :disabled="currentPage('studentAttempts', studentAttempts) >= pageCount(studentAttempts)"
+                @click="setPage('studentAttempts', currentPage('studentAttempts', studentAttempts) + 1, studentAttempts)"
+              >
+                下一頁
+              </button>
+            </div>
           </article>
 
           <article class="detailBlock">
@@ -346,11 +560,11 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="(row, index) in studentLogs" :key="`${row.event_at}-${index}`">
+                  <tr v-for="(row, index) in pagedStudentLogs" :key="`${row.event_at}-${index}`">
                     <td class="compact">{{ formatTaipeiDateTime(row.event_at) }}</td>
                     <td>
                       <span class="event-badge" :title="row.event_type || ''">
-                        {{ formatEventType(row.event_type) }}
+                        {{ formatEventType(row.event_type, row) }}
                       </span>
                     </td>
                     <td class="compact">{{ row.page || "-" }}</td>
@@ -375,6 +589,25 @@
                 </tbody>
               </table>
             </div>
+            <div v-if="hasPagination(studentLogs)" class="paginationControls compactPagination">
+              <button
+                class="pageBtn"
+                type="button"
+                :disabled="currentPage('studentLogs', studentLogs) <= 1"
+                @click="setPage('studentLogs', currentPage('studentLogs', studentLogs) - 1, studentLogs)"
+              >
+                上一頁
+              </button>
+              <span>{{ paginationText("studentLogs", studentLogs) }}</span>
+              <button
+                class="pageBtn"
+                type="button"
+                :disabled="currentPage('studentLogs', studentLogs) >= pageCount(studentLogs)"
+                @click="setPage('studentLogs', currentPage('studentLogs', studentLogs) + 1, studentLogs)"
+              >
+                下一頁
+              </button>
+            </div>
           </article>
         </div>
       </section>
@@ -385,14 +618,31 @@
           目前為測試資料模式，圖表僅供系統測試，不納入正式研究分析。
         </div>
 
+        <section class="panel chartExportPanel">
+          <div>
+            <h2>視覺化圖表</h2>
+            <p>
+              {{ showAllCharts ? "目前顯示完整圖表資料。" : `目前每張圖先顯示前 ${chartPreviewLimit} 筆重點資料。` }}
+            </p>
+          </div>
+          <div class="chartExportActions">
+            <button class="btn" type="button" @click="showAllCharts = !showAllCharts">
+              {{ showAllCharts ? "收合圖形" : "查看全部圖形" }}
+            </button>
+            <button class="btn primary" type="button" :disabled="pngBusy" @click="downloadVisualizationPng">
+              {{ pngBusy ? "產生中..." : "下載全部圖形 ZIP" }}
+            </button>
+          </div>
+        </section>
+
         <section class="visualizationGrid">
           <article class="panel chartPanel">
             <div class="sectionHeader">
               <h2>概念錯誤分布</h2>
-              <span>{{ conceptChartItems.length }} 個概念</span>
+              <span>{{ displayedConceptChartItems.length }} / {{ conceptChartItems.length }} 個概念</span>
             </div>
             <AnalyticsBarChart
-              :items="conceptChartItems"
+              :items="displayedConceptChartItems"
               color="#c2413b"
               aria-label="各概念錯誤次數長條圖"
             />
@@ -401,10 +651,10 @@
           <article class="panel chartPanel">
             <div class="sectionHeader">
               <h2>題目答對率</h2>
-              <span>{{ taskCorrectRateChartItems.length }} 題</span>
+              <span>{{ displayedTaskCorrectRateChartItems.length }} / {{ taskCorrectRateChartItems.length }} 題</span>
             </div>
             <AnalyticsBarChart
-              :items="taskCorrectRateChartItems"
+              :items="displayedTaskCorrectRateChartItems"
               :max-value="100"
               value-suffix="%"
               color="#2563a6"
@@ -415,10 +665,10 @@
           <article class="panel chartPanel">
             <div class="sectionHeader">
               <h2>錯誤類型分布</h2>
-              <span>{{ errorTypeChartItems.length }} 種錯誤</span>
+              <span>{{ displayedErrorTypeChartItems.length }} / {{ errorTypeChartItems.length }} 種錯誤</span>
             </div>
             <AnalyticsBarChart
-              :items="errorTypeChartItems"
+              :items="displayedErrorTypeChartItems"
               color="#b45309"
               aria-label="錯誤類型出現次數長條圖"
             />
@@ -427,10 +677,10 @@
           <article class="panel chartPanel">
             <div class="sectionHeader">
               <h2>學生平均嘗試次數</h2>
-              <span>{{ studentAttemptChartItems.length }} 位學生</span>
+              <span>{{ displayedStudentAttemptChartItems.length }} / {{ studentAttemptChartItems.length }} 位學生</span>
             </div>
             <AnalyticsBarChart
-              :items="studentAttemptChartItems"
+              :items="displayedStudentAttemptChartItems"
               color="#146c64"
               aria-label="各學生平均每題嘗試次數長條圖"
             />
@@ -440,12 +690,12 @@
         <section v-if="selectedStudentId" class="panel timelinePanel">
           <div class="sectionHeader">
             <h2>單一學生操作歷程</h2>
-            <span>{{ selectedStudentId }}</span>
+            <span>{{ selectedStudentId }}，{{ timelineEvents.length }} 筆事件</span>
           </div>
 
           <ol v-if="timelineEvents.length" class="timelineList">
             <li
-              v-for="(event, index) in timelineEvents"
+              v-for="(event, index) in pagedTimelineEvents"
               :key="`${event.event_at}-${event.event_type}-${index}`"
               class="timelineItem"
             >
@@ -453,7 +703,7 @@
               <div class="timelineContent">
                 <div class="timelineHeader">
                   <span class="event-badge" :title="event.event_type || ''">
-                    {{ formatEventType(event.event_type) }}
+                    {{ formatEventType(event.event_type, event) }}
                   </span>
                   <time>{{ formatTaipeiDateTime(event.event_at) }}</time>
                 </div>
@@ -467,7 +717,26 @@
               </div>
             </li>
           </ol>
-          <div v-else class="visualizationEmpty">目前沒有符合條件的資料可視覺化。</div>
+          <div v-if="hasPagination(timelineEvents)" class="paginationControls compactPagination">
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('studentTimeline', timelineEvents) <= 1"
+              @click="setPage('studentTimeline', currentPage('studentTimeline', timelineEvents) - 1, timelineEvents)"
+            >
+              上一頁
+            </button>
+            <span>{{ paginationText("studentTimeline", timelineEvents) }}</span>
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('studentTimeline', timelineEvents) >= pageCount(timelineEvents)"
+              @click="setPage('studentTimeline', currentPage('studentTimeline', timelineEvents) + 1, timelineEvents)"
+            >
+              下一頁
+            </button>
+          </div>
+          <div v-if="!timelineEvents.length" class="visualizationEmpty">目前沒有符合條件的資料可視覺化。</div>
         </section>
       </template>
     </main>
@@ -475,7 +744,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import AnalyticsBarChart from "../components/AnalyticsBarChart.vue";
 import TeacherSidebar from "../components/TeacherSidebar.vue";
 import { formatTaipeiDateTime } from "../utils/dateTime.js";
@@ -495,22 +764,46 @@ const groupType = ref("");
 const selectedStudentId = ref("");
 const loading = ref(false);
 const csvBusy = ref(false);
+const pngBusy = ref(false);
 const errorMsg = ref("");
 const csvMessage = ref("");
 const invalidRows = ref([]);
 const studentCsvInput = ref(null);
 const analysis = ref(emptyAnalysis());
 const studentOptions = ref([]);
+// 分頁功能
+const pageSize = 5;
+const chartPreviewLimit = 10;
+const showAllCharts = ref(false);
+const pagination = reactive({
+  studentProgress: 1,
+  studentSummary: 1,
+  taskErrors: 1,
+  conceptErrors: 1,
+  studentAttempts: 1,
+  studentLogs: 1,
+  studentTimeline: 1,
+});
 
 const selectedModeConfig = computed(() => (
   modeOptions.find((option) => option.value === selectedMode.value) || modeOptions[0]
 ));
 const kpis = computed(() => analysis.value.kpis || {});
+const userGroupOverview = computed(() => analysis.value.user_group_overview || {});
+const testCompletionOverview = computed(() => analysis.value.test_completion_overview || {});
+const studentProgressRows = computed(() => analysis.value.student_progress_rows || []);
 const studentRows = computed(() => analysis.value.student_overview || []);
 const taskRows = computed(() => analysis.value.task_error_analysis || []);
 const conceptRows = computed(() => analysis.value.concept_error_analysis || []);
 const studentAttempts = computed(() => analysis.value.student_attempts || []);
 const studentLogs = computed(() => analysis.value.student_logs || []);
+const pagedStudentProgressRows = computed(() => pageItems(studentProgressRows.value, "studentProgress"));
+const pagedStudentRows = computed(() => pageItems(studentRows.value, "studentSummary"));
+const pagedTaskRows = computed(() => pageItems(taskRows.value, "taskErrors"));
+const pagedConceptRows = computed(() => pageItems(conceptRows.value, "conceptErrors"));
+const pagedStudentAttempts = computed(() => pageItems(studentAttempts.value, "studentAttempts"));
+const pagedStudentLogs = computed(() => pageItems(studentLogs.value, "studentLogs"));
+const isTestMode = computed(() => selectedMode.value === "pretest" || selectedMode.value === "posttest");
 const conceptChartItems = computed(() => (
   [...conceptRows.value]
     .sort((a, b) => Number(b.wrong_attempts || 0) - Number(a.wrong_attempts || 0))
@@ -591,11 +884,31 @@ const studentAttemptChartItems = computed(() => (
       };
     })
 ));
+
+function chartDisplayItems(items) {
+  const rows = Array.isArray(items) ? items : [];
+  return showAllCharts.value ? rows : rows.slice(0, chartPreviewLimit);
+}
+
+const displayedConceptChartItems = computed(() => chartDisplayItems(conceptChartItems.value));
+const displayedTaskCorrectRateChartItems = computed(() => chartDisplayItems(taskCorrectRateChartItems.value));
+const displayedErrorTypeChartItems = computed(() => chartDisplayItems(errorTypeChartItems.value));
+const displayedStudentAttemptChartItems = computed(() => chartDisplayItems(studentAttemptChartItems.value));
 const timelineEvents = computed(() => {
   const allowed = new Set([
     "task_open",
     "task_start",
+    "video_click",
+    "video_play",
+    "video_pause",
+    "video_progress",
+    "video_ended",
+    "video_leave",
+    "click_next_to_practice",
+    "enter_parsons_task",
     "answer_submit",
+    "view_hint",
+    "hide_hint",
     "review_open",
     "review_close",
     "return_to_task",
@@ -605,13 +918,14 @@ const timelineEvents = computed(() => {
     .slice()
     .sort((a, b) => new Date(a.event_at || 0) - new Date(b.event_at || 0));
 });
+const pagedTimelineEvents = computed(() => pageItems(timelineEvents.value, "studentTimeline"));
 const groupHint = computed(() => {
   if (groupType.value === "control") return "目前顯示控制組正式資料，已排除測試資料。";
   if (groupType.value === "experimental") return "目前顯示實驗組正式資料，已排除測試資料。";
   if (groupType.value === "test_data") {
     return "目前為測試資料模式，僅供系統測試，不納入正式研究分析。";
   }
-  return "目前顯示正式資料中的控制組與實驗組，不包含測試資料。";
+  return "目前顯示全部組別資料，包含控制組、實驗組與測試資料。";
 });
 const kpiItems = computed(() => [
   { key: "active_students", label: "參與學生數", value: kpis.value.active_students ?? 0 },
@@ -648,12 +962,75 @@ function emptyAnalysis() {
       avg_attempts_per_task: 0,
       avg_duration_sec: null,
     },
+    user_group_overview: {
+      experimental_count: 0,
+      control_count: 0,
+      test_account_count: 0,
+      formal_student_count: 0,
+      total_student_count: 0,
+    },
+    test_completion_overview: null,
+    student_progress_rows: [],
     student_overview: [],
     task_error_analysis: [],
     concept_error_analysis: [],
     student_attempts: [],
     student_logs: [],
   };
+}
+
+function pageCount(items) {
+  const total = Array.isArray(items) ? items.length : 0;
+  return Math.max(1, Math.ceil(total / pageSize));
+}
+
+function currentPage(key, items) {
+  const totalPages = pageCount(items);
+  return Math.min(Math.max(Number(pagination[key]) || 1, 1), totalPages);
+}
+
+function pageItems(items, key) {
+  const rows = Array.isArray(items) ? items : [];
+  const page = currentPage(key, rows);
+  const start = (page - 1) * pageSize;
+  return rows.slice(start, start + pageSize);
+}
+
+function hasPagination(items) {
+  return Array.isArray(items) && items.length > pageSize;
+}
+
+function setPage(key, page, items) {
+  pagination[key] = Math.min(Math.max(Number(page) || 1, 1), pageCount(items));
+}
+
+function paginationText(key, items) {
+  const rows = Array.isArray(items) ? items : [];
+  const page = currentPage(key, rows);
+  const start = rows.length ? (page - 1) * pageSize + 1 : 0;
+  const end = Math.min(page * pageSize, rows.length);
+  return `${start}-${end} / ${rows.length}`;
+}
+
+function resetPagination() {
+  for (const key of Object.keys(pagination)) {
+    pagination[key] = 1;
+  }
+}
+
+function clampPagination() {
+  const sources = {
+    studentProgress: studentProgressRows.value,
+    studentSummary: studentRows.value,
+    taskErrors: taskRows.value,
+    conceptErrors: conceptRows.value,
+    studentAttempts: studentAttempts.value,
+    studentLogs: studentLogs.value,
+    studentTimeline: timelineEvents.value,
+  };
+  for (const [key, rows] of Object.entries(sources)) {
+    pagination[key] = currentPage(key, rows);
+  }
 }
 
 function shortChartLabel(value, fallback = "-") {
@@ -697,9 +1074,20 @@ const eventTypeLabels = {
   session_start: "工作階段開始",
   session_end: "工作階段結束",
   page_view: "進入頁面",
+  video_click: "點擊影片",
+  video_play: "播放影片",
+  video_pause: "暫停影片",
+  video_progress: "觀看影片",
+  video_ended: "影片結束",
+  video_leave: "離開影片",
+  click_next_to_practice: "點擊下一步",
+  enter_parsons_task: "進入 Parsons 題目",
   task_open: "開啟題目",
   task_start: "開始作答",
-  answer_submit: "提交答案",
+  answer_submit: "提交 Parsons",
+  submit_parsons: "提交 Parsons",
+  view_hint: "查看提示",
+  hide_hint: "收起提示",
   review_open: "開啟提示",
   review_close: "關閉提示",
   return_to_task: "返回題目",
@@ -712,6 +1100,7 @@ const metadataValueLabels = {
   click_ai_hint: "點擊 AI 提示",
   click_blank_area: "點擊空白處",
   click_ai_hint_again: "再次點擊 AI 提示",
+  click_hint_retry: "點擊再次提示",
   click_close_button: "點擊關閉按鈕",
 };
 
@@ -721,7 +1110,34 @@ function formatCorrectness(value) {
   return "-";
 }
 
-function formatEventType(value) {
+function formatGroupType(row) {
+  if (row?.is_test_data === true) return "測試資料";
+  if (row?.group_type === "control") return "控制組";
+  if (row?.group_type === "experimental") return "實驗組";
+  return row?.group_type || "-";
+}
+
+function formatProgressStatus(value) {
+  if (value === "completed") return "完成";
+  if (value === "in_progress") return "進行中";
+  if (value === "not_started") return "未開始";
+  return "-";
+}
+
+function statusClass(value) {
+  if (value === "completed") return "done";
+  if (value === "in_progress") return "doing";
+  return "idle";
+}
+
+function formatEventType(value, row = null) {
+  const metadata = hasMetadata(row?.metadata) ? row.metadata : {};
+  const triggerMethod = metadata.trigger_method || row?.trigger_method;
+  const buttonName = metadata.button_name || row?.button_name;
+  if ((value === "view_hint" || value === "review_open")
+    && (triggerMethod === "click_hint_retry" || buttonName === "再次提示")) {
+    return "再次提示";
+  }
   return eventTypeLabels[value] || value || "-";
 }
 
@@ -729,16 +1145,55 @@ function formatMetadataValue(value) {
   return metadataValueLabels[value] || value;
 }
 
+function compactMetadataText(value, maxLength = 90) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
 function hasMetadata(value) {
   return Boolean(value && typeof value === "object" && Object.keys(value).length);
 }
 
 function formatMetadataSummary(row) {
-  const metadata = row?.metadata;
-  if (!hasMetadata(metadata)) return "-";
+  const metadata = hasMetadata(row?.metadata) ? row.metadata : {};
+  if (!hasMetadata(metadata) && !row?.hint_content && !row?.hint_click_no) return "-";
 
   const parts = [];
-  if (row.event_type === "answer_submit") {
+  if (["video_click", "video_play", "video_pause", "video_progress", "video_ended", "video_leave"].includes(row.event_type)) {
+    const title = row.from_video_title || metadata.video_title;
+    const videoId = row.from_video_id || metadata.video_id;
+    const watchSeconds = metadata.watch_seconds;
+    const deltaSeconds = metadata.watch_delta_sec;
+    if (title) parts.push(`影片：${title}`);
+    else if (videoId) parts.push(`影片ID：${videoId}`);
+    if (watchSeconds !== null && watchSeconds !== undefined) {
+      parts.push(`累積觀看：${formatSeconds(watchSeconds)}`);
+    }
+    if (deltaSeconds !== null && deltaSeconds !== undefined) {
+      parts.push(`本次增加：${formatSeconds(deltaSeconds)}`);
+    }
+    if (metadata.current_time_sec !== null && metadata.current_time_sec !== undefined) {
+      parts.push(`目前時間：${formatSeconds(metadata.current_time_sec)}`);
+    }
+    if (metadata.reached_end === true) parts.push("已看至片尾");
+  } else if (row.event_type === "click_next_to_practice") {
+    const title = row.from_video_title || metadata.from_video_title;
+    const toTaskId = row.to_task_id || metadata.to_task_id;
+    if (title) parts.push(`來源影片：${title}`);
+    if (row.watch_session_id || metadata.watch_session_id) {
+      parts.push(`觀看序列：${row.watch_session_id || metadata.watch_session_id}`);
+    }
+    parts.push(`前往：${toTaskId || "尚未指定題目"} / Parsons`);
+  } else if (row.event_type === "enter_parsons_task") {
+    const taskId = row.task_id || metadata.task_id;
+    const title = row.from_video_title || metadata.from_video_title;
+    if (title) parts.push(`來源影片：${title}`);
+    if (row.watch_session_id || metadata.watch_session_id) {
+      parts.push(`觀看序列：${row.watch_session_id || metadata.watch_session_id}`);
+    }
+    parts.push(`進入題目：${taskId || "-"}`);
+  } else if (row.event_type === "answer_submit") {
     if (typeof metadata.is_correct === "boolean") {
       parts.push(`是否答對：${formatCorrectness(metadata.is_correct)}`);
     }
@@ -748,17 +1203,41 @@ function formatMetadataSummary(row) {
     if (Array.isArray(metadata.error_types)) {
       parts.push(`錯誤類型：${metadata.error_types.length ? metadata.error_types.join("、") : "無"}`);
     }
-  } else if (row.event_type === "review_open") {
-    if (metadata.hint_no !== null && metadata.hint_no !== undefined) {
-      parts.push(`第 ${metadata.hint_no} 次提示`);
+  } else if (row.event_type === "view_hint" || row.event_type === "review_open") {
+    const hintNo = metadata.hint_click_no ?? metadata.hint_no ?? row.hint_click_no;
+    if (hintNo !== null && hintNo !== undefined) {
+      parts.push(`第 ${hintNo} 次提示`);
     }
-    if (metadata.review_type) {
-      parts.push(`提示類型：${formatMetadataValue(metadata.review_type)}`);
+    const reviewType = metadata.review_type || row.review_type;
+    if (reviewType) {
+      parts.push(`提示類型：${formatMetadataValue(reviewType)}`);
+    }
+    const triggerMethod = metadata.trigger_method || row.trigger_method;
+    if (triggerMethod) {
+      parts.push(`動作：${formatMetadataValue(triggerMethod)}`);
+    }
+    const buttonName = metadata.button_name || row.button_name;
+    if (buttonName) {
+      parts.push(`按鈕：${buttonName}`);
+    }
+    const hintText = compactMetadataText(row.hint_content || row.hint_text || metadata.hint_content || metadata.hint_text || metadata.first_hint || metadata.concept_hint);
+    if (hintText) {
+      parts.push(`提示內容：${hintText}`);
+    }
+    if (metadata.hint_source) {
+      parts.push(`來源：${formatMetadataValue(metadata.hint_source)}`);
     }
     if (metadata.hint_limit_reached === true) parts.push("已達提示上限");
-  } else if (row.event_type === "review_close") {
+  } else if (row.event_type === "hide_hint" || row.event_type === "review_close") {
     if (metadata.close_method) {
       parts.push(`關閉方式：${formatMetadataValue(metadata.close_method)}`);
+    }
+    if (metadata.next_hint_no) {
+      parts.push(`接著查看第 ${metadata.next_hint_no} 次提示`);
+    }
+    const hintText = compactMetadataText(row.hint_content || metadata.hint_content || metadata.hint_text || metadata.first_hint || metadata.concept_hint);
+    if (hintText) {
+      parts.push(`提示內容：${hintText}`);
     }
   } else if (row.event_type === "return_to_task") {
     const returnMethod = metadata.return_source
@@ -767,6 +1246,10 @@ function formatMetadataSummary(row) {
       ?? metadata.from_page
       ?? metadata.from;
     if (returnMethod) parts.push(`返回來源／方式：${formatMetadataValue(returnMethod)}`);
+    const hintText = compactMetadataText(row.hint_content || metadata.hint_content || metadata.hint_text || metadata.first_hint || metadata.concept_hint);
+    if (hintText) {
+      parts.push(`提示內容：${hintText}`);
+    }
   }
 
   return parts.length ? parts.join("；") : "有事件詳細資料";
@@ -775,6 +1258,10 @@ function formatMetadataSummary(row) {
 function formatMetadata(value) {
   if (!value || typeof value !== "object") return "-";
   return JSON.stringify(value, null, 2);
+}
+
+function formatDateTime(value) {
+  return value ? formatTaipeiDateTime(value) : "-";
 }
 
 function selectedGroupFilter() {
@@ -799,19 +1286,21 @@ function buildFilterQuery() {
   if (className.value) params.set("class_name", className.value);
   if (groupType.value) params.set("group_type", groupType.value);
   if (selectedStudentId.value) params.set("student_id", selectedStudentId.value);
-  params.set("exclude_test_data", groupType.value === "test_data" ? "false" : "true");
+  params.set("exclude_test_data", groupType.value === "control" || groupType.value === "experimental" ? "true" : "false");
   return params;
 }
 
 function buildGroupExportQuery() {
   const params = buildFilterQuery();
   params.delete("student_id");
+  params.set("_ts", String(Date.now()));
   return params;
 }
 
 function buildQuery() {
   const params = buildFilterQuery();
   params.set("logs_limit", "120");
+  params.set("_ts", String(Date.now()));
   return params;
 }
 
@@ -832,6 +1321,319 @@ function downloadBlob(blob, filename) {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+let crc32Table = null;
+
+function getCrc32Table() {
+  if (crc32Table) return crc32Table;
+  crc32Table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let j = 0; j < 8; j += 1) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    crc32Table[i] = c >>> 0;
+  }
+  return crc32Table;
+}
+
+function crc32(bytes) {
+  const table = getCrc32Table();
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+  };
+}
+
+async function createZipBlob(files) {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const stamp = dosDateTime();
+
+  for (const file of files) {
+    const filenameBytes = encoder.encode(file.name);
+    const dataBytes = new Uint8Array(await file.blob.arrayBuffer());
+    const checksum = crc32(dataBytes);
+
+    const localHeader = new Uint8Array(30 + filenameBytes.length);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0x0800, true);
+    localView.setUint16(8, 0, true);
+    localView.setUint16(10, stamp.time, true);
+    localView.setUint16(12, stamp.date, true);
+    localView.setUint32(14, checksum, true);
+    localView.setUint32(18, dataBytes.length, true);
+    localView.setUint32(22, dataBytes.length, true);
+    localView.setUint16(26, filenameBytes.length, true);
+    localView.setUint16(28, 0, true);
+    localHeader.set(filenameBytes, 30);
+    localParts.push(localHeader, dataBytes);
+
+    const centralHeader = new Uint8Array(46 + filenameBytes.length);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0x0800, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint16(12, stamp.time, true);
+    centralView.setUint16(14, stamp.date, true);
+    centralView.setUint32(16, checksum, true);
+    centralView.setUint32(20, dataBytes.length, true);
+    centralView.setUint32(24, dataBytes.length, true);
+    centralView.setUint16(28, filenameBytes.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, offset, true);
+    centralHeader.set(filenameBytes, 46);
+    centralParts.push(centralHeader);
+
+    offset += localHeader.length + dataBytes.length;
+  }
+
+  const centralOffset = offset;
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const endRecord = new Uint8Array(22);
+  const endView = new DataView(endRecord.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(4, 0, true);
+  endView.setUint16(6, 0, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralSize, true);
+  endView.setUint32(16, centralOffset, true);
+  endView.setUint16(20, 0, true);
+
+  return new Blob([...localParts, ...centralParts, endRecord], { type: "application/zip" });
+}
+
+function currentModeLabel() {
+  return selectedModeConfig.value?.label || "平時練習";
+}
+
+function currentGroupLabel() {
+  if (groupType.value === "control") return "控制組";
+  if (groupType.value === "experimental") return "實驗組";
+  if (groupType.value === "test_data") return "測試資料";
+  return "全部組別";
+}
+
+function roundedRect(ctx, x, y, width, height, radius = 8) {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + width, y, x + width, y + height, r);
+  ctx.arcTo(x + width, y + height, x, y + height, r);
+  ctx.arcTo(x, y + height, x, y, r);
+  ctx.arcTo(x, y, x + width, y, r);
+  ctx.closePath();
+}
+
+// 視覺化分布類型
+function chartPngDefinitions() {
+  return [
+    {
+      title: "概念錯誤分布",
+      subtitle: "依 target_concept 統計錯誤提交次數",
+      filenameKey: "concept_error",
+      items: conceptChartItems.value,
+      color: "#c2413b",
+    },
+    {
+      title: "題目答對率",
+      subtitle: "依題目統計答對率，數值越低代表越需要關注",
+      filenameKey: "task_correct_rate",
+      items: taskCorrectRateChartItems.value,
+      color: "#2563a6",
+      maxValue: 100,
+    },
+    {
+      title: "錯誤類型分布",
+      subtitle: "統計 sequence_error、indentation_error 等錯誤類型",
+      filenameKey: "error_type",
+      items: errorTypeChartItems.value,
+      color: "#b45309",
+    },
+    {
+      title: "學生平均嘗試次數",
+      subtitle: "依學生統計平均每題提交次數",
+      filenameKey: "student_avg_attempts",
+      items: studentAttemptChartItems.value,
+      color: "#146c64",
+    },
+  ];
+}
+
+function verticalChartWidth(chart) {
+  const itemCount = Math.max(1, chart.items.length);
+  return Math.max(1100, 150 + itemCount * 96);
+}
+
+function drawWrappedLabel(ctx, text, centerX, y, maxWidth) {
+  const raw = String(text || "-");
+  const words = raw.length > 12 ? raw.match(/.{1,12}/g) || [raw] : [raw];
+  const lines = [];
+  for (const word of words) {
+    if (lines.length >= 2) break;
+    let output = word;
+    while (output.length > 1 && ctx.measureText(output).width > maxWidth) {
+      output = output.slice(0, -1);
+    }
+    lines.push(output);
+  }
+  if (words.length > lines.length && lines.length) {
+    lines[lines.length - 1] = `${lines[lines.length - 1].replace(/…$/, "")}…`;
+  }
+  lines.forEach((line, index) => {
+    ctx.fillText(line, centerX, y + index * 15);
+  });
+}
+
+function drawVerticalPngChart(ctx, chart, width, height) {
+  const margin = 50;
+  const cardInset = 22;
+  const titleY = 58;
+  const infoY = 112;
+  const plotTop = 188;
+  const plotBottom = height - 116;
+  const plotLeft = 84;
+  const plotRight = width - 44;
+  const plotWidth = plotRight - plotLeft;
+  const plotHeight = plotBottom - plotTop;
+  const items = chart.items || [];
+  const maxValue = Number.isFinite(chart.maxValue) && chart.maxValue > 0
+    ? chart.maxValue
+    : Math.max(1, ...items.map((item) => Number(item.value) || 0));
+
+  ctx.fillStyle = "#f8fafc";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#ffffff";
+  roundedRect(ctx, cardInset, cardInset, width - cardInset * 2, height - cardInset * 2, 14);
+  ctx.fill();
+  ctx.strokeStyle = "#d8dee9";
+  ctx.stroke();
+
+  ctx.fillStyle = "#111827";
+  ctx.font = "800 28px Arial, 'Microsoft JhengHei', sans-serif";
+  ctx.fillText(chart.title, margin, titleY);
+  ctx.fillStyle = "#64748b";
+  ctx.font = "14px Arial, 'Microsoft JhengHei', sans-serif";
+  ctx.fillText(`${chart.subtitle}，共 ${items.length} 筆`, margin, titleY + 26);
+  const filterText = [
+    `資料模式：${currentModeLabel()}`,
+    `班級：${className.value || "全部班級"}`,
+    `組別：${currentGroupLabel()}`,
+    selectedStudentId.value ? `學生：${selectedStudentId.value}` : "學生：全部",
+  ].join("　");
+  ctx.fillText(filterText, margin, infoY);
+  ctx.fillText(`產生時間：${formatTaipeiDateTime(new Date().toISOString())}`, margin, infoY + 22);
+
+  if (!items.length) {
+    ctx.fillStyle = "#64748b";
+    ctx.font = "15px Arial, 'Microsoft JhengHei', sans-serif";
+    ctx.fillText("目前沒有符合條件的資料可視覺化。", margin, plotTop + 36);
+    return;
+  }
+
+  ctx.strokeStyle = "#dbe2ea";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#64748b";
+  ctx.font = "12px Arial, 'Microsoft JhengHei', sans-serif";
+  ctx.textAlign = "right";
+  for (let tick = 0; tick <= 2; tick += 1) {
+    const ratio = tick / 2;
+    const value = maxValue * (1 - ratio);
+    const y = plotTop + plotHeight * ratio;
+    ctx.beginPath();
+    ctx.moveTo(plotLeft, y);
+    ctx.lineTo(plotRight, y);
+    ctx.stroke();
+    ctx.fillText(Number.isInteger(value) ? String(value) : value.toFixed(1), plotLeft - 12, y + 4);
+  }
+
+  ctx.strokeStyle = "#94a3b8";
+  ctx.beginPath();
+  ctx.moveTo(plotLeft, plotTop);
+  ctx.lineTo(plotLeft, plotBottom);
+  ctx.lineTo(plotRight, plotBottom);
+  ctx.stroke();
+
+  const slotWidth = plotWidth / items.length;
+  const barWidth = Math.min(54, Math.max(24, slotWidth * 0.55));
+  ctx.textAlign = "center";
+  items.forEach((item, index) => {
+    const value = Math.max(0, Number(item.value) || 0);
+    const valueText = item.displayValue ?? String(value);
+    const x = plotLeft + slotWidth * index + slotWidth / 2;
+    const barHeight = value ? Math.max(4, (value / maxValue) * plotHeight) : 0;
+    const y = plotBottom - barHeight;
+
+    ctx.fillStyle = item.color || chart.color;
+    roundedRect(ctx, x - barWidth / 2, y, barWidth, barHeight, 5);
+    ctx.fill();
+
+    ctx.fillStyle = "#111827";
+    ctx.font = "700 12px Arial, 'Microsoft JhengHei', sans-serif";
+    ctx.fillText(valueText, x, y - 10);
+
+    ctx.fillStyle = "#475569";
+    ctx.font = "12px Arial, 'Microsoft JhengHei', sans-serif";
+    drawWrappedLabel(ctx, item.label, x, plotBottom + 20, Math.min(82, slotWidth - 8));
+  });
+}
+
+async function downloadVisualizationPng() {
+  try {
+    pngBusy.value = true;
+    errorMsg.value = "";
+    csvMessage.value = "";
+
+    const charts = chartPngDefinitions();
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const files = [];
+    for (const chart of charts) {
+      const width = verticalChartWidth(chart);
+      const height = 780;
+      const canvas = document.createElement("canvas");
+      canvas.width = width * pixelRatio;
+      canvas.height = height * pixelRatio;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("無法建立 PNG 圖表。");
+      ctx.scale(pixelRatio, pixelRatio);
+      drawVerticalPngChart(ctx, chart, width, height);
+
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("PNG 產生失敗。");
+      files.push({
+        name: `parsons_${chart.filenameKey}_${todayStamp()}.png`,
+        blob,
+      });
+    }
+    const zipBlob = await createZipBlob(files);
+    downloadBlob(zipBlob, `parsons_visualization_png_${todayStamp()}.zip`);
+    csvMessage.value = "已下載目前篩選條件下的完整長條圖 PNG 壓縮檔。";
+  } catch (error) {
+    errorMsg.value = error?.message || String(error);
+  } finally {
+    pngBusy.value = false;
+  }
 }
 
 function openStudentCsvPicker() {
@@ -923,10 +1725,12 @@ async function fetchAnalysis() {
       ...emptyAnalysis(),
       ...data,
     };
+    resetPagination();
   } catch (error) {
     errorMsg.value = error?.message || String(error);
     analysis.value = emptyAnalysis();
     studentOptions.value = [];
+    resetPagination();
   } finally {
     loading.value = false;
   }
@@ -948,6 +1752,11 @@ function selectStudent(studentId) {
   selectedStudentId.value = studentId;
   fetchAnalysis();
 }
+
+watch(
+  [studentProgressRows, studentRows, taskRows, conceptRows, studentAttempts, studentLogs, timelineEvents],
+  () => clampPagination(),
+);
 
 onMounted(() => {
   fetchAnalysis();
@@ -1154,6 +1963,161 @@ onMounted(() => {
   background: #fff7ed;
   font-size: 14px;
   font-weight: 800;
+}
+
+.chartExportPanel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.chartExportPanel h2 {
+  margin: 0;
+  color: #172033;
+  font-size: 18px;
+  font-weight: 900;
+}
+
+.chartExportPanel p {
+  margin: 5px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.chartExportActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.overviewGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.overviewPanel {
+  padding: 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+}
+
+.overviewCards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.overviewCard {
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.overviewCard.subtle {
+  background: #f5fbf8;
+}
+
+.overviewLabel {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.overviewValue {
+  margin-top: 8px;
+  color: #111827;
+  font-size: 24px;
+  font-weight: 900;
+}
+
+.compactHeader {
+  margin-bottom: 10px;
+}
+
+.progress-table {
+  min-width: 980px;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 58px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.status-badge.done {
+  color: #166534;
+  background: #dcfce7;
+  border: 1px solid #86efac;
+}
+
+.status-badge.doing {
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+}
+
+.status-badge.idle {
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+}
+
+.progress-sub {
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.paginationControls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.compactPagination {
+  justify-content: center;
+}
+
+.pageBtn {
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  padding: 6px 12px;
+  color: #1f2937;
+  background: #fff;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.pageBtn:hover:not(:disabled) {
+  border-color: #146c64;
+  color: #146c64;
+  background: #f0fdfa;
+}
+
+.pageBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .kpiGrid {
@@ -1497,6 +2461,10 @@ onMounted(() => {
 }
 
 @media (max-width: 1280px) {
+  .overviewCards {
+    grid-template-columns: repeat(2, minmax(160px, 1fr));
+  }
+
   .kpiGrid {
     grid-template-columns: repeat(3, minmax(160px, 1fr));
   }
@@ -1530,6 +2498,7 @@ onMounted(() => {
   }
 
   .filters,
+  .overviewCards,
   .kpiGrid {
     grid-template-columns: 1fr;
   }

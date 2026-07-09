@@ -732,7 +732,8 @@ def upload_video():
 
         # 影片資訊
         "duration_sec": duration_sec,
-        "thumbnail": thumbnail_rel
+        "thumbnail": thumbnail_rel,
+        "related_task_ids": [],
     }
 
     r = db.videos.insert_one(doc)
@@ -831,6 +832,7 @@ def list_videos():
             v.setdefault("subtitle_verified", False)
             v.setdefault("subtitle_current_version", 1)
             v.setdefault("subtitle_versions_count", 1)
+            v.setdefault("related_task_ids", [])
 
         return jsonify({
             "ok": True,

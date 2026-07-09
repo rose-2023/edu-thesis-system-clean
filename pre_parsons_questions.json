@@ -1,0 +1,128 @@
+[
+  {
+    "question_id": "PRE_U1_P001",
+    "assessment_type": "pretest",
+    "question_type": "parsons",
+    "title": "讀取姓名並輸出問候語",
+    "concept_tag": "u1_input_output",
+    "blocks": [
+      {
+        "block_id": "b2",
+        "code": "print('你好，' + name)"
+      },
+      {
+        "block_id": "b1",
+        "code": "name = input('請輸入姓名：')"
+      }
+    ],
+    "solution": [
+      {
+        "block_id": "b1",
+        "indent_level": 0
+      },
+      {
+        "block_id": "b2",
+        "indent_level": 0
+      }
+    ],
+    "instruction": "請將程式碼區塊排列成正確順序，使程式能讀取使用者姓名並輸出問候語。",
+    "requires_indentation": false,
+    "max_indent_level": 0,
+    "max_score": 1,
+    "order": 1,
+    "schema_version": 1,
+    "is_active": true
+  },
+  {
+    "question_id": "PRE_U1_P002",
+    "assessment_type": "pretest",
+    "question_type": "parsons",
+    "title": "讀取年齡並輸出明年年齡",
+    "concept_tag": "u1_input_type_conversion",
+    "blocks": [
+      {
+        "block_id": "b3",
+        "code": "print(next_age)"
+      },
+      {
+        "block_id": "b1",
+        "code": "age = int(input('請輸入年齡：'))"
+      },
+      {
+        "block_id": "b2",
+        "code": "next_age = age + 1"
+      }
+    ],
+    "solution": [
+      {
+        "block_id": "b1",
+        "indent_level": 0
+      },
+      {
+        "block_id": "b2",
+        "indent_level": 0
+      },
+      {
+        "block_id": "b3",
+        "indent_level": 0
+      }
+    ],
+    "instruction": "請將程式碼區塊排列成正確順序，使程式能讀取年齡、計算明年年齡並輸出結果。",
+    "requires_indentation": false,
+    "max_indent_level": 0,
+    "max_score": 1,
+    "order": 2,
+    "schema_version": 1,
+    "is_active": true
+  },
+  {
+    "question_id": "PRE_U1_P003",
+    "assessment_type": "pretest",
+    "question_type": "parsons",
+    "title": "讀取長與寬並輸出面積",
+    "concept_tag": "u1_input_output_calculation",
+    "blocks": [
+      {
+        "block_id": "b2",
+        "code": "width = int(input('請輸入寬：'))"
+      },
+      {
+        "block_id": "b4",
+        "code": "print(area)"
+      },
+      {
+        "block_id": "b1",
+        "code": "length = int(input('請輸入長：'))"
+      },
+      {
+        "block_id": "b3",
+        "code": "area = length * width"
+      }
+    ],
+    "solution": [
+      {
+        "block_id": "b1",
+        "indent_level": 0
+      },
+      {
+        "block_id": "b2",
+        "indent_level": 0
+      },
+      {
+        "block_id": "b3",
+        "indent_level": 0
+      },
+      {
+        "block_id": "b4",
+        "indent_level": 0
+      }
+    ],
+    "instruction": "請將程式碼區塊排列成正確順序，使程式能讀取長與寬，計算面積並輸出結果。",
+    "requires_indentation": false,
+    "max_indent_level": 0,
+    "max_score": 1,
+    "order": 3,
+    "schema_version": 1,
+    "is_active": true
+  }
+]

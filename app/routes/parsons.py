@@ -7,13 +7,14 @@ import random
 import statistics
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Any, Dict, Tuple, Optional
 
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 from bson.errors import InvalidId
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 from ..db import db
 from ..session_auth import (
@@ -21,7 +22,10 @@ from ..session_auth import (
     current_participant_id,
     current_student_id,
 )
-from .learning_logs import write_learning_log_safely
+from .learning_logs import (
+    write_learning_log_safely,
+    write_or_update_hint_learning_log_safely,
+)
 
 from . import parsons_ai  # [新增] 統一管理 OpenAI 呼叫（方案1）
 from .parsons_concept_align import (
@@ -114,9 +118,13 @@ _DUPLICATE_SUBMIT_WINDOW_SEC = 2.0
 
 
 def _submit_request_key(data):
+    canonical_task_id = (
+        data.get("task_id")
+        or data.get("source_task_id")
+        or data.get("test_task_id")
+    )
     relevant = {
-        "task_id": data.get("task_id") or data.get("source_task_id"),
-        "test_task_id": data.get("test_task_id"),
+        "task_id": canonical_task_id,
         "test_role": data.get("test_role"),
         "answer_ids": data.get("answer_ids"),
         "submitted_order": data.get("submitted_order"),
@@ -172,12 +180,24 @@ def _attempt_belongs_to_current_student(attempt):
 # =========================
 # UTC time helper
 # =========================
+_TAIPEI_TZ = timezone(timedelta(hours=8))
+
+
 def _utc_now():
     """
     Return current UTC datetime.
     Used by AI feedback / subtitle alignment / regenerate timestamps.
     """
     return datetime.now(timezone.utc)
+
+
+def _taiwan_time_string(value):
+    """Format an aware UTC datetime for display/audit fields without changing BSON Date storage."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(_TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _video_review_enabled() -> bool:
@@ -222,16 +242,48 @@ def _model_for_feedback() -> str:
 _TEST_INDEX_READY = False
 
 def ensure_test_indexes():
-    """Create unique index for test attempts (one per student per cycle per role)."""
+    """Keep legacy test-attempt indexes compatible with multi-question tests."""
     global _TEST_INDEX_READY
     if _TEST_INDEX_READY:
         return
     try:
+        index_info = db.parsons_test_attempts.index_information()
+        legacy = index_info.get("uniq_student_cycle_role")
+        if legacy and legacy.get("unique"):
+            db.parsons_test_attempts.drop_index("uniq_student_cycle_role")
+        for index_name in ("student_cycle_role_task_1", "uniq_student_cycle_role_task"):
+            index = index_info.get(index_name)
+            index_keys = [item[0] for item in (index or {}).get("key", [])]
+            if index and "test_task_id" in index_keys:
+                db.parsons_test_attempts.drop_index(index_name)
+
+        try:
+            db.parsons_test_attempts.create_index(
+                [
+                    ("student_id", 1),
+                    ("test_cycle_id", 1),
+                    ("test_role", 1),
+                    ("task_id", 1),
+                ],
+                name="uniq_student_cycle_role_task",
+                unique=True,
+            )
+        except (DuplicateKeyError, OperationFailure) as e:
+            print("[parsons_test_attempts] unique index not created; duplicate test attempts need manual review:", e)
+            db.parsons_test_attempts.create_index(
+                [
+                    ("student_id", 1),
+                    ("test_cycle_id", 1),
+                    ("test_role", 1),
+                    ("task_id", 1),
+                ],
+                name="student_cycle_role_task_1",
+            )
         db.parsons_test_attempts.create_index(
             [("student_id", 1), ("test_cycle_id", 1), ("test_role", 1)],
-            unique=True,
-            name="uniq_student_cycle_role",
+            name="student_cycle_role_1",
         )
+        _TEST_INDEX_READY = True
     except Exception as e:
         import traceback
         print("\n========== AI HINT AND SEGMENT ERROR ==========")
@@ -330,6 +382,7 @@ def _build_attempt_v2_duration_fields(started_at, submitted_at) -> dict:
     result = {
         "elapsed_sec_raw": None,
         "duration_sec": None,
+        "duration_seconds": None,
         "duration_outlier": False,
         "duration_outlier_reason": None,
     }
@@ -347,6 +400,7 @@ def _build_attempt_v2_duration_fields(started_at, submitted_at) -> dict:
             result["duration_outlier_reason"] = "long_page_open"
             return result
         result["duration_sec"] = sec
+        result["duration_seconds"] = sec
         return result
     except Exception:
         return result
@@ -355,6 +409,18 @@ def _build_attempt_v2_duration_fields(started_at, submitted_at) -> dict:
 def _normalize_attempt_v2_duration(started_at, submitted_at):
     fields = _build_attempt_v2_duration_fields(started_at, submitted_at)
     return fields["duration_sec"], fields["duration_outlier"]
+
+
+def _safe_duration_seconds(value):
+    try:
+        if value is None or value == "":
+            return None
+        seconds = int(round(float(value)))
+        if 0 <= seconds <= 3600:
+            return seconds
+    except Exception:
+        return None
+    return None
 
 
 def _lookup_attempt_v2_user_profile(student_id: str, participant_id: str = "") -> dict:
@@ -740,13 +806,14 @@ def _validate_attempt_v2_doc(doc: dict) -> list:
         isinstance(elapsed_sec_raw, bool) or not isinstance(elapsed_sec_raw, (int, float))
     ):
         missing.append("elapsed_sec_raw")
-    duration_sec = doc.get("duration_sec")
-    if duration_sec is not None and (
-        isinstance(duration_sec, bool)
-        or not isinstance(duration_sec, (int, float))
-        or not 0 <= duration_sec <= 3600
-    ):
-        missing.append("duration_sec")
+    for duration_key in ("duration_sec", "duration_seconds"):
+        duration_value = doc.get(duration_key)
+        if duration_value is not None and (
+            isinstance(duration_value, bool)
+            or not isinstance(duration_value, (int, float))
+            or not 0 <= duration_value <= 3600
+        ):
+            missing.append(duration_key)
     if not isinstance(doc.get("duration_outlier"), bool):
         missing.append("duration_outlier")
     duration_outlier_reason = doc.get("duration_outlier_reason")
@@ -782,7 +849,7 @@ def _build_parsons_attempt_v2_doc(
     submitted_at_input = _parse_attempt_v2_datetime((data or {}).get("submitted_at"))
     submitted_at = submitted_at_input or now_utc()
     started_at = _parse_attempt_v2_datetime((data or {}).get("started_at"))
-    duration_fields = _build_attempt_v2_duration_fields(started_at, submitted_at_input)
+    duration_fields = _build_attempt_v2_duration_fields(started_at, submitted_at)
     profile = _lookup_attempt_v2_user_profile(sid, participant_id)
 
     attempt_no = _next_attempt_v2_no(sid, tid, activity, v2_test_role) if sid and tid and activity else None
@@ -840,12 +907,19 @@ def _build_parsons_attempt_v2_doc(
         "correct_answer": correct_answer,
         **error_analysis,
         "started_at": started_at,
+        "started_at_utc": started_at,
         "submitted_at": submitted_at,
+        "submitted_at_utc": submitted_at,
+        "submitted_at_taiwan": _taiwan_time_string(submitted_at),
         **duration_fields,
         "needs_review": bool(review_reason),
         "review_reason": review_reason,
         "created_at": now,
+        "created_at_utc": now,
+        "created_at_taiwan": _taiwan_time_string(now),
         "updated_at": now,
+        "updated_at_utc": now,
+        "updated_at_taiwan": _taiwan_time_string(now),
         "timezone": _PARSONS_ATTEMPTS_V2_TIMEZONE,
     }
 
@@ -979,6 +1053,7 @@ def t5doc_to_parsons_task(doc: dict) -> dict:
                     "id": str(bid),
                     "text": b.get("text") if b.get("text") is not None else b.get("code", ""),
                     "type": b.get("type") or "solution",
+                    "indent": b.get("indent") if b.get("indent") is not None else b.get("indent_level", 0),
                     "semantic_zh": b.get("semantic_zh") if b.get("semantic_zh") is not None else b.get("meaning_zh", ""),
                     "meaning_zh": b.get("meaning_zh") if b.get("meaning_zh") is not None else b.get("semantic_zh", ""),
                     "zh": b.get("zh", ""),
@@ -3088,6 +3163,165 @@ def is_pretest_open(test_cycle_id: str) -> bool:
         return True  # ✅ 預設開放前測
     return bool(doc.get("pre_open", True))
 
+# 前後測開放判斷
+def _test_question_collection_name(test_role: str):
+    role = str(test_role or "").strip().lower()
+    if role == "pre":
+        return "pre_parsons_questions"
+    if role == "post":
+        return "post_parsons_questions"
+    return None
+
+
+def _test_question_task_id(question_doc: dict) -> str:
+    if not isinstance(question_doc, dict):
+        return ""
+    for key in ("task_id", "question_id", "test_task_id"):
+        value = question_doc.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    if question_doc.get("_id") is not None:
+        return str(question_doc.get("_id"))
+    return ""
+
+
+def _test_question_sort_key():
+    return [("order", 1), ("question_id", 1), ("_id", 1)]
+
+
+def _active_test_question_query():
+    return {
+        "$and": [
+            {"question_type": {"$in": ["parsons", None]}},
+            {"is_active": {"$ne": False}},
+        ]
+    }
+
+
+def _find_test_question_by_ref(test_role: str, task_ref: str):
+    collection_name = _test_question_collection_name(test_role)
+    ref = str(task_ref or "").strip()
+    if not collection_name or not ref:
+        return None
+
+    query = _active_test_question_query()
+    candidates = [{"question_id": ref}, {"task_id": ref}, {"test_task_id": ref}]
+    oid_value = maybe_oid(ref)
+    if oid_value is not None:
+        candidates.append({"_id": oid_value})
+    return db[collection_name].find_one({"$and": [query, {"$or": candidates}]})
+
+
+def _find_test_question_by_index(test_role: str, index: int):
+    collection_name = _test_question_collection_name(test_role)
+    if not collection_name:
+        return None, 0, 1
+
+    current_index = max(1, int(index or 1))
+    query = _active_test_question_query()
+    total = db[collection_name].count_documents(query)
+    if total <= 0:
+        return None, 0, current_index
+
+    if current_index > total:
+        current_index = total
+    docs = list(
+        db[collection_name]
+        .find(query)
+        .sort(_test_question_sort_key())
+        .skip(current_index - 1)
+        .limit(1)
+    )
+    return (docs[0] if docs else None), total, current_index
+
+
+def _parsons_question_to_task_doc(question_doc: dict) -> dict:
+    question = question_doc if isinstance(question_doc, dict) else {}
+    raw_blocks = question.get("blocks") if isinstance(question.get("blocks"), list) else []
+    raw_solution = question.get("solution") if isinstance(question.get("solution"), list) else []
+    blocks_by_id = {}
+
+    for index, block in enumerate(raw_blocks):
+        if not isinstance(block, dict):
+            continue
+        block_id = str(block.get("block_id") or block.get("id") or f"b{index + 1}").strip()
+        if not block_id:
+            continue
+        blocks_by_id[block_id] = {
+            "id": block_id,
+            "text": str(block.get("code") if block.get("code") is not None else block.get("text", "")),
+            "type": block.get("type") or "solution",
+            "indent": int(block.get("indent_level") or block.get("indent") or 0),
+            "semantic_zh": block.get("semantic_zh") or block.get("meaning_zh") or "",
+            "meaning_zh": block.get("meaning_zh") or block.get("semantic_zh") or "",
+            "zh": block.get("zh") or "",
+        }
+
+    solution_blocks = []
+    template_slots = []
+    for index, slot in enumerate(raw_solution):
+        if isinstance(slot, dict):
+            block_id = str(slot.get("block_id") or slot.get("id") or "").strip()
+            indent_level = int(slot.get("indent_level") or slot.get("indent") or 0)
+        else:
+            block_id = str(slot or "").strip()
+            indent_level = 0
+        if not block_id:
+            continue
+        block = dict(blocks_by_id.get(block_id) or {"id": block_id, "text": "", "type": "solution"})
+        block["indent"] = indent_level
+        solution_blocks.append(block)
+        template_slots.append({
+            "slot": f"s{index + 1}",
+            "label": f"第{index + 1}格",
+            "expected_id": block_id,
+        })
+
+    if not solution_blocks and blocks_by_id:
+        for index, block in enumerate(blocks_by_id.values()):
+            solution_blocks.append(dict(block))
+            template_slots.append({
+                "slot": f"s{index + 1}",
+                "label": f"第{index + 1}格",
+                "expected_id": block["id"],
+            })
+
+# 回傳的MongoDB前後測題目格式
+    task_id = _test_question_task_id(question)
+    return {
+        "_id": question.get("_id"),
+        "question_id": task_id,
+        "task_id": task_id,
+        "task_title": question.get("title"),
+        "title": question.get("title"),
+        "question_text": question.get("instruction") or question.get("question_text") or question.get("title") or "",
+        "concept_tag": question.get("concept_tag") or question.get("target_concept") or question.get("concept"),
+        "target_concept": question.get("target_concept") or question.get("concept_tag") or question.get("concept"),
+        "difficulty": question.get("difficulty"),
+        "solution_blocks": solution_blocks,
+        "distractor_blocks": [],
+        "pool": list(blocks_by_id.values()),
+        "template_slots": template_slots,
+        "hide_semantic_zh": bool(question.get("hide_semantic_zh", True)),
+    }
+
+
+def _build_test_question_response(question_doc: dict, total: int, current_index: int):
+    task_doc = _parsons_question_to_task_doc(question_doc)
+    parsed = t5doc_to_parsons_task(task_doc)
+    task_id = _test_question_task_id(question_doc)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "question_text": parsed.get("question_text") or "",
+        "solution_blocks": parsed.get("solution_blocks") or [],
+        "template_slots": parsed.get("template_slots") or [],
+        "pool": parsed.get("pool") or [],
+        "total": int(total or 1),
+        "current_index": int(current_index or 1),
+        "data_source": "pre_post_parsons_questions",
+    }
+
 
 @parsons_bp.get("/test/task")
 def get_test_task():
@@ -3107,12 +3341,22 @@ def get_test_task():
     if not test_cycle_id:
         return jsonify({"ok": False, "message": "missing test_cycle_id"}), 400
 
+    requested_index = request.args.get("next_index") or request.args.get("index") or 1
+    try:
+        requested_index = int(requested_index)
+    except Exception:
+        requested_index = 1
+
+    question_doc, total, current_index = _find_test_question_by_index(test_role, requested_index)
+    if question_doc:
+        return jsonify(_build_test_question_response(question_doc, total, current_index))
+
     tt = db.parsons_test_tasks.find_one({"test_cycle_id": test_cycle_id, "test_role": test_role})
     if not tt:
         return jsonify({"ok": False, "message": "test task not configured"}), 404
 
     # 取得原始題目
-    raw_source = tt.get("source_task_id")
+    raw_source = tt.get("task_id") or tt.get("source_task_id")
     source_task_id = str(raw_source).strip() if raw_source else ""
     try:
         task_doc = db.parsons_tasks.find_one({"_id": ObjectId(source_task_id)})
@@ -3127,10 +3371,7 @@ def get_test_task():
 
     return jsonify({
         "ok": True,
-        "test_task_id": str(tt.get("_id")),
-         # ✅【新增】一定要回傳 parsons_tasks 的 _id，給前端 submit 用
-        "source_task_id": str(task_doc.get("_id")),  # <= 最重要
-        "task_id": str(task_doc.get("_id")),         # <= 可選：給前端相容用（你後端 submit 也吃 task_id）
+        "task_id": str(task_doc.get("_id")),
         "question_text": task_doc.get("question_text") or "",
         "template_slots": parsed.get("template_slots") or [],
         "pool": parsed.get("pool") or [],
@@ -3147,8 +3388,7 @@ def submit_test_answer():
       - student_id
       - test_cycle_id
       - test_role: pre/post
-      - test_task_id
-      - source_task_id / task_id
+      - task_id
       - answer_ids: [block_id,...]
       - duration_sec
     '''
@@ -3159,11 +3399,15 @@ def submit_test_answer():
     participant_id = current_participant_id()
     test_cycle_id = (data.get("test_cycle_id") or get_default_test_cycle_id()).strip() or get_default_test_cycle_id()
     test_role = (data.get("test_role") or "").strip().lower()
-    test_task_id = (data.get("test_task_id") or "").strip()
-    source_task_id = (data.get("source_task_id") or data.get("task_id") or "").strip()
+    request_task_id = (
+        data.get("task_id")
+        or data.get("source_task_id")
+        or data.get("test_task_id")
+        or ""
+    ).strip()
     answer_ids = data.get("answer_ids") or []
     answer_lines = data.get("answer_lines") or []
-    duration_sec = int(data.get("duration_sec") or 0)
+    payload_duration_sec = _safe_duration_seconds(data.get("duration_sec"))
 
     if not student_id:
         return jsonify({"ok": False, "message": "missing student_id"}), 400
@@ -3174,12 +3418,38 @@ def submit_test_answer():
         return jsonify({"ok": False, "message": "posttest not open"}), 403
 
     # 取得題目
+    task_identity = request_task_id
     try:
-        task = db.parsons_tasks.find_one({"_id": ObjectId(source_task_id)})
+        task = db.parsons_tasks.find_one({"_id": ObjectId(request_task_id)})
     except Exception:
         task = None
     if not task:
+        question_doc = _find_test_question_by_ref(test_role, request_task_id)
+        if question_doc:
+            task = _parsons_question_to_task_doc(question_doc)
+            task_identity = _test_question_task_id(question_doc)
+    if not task:
         return jsonify({"ok": False, "message": "task not found"}), 404
+    if not task_identity:
+        task_identity = str(task.get("question_id") or task.get("task_id") or task.get("_id") or "")
+    existing_attempt = db.parsons_test_attempts.find_one(
+        {
+            "student_id": student_id,
+            "test_cycle_id": test_cycle_id,
+            "test_role": test_role,
+            "task_id": task_identity,
+        },
+        {"_id": 1, "is_correct": 1, "score": 1, "submitted_at": 1},
+    )
+    if existing_attempt:
+        return jsonify({
+            "ok": True,
+            "already_submitted": True,
+            "attempt_id": str(existing_attempt.get("_id")),
+            "is_correct": existing_attempt.get("is_correct"),
+            "score": existing_attempt.get("score"),
+            "message": "此題已提交，不能重複作答。",
+        })
 
     parsed = t5doc_to_parsons_task(task)
     expected_ids = [str(s.get("expected_id")) for s in (parsed.get("template_slots") or [])]
@@ -3265,63 +3535,130 @@ def submit_test_answer():
 
     total_slots = max(1, len(expected_ids))
     score = (total_slots - len(wrong_indices)) / total_slots
+    submitted_order = list(answer_ids) if isinstance(answer_ids, list) else []
+    submitted_indentation = _submitted_indentation_from_lines(answer_lines)
+    submitted_indentation_by_block = _submitted_indentation_by_block(
+        submitted_order,
+        submitted_indentation,
+    )
+    correct_answer = _correct_answer_from_task(task) or {
+        "order": expected_ids,
+        "lines": expected_lines,
+        "indentation": expected_indent_list,
+    }
+    test_error_analysis = _build_attempt_v2_error_analysis(
+        is_correct=bool(is_correct),
+        submitted_order=submitted_order,
+        submitted_indentation=submitted_indentation,
+        correct_answer=correct_answer,
+        target_concept=_extract_attempt_v2_target_concept(task),
+        previous_error_types=[],
+    )
+    submitted_blocks = []
+    for index, block_id in enumerate(submitted_order):
+        submitted_blocks.append({
+            "index": index,
+            "block_id": block_id,
+            "line": answer_lines[index] if index < len(answer_lines) else None,
+            "indentation": submitted_indentation[index] if index < len(submitted_indentation or []) else None,
+            "expected_block_id": expected_ids[index] if index < len(expected_ids) else None,
+            "expected_line": expected_lines[index] if index < len(expected_lines) else None,
+            "expected_indentation": expected_indent_list[index] if index < len(expected_indent_list) else None,
+            "is_sequence_correct": (
+                index < len(expected_ids)
+                and str(block_id) == str(expected_ids[index])
+            ),
+            "is_indentation_correct": (
+                index < len(expected_indent_list)
+                and index < len(submitted_indentation or [])
+                and submitted_indentation[index] == expected_indent_list[index]
+            ),
+        })
+    submitted_at_input = _parse_attempt_v2_datetime(data.get("submitted_at"))
+    submitted_at = submitted_at_input or now_utc()
+    started_at = _parse_attempt_v2_datetime(data.get("started_at"))
+    duration_fields = _build_attempt_v2_duration_fields(started_at, submitted_at)
+    duration_seconds = duration_fields.get("duration_seconds")
+    if duration_seconds is None and not duration_fields.get("duration_outlier"):
+        duration_seconds = payload_duration_sec
+        duration_fields["duration_sec"] = payload_duration_sec
+        duration_fields["duration_seconds"] = payload_duration_sec
+    created_at = now_utc()
 
     attempt_doc = {
         "student_id": student_id,
         "test_cycle_id": test_cycle_id,
         "test_role": test_role,
-        "test_task_id": test_task_id or str(task.get("_id")),
-        "source_task_id": str(task.get("_id")),
+        "task_id": task_identity,
+        "task_title": _extract_attempt_v2_task_title(task),
+        "target_concept": _extract_attempt_v2_target_concept(task),
+        "attempt_no": 1,
         "answer_ids": answer_ids,
+        "answer_lines": answer_lines,
+        "answer_block_ids": answer_ids,
+        "submitted_order": submitted_order,
+        "submitted_indentation": submitted_indentation,
+        "submitted_indentation_by_block": submitted_indentation_by_block,
+        "submitted_blocks": submitted_blocks,
+        "correct_answer": correct_answer,
+        "expected_order": expected_ids,
+        "expected_lines": expected_lines,
+        "expected_indentation": expected_indent_list,
         "is_correct": is_correct,
         "score": score,
-        "duration_sec": duration_sec,
+        "duration_sec": duration_seconds,
+        "duration_seconds": duration_seconds,
+        "elapsed_sec_raw": duration_fields.get("elapsed_sec_raw"),
+        "duration_outlier": bool(duration_fields.get("duration_outlier")),
+        "duration_outlier_reason": duration_fields.get("duration_outlier_reason"),
         "wrong_indices": wrong_indices,
+        "wrong_indices_all": wrong_indices,
+        "id_mismatch_indices": id_mismatch_indices,
         "indent_errors": indent_errors,
-        "submitted_at": now_utc(),
+        "wrong_slots": test_error_analysis.get("wrong_slots", []),
+        "error_count": test_error_analysis.get("error_count", 0),
+        "error_types": test_error_analysis.get("error_types", []),
+        "error_concept": test_error_analysis.get("error_concept"),
+        "repeated_error": False,
+        "extra_wrong_count": extra_wrong,
+        "total_slots": total_slots,
+        "started_at": started_at,
+        "started_at_utc": started_at,
+        "submitted_at": submitted_at,
+        "submitted_at_utc": submitted_at,
+        "submitted_at_taiwan": _taiwan_time_string(submitted_at),
+        "created_at": created_at,
+        "created_at_utc": created_at,
+        "created_at_taiwan": _taiwan_time_string(created_at),
+        "updated_at": created_at,
+        "updated_at_utc": created_at,
+        "updated_at_taiwan": _taiwan_time_string(created_at),
+        "timezone": _PARSONS_ATTEMPTS_V2_TIMEZONE,
     }
-
-    try:
-        v2_doc = _build_parsons_attempt_v2_doc(
-            data=data,
-            task_doc=task,
-            student_id=student_id,
-            participant_id=participant_id,
-            activity_type="test",
-            test_role=test_role,
-            test_cycle_id=test_cycle_id,
-            task_id=str(task.get("_id")),
-            video_id=task.get("video_id"),
-            level=task.get("level"),
-            answer_ids=answer_ids,
-            answer_lines=answer_lines,
-            is_correct=is_correct,
-            score=score,
-        )
-    except ValueError as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "message": "parsons_attempts_v2 prepare failed", "detail": str(e)}), 500
 
     try:
         ins = db.parsons_test_attempts.insert_one(attempt_doc)
         attempt_id = str(ins.inserted_id)
-    except Exception:
-        # duplicate key => already submitted
+    except DuplicateKeyError:
+        existing_attempt = db.parsons_test_attempts.find_one(
+            {
+                "student_id": student_id,
+                "test_cycle_id": test_cycle_id,
+                "test_role": test_role,
+                "task_id": task_identity,
+            },
+            {"_id": 1, "is_correct": 1, "score": 1},
+        )
         return jsonify({
             "ok": True,
             "already_submitted": True,
-            "is_correct": is_correct,
-            "score": score,
-            "wrong_indices": wrong_indices,
-            "indent_errors": indent_errors,
+            "attempt_id": str((existing_attempt or {}).get("_id") or ""),
+            "is_correct": (existing_attempt or {}).get("is_correct"),
+            "score": (existing_attempt or {}).get("score"),
+            "message": "此題已提交，不能重複作答。",
         })
-
-    try:
-        v2_ins = db.parsons_attempts_v2.insert_one(v2_doc)
-        v2_attempt_id = str(v2_ins.inserted_id)
     except Exception as e:
-        return jsonify({"ok": False, "message": "parsons_attempts_v2 write failed", "detail": str(e)}), 500
+        return jsonify({"ok": False, "message": "parsons_test_attempts write failed", "detail": str(e)}), 500
 
     write_learning_log_safely({
         "session_id": data.get("session_id"),
@@ -3329,19 +3666,19 @@ def submit_test_answer():
         "event_type": "answer_submit",
         "page": data.get("page") or "parsons",
         "activity_type": "test",
-        "test_role": v2_doc.get("test_role"),
-        "task_id": v2_doc.get("task_id"),
-        "attempt_id": v2_attempt_id,
-        "attempt_no": v2_doc.get("attempt_no"),
-        "target_concept": v2_doc.get("target_concept"),
-        "event_at": v2_doc.get("submitted_at"),
+        "test_role": test_role,
+        "task_id": task_identity,
+        "attempt_id": attempt_id,
+        "attempt_no": 1,
+        "target_concept": attempt_doc.get("target_concept"),
+        "event_at": submitted_at,
         "metadata": {
-            "is_correct": v2_doc.get("is_correct"),
-            "score": v2_doc.get("score"),
-            "error_count": v2_doc.get("error_count"),
-            "error_types": v2_doc.get("error_types", []),
-            "wrong_slots": v2_doc.get("wrong_slots", []),
-            "repeated_error": v2_doc.get("repeated_error"),
+            "is_correct": attempt_doc.get("is_correct"),
+            "score": attempt_doc.get("score"),
+            "error_count": attempt_doc.get("error_count"),
+            "error_types": attempt_doc.get("error_types", []),
+            "wrong_slots": attempt_doc.get("wrong_slots", []),
+            "repeated_error": False,
         },
     })
 
@@ -3349,8 +3686,8 @@ def submit_test_answer():
         "ok": True,
         "already_submitted": False,
         "attempt_id": attempt_id,
-        "attempt_v2_id": v2_attempt_id,
-        "attempt_no": v2_doc.get("attempt_no"),
+        "attempt_v2_id": None,
+        "attempt_no": 1,
         "is_correct": is_correct,
         "score": score,
         "wrong_indices": wrong_indices,
@@ -3470,7 +3807,7 @@ def export_test_csv():
         "student_id",
         "test_cycle_id",
         "test_role",
-        "test_task_id",
+        "task_id",
         "is_correct",
         "score",
         "duration_sec",
@@ -3488,7 +3825,7 @@ def export_test_csv():
             "student_id": d.get("student_id", ""),
             "test_cycle_id": d.get("test_cycle_id", ""),
             "test_role": d.get("test_role", ""),
-            "test_task_id": d.get("test_task_id", ""),
+            "task_id": d.get("task_id") or d.get("test_task_id") or d.get("source_task_id") or "",
             "is_correct": d.get("is_correct", False),
             "score": d.get("score", ""),
             "duration_sec": d.get("duration_sec", ""),
@@ -7398,7 +7735,7 @@ def review_choice():
 
     if not attempt_id:
         return jsonify({"ok": False, "message": "missing attempt_id"}), 400
-    if student_choice not in ("yes", "no") and click_type not in ("hint", "video"):
+    if student_choice not in ("yes", "no") and click_type not in ("hint", "hint_retry", "video"):
         return jsonify({"ok": False, "message": "student_choice must be yes/no"}), 400
 
     # 先從 attempts 補 task_id / video_id（不改 schema）
@@ -7443,7 +7780,7 @@ def review_choice():
     click_set = {}
     click_now = now_utc()
     is_wrong_attempt = bool(att) and (att.get("is_correct") is False)
-    if click_type == "hint" and is_wrong_attempt:
+    if click_type in {"hint", "hint_retry"} and is_wrong_attempt:
         click_set["hint_click"] = True
         click_set["hint_click_time"] = click_now
     elif click_type == "video" and is_wrong_attempt:
@@ -7458,6 +7795,58 @@ def review_choice():
             )
         except Exception:
             pass
+
+    if click_type in {"hint", "hint_retry"} and is_wrong_attempt:
+        hint_no = data.get("hint_no") or data.get("hint_click_no")
+        if not hint_no and click_type == "hint_retry":
+            hint_no = 2
+        elif not hint_no:
+            hint_no = 1
+        trigger_method = data.get("trigger_method") or (
+            "click_hint_retry" if click_type == "hint_retry" else "click_ai_hint"
+        )
+        button_name = data.get("button_name") or (
+            "再次提示" if click_type == "hint_retry" else "AI提示"
+        )
+        hint_content = str(
+            data.get("hint_content")
+            or data.get("hint_text")
+            or data.get("first_hint")
+            or ""
+        ).strip()
+        write_or_update_hint_learning_log_safely({
+            "session_id": data.get("session_id"),
+            "student_id": student_id,
+            "event_type": "view_hint",
+            "page": data.get("page") or "parsons",
+            "activity_type": data.get("activity_type") or "practice",
+            "test_role": data.get("test_role"),
+            "task_id": data.get("task_id") or task_id_f,
+            "attempt_id": data.get("attempt_v2_id") or data.get("learning_attempt_id"),
+            "attempt_no": data.get("attempt_no"),
+            "target_concept": data.get("target_concept") or att.get("target_concept"),
+            "event_at": data.get("event_at") or click_now,
+            "metadata": {
+                "review_type": "ai_hint",
+                "hint_type": "ai_hint",
+                "hint_no": hint_no,
+                "hint_click_no": hint_no,
+                "max_hint_count": 2,
+                "hint_retry_count": data.get("hint_retry_count"),
+                "trigger_method": trigger_method,
+                "button_name": button_name,
+                "question_id": data.get("question_id") or data.get("task_id") or task_id_f,
+                "unit_id": data.get("unit_id"),
+                "question_type": data.get("question_type") or "parsons",
+                "hint_text": hint_content,
+                "hint_content": hint_content,
+                "hint_source": data.get("hint_source") or "frontend",
+                "hint_loaded": True if hint_content else data.get("hint_loaded"),
+                "error_type": data.get("error_type") or att.get("primary_error_type") or att.get("error_type"),
+                "wrong_slots": data.get("wrong_slots") if isinstance(data.get("wrong_slots"), list) else att.get("wrong_indices") or [],
+                "ai_diagnosis_summary": data.get("ai_diagnosis_summary"),
+            },
+        })
 
     return jsonify({"ok": True, "student_id": student_id})
 

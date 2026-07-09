@@ -1,5 +1,6 @@
+# 不需要上傳的檔案:
 # ========================
-# Python
+# Python、open ai金鑰
 # ========================
 __pycache__/
 *.pyc
@@ -10,7 +11,7 @@ venv/
 .venv/
 
 # ========================
-# Flask user uploads
+# Flask user uploads 影音檔/srt檔不用上傳
 # ========================
 uploads/
 backups/

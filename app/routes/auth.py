@@ -28,8 +28,18 @@ def login():
 
     try:
         user = db.users.find_one({"student_id": student_id})
-        stored_hash = (user or {}).get("password_hash")
-        if not user or not stored_hash or not check_password_hash(stored_hash, password):
+        if not user:
+            return jsonify({"ok": False, "message": "帳號或密碼錯誤。"}), 401
+
+        stored_hash = user.get("password_hash")
+        if not stored_hash:
+            return jsonify({
+                "ok": False,
+                "error": "password_not_set",
+                "message": "帳號尚未設定密碼，請聯絡管理者。",
+            }), 403
+
+        if not check_password_hash(user["password_hash"], password):
             return jsonify({"ok": False, "message": "帳號或密碼錯誤。"}), 401
 
         session_id = secrets.token_urlsafe(32)

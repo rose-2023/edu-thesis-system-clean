@@ -80,6 +80,7 @@
         <video
           ref="player"
           v-if="selectedVideo"
+          :key="selectedVideoId"
           class="player"
           controls
           :src="selectedVideo.videoUrl"
@@ -119,10 +120,37 @@ let hasSentReached = false; // ✅【新增】避免 reached_end 重複送
 // ✅【修正】用「影片時間差」累積實際觀看秒數（比 setInterval 穩定、也能避免背景分頁被節流）
 let _watchBound = false;
 let _lastVideoTime = null; // 上一次 timeupdate 的 currentTime
+let _lastSentWatchSeconds = 0;
+let _watchSessionId = "";
+
+function newWatchSessionId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch (_) {}
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function _resetWatchAccumulators() {
   _lastVideoTime = null;
   // 注意：watchSeconds / reachedEnd / watchStartAt 是否重置由呼叫端決定
+}
+
+function resetWatchCounters() {
+  if (autoSaveTimer) {
+    clearInterval(autoSaveTimer);
+    autoSaveTimer = null;
+  }
+  watchStartAt.value = null;
+  reachedEnd.value = false;
+  watchSeconds.value = 0;
+  hasSentReached = false;
+  _lastSentWatchSeconds = 0;
+  _resetWatchAccumulators();
+}
+
+function resetWatchSession() {
+  _watchSessionId = newWatchSessionId();
+  resetWatchCounters();
 }
 
 function _bindPlayerWatchEvents() {
@@ -137,17 +165,21 @@ function _bindPlayerWatchEvents() {
     if (!watchStartAt.value) watchStartAt.value = new Date().toISOString();
     // 以目前播放位置作為起點
     _lastVideoTime = el.currentTime;
+    sendWatchLog("video_play");
 
     // ✅【新增】播放時啟動自動送
     if (!autoSaveTimer) {
       autoSaveTimer = setInterval(() => {
-        sendWatchLog();
+        sendWatchLog("video_progress");
       }, 5000);
     }
   });
 
   el.addEventListener("pause", () => {
     _lastVideoTime = el.currentTime;
+    if (!reachedEnd.value) {
+      sendWatchLog("video_pause");
+    }
     // ✅【新增】暫停就停止自動送（省資源）
     if (autoSaveTimer) {
       clearInterval(autoSaveTimer);
@@ -163,8 +195,12 @@ function _bindPlayerWatchEvents() {
   el.addEventListener("ended", () => {
     reachedEnd.value = true;
     _lastVideoTime = null;
+    if (autoSaveTimer) {
+      clearInterval(autoSaveTimer);
+      autoSaveTimer = null;
+    }
     // 看完就先送一次（不等離開頁面）
-    sendWatchLog?.();
+    sendWatchLog("video_ended");
   });
 
   el.addEventListener("timeupdate", () => {
@@ -190,7 +226,7 @@ function _bindPlayerWatchEvents() {
       }
       if (!hasSentReached) {
         hasSentReached = true;
-        sendWatchLog(); // ✅ 到 end 立刻送一次
+        sendWatchLog("video_ended"); // ✅ 到 end 立刻送一次
       }
     }
   });
@@ -312,10 +348,15 @@ function groupByUnit(videos) {
 }
 
 function selectVideo(u, v) {
+  if (selectedVideoId.value) {
+    sendWatchLog("video_leave");
+  }
   selectedVideo.value = v;
   selectedVideoId.value = v._id || v.id || v.video_id;
   currentUnit.value = u.unit;
   currentTitle.value = v.title;
+  resetWatchSession();
+  sendWatchLog("video_click");
 
   // ✅ 每次切換影片都重新綁定一次監聽（新的 <video> 會重新渲染）
   _watchBound = false;
@@ -332,6 +373,60 @@ function isVideoCompleted(v) {
   const key = videoKey(v);
   if (!key) return false;
   return completedVideoIds.value.has(key);
+}
+
+function relatedTaskIdsForVideo(video = selectedVideo.value) {
+  return Array.isArray(video?.related_task_ids)
+    ? video.related_task_ids.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+function firstRelatedTaskId(video = selectedVideo.value) {
+  return relatedTaskIdsForVideo(video)[0] || null;
+}
+
+async function logLearningTransition(eventType, extra = {}) {
+  const token = String(localStorage.getItem("token") || "").trim();
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const relatedTaskIds = relatedTaskIdsForVideo();
+  const fromVideoId = selectedVideoId.value
+    ? String(selectedVideoId.value)
+    : (route.params.videoId ? String(route.params.videoId) : "");
+  const body = {
+    session_id: _watchSessionId,
+    event_type: eventType,
+    page: "student_learning",
+    activity_type: "practice",
+    test_role: null,
+    task_id: extra.to_task_id || null,
+    unit_id: currentUnit.value || selectedVideo.value?.unit || "",
+    from_video_id: fromVideoId || null,
+    from_video_title: currentTitle.value || selectedVideo.value?.title || "",
+    watch_session_id: _watchSessionId,
+    to_task_id: extra.to_task_id || null,
+    to_question_type: "parsons",
+    question_type: "parsons",
+    event_at: new Date().toISOString(),
+    metadata: {
+      related_task_ids: relatedTaskIds,
+      ...(extra.metadata || {}),
+    },
+  };
+  try {
+    const response = await fetch(`${API_BASE}/api/learning_logs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      keepalive: true,
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      console.warn("learning transition log failed", eventType, response.status, text);
+    }
+  } catch (err) {
+    console.warn("learning transition log failed", eventType, err);
+  }
 }
 
 async function loadCompletedVideoIds() {
@@ -364,24 +459,36 @@ async function loadCompletedVideoIds() {
   }
 }
 
-function goParsons() {
+async function goParsons() {
   if (!selectedVideoId.value) {
     alert("請先從左側選擇一部影片");
     return;
   }
+  await sendWatchLog("video_leave");
+  const toTaskId = firstRelatedTaskId();
+  await logLearningTransition("click_next_to_practice", {
+    to_task_id: toTaskId,
+  });
   router.push({
     path: `/parsons/${selectedVideoId.value || route.params.videoId}`,
     query: {
       review_attempt_id: String(route.query.attempt_id || ""),
+      from_video_id: String(selectedVideoId.value || route.params.videoId || ""),
+      from_video_title: currentTitle.value || selectedVideo.value?.title || "",
+      unit_id: currentUnit.value || selectedVideo.value?.unit || "",
+      watch_session_id: _watchSessionId,
+      to_task_id: toTaskId || "",
     },
   });
 }
 
-function goHome() {
+async function goHome() {
+  await sendWatchLog("video_leave");
   router.push("/home");
 }
 
 async function logout() {
+  await sendWatchLog("video_leave");
   await logoutCurrentSession(API_BASE);
   router.replace("/login");
 }
@@ -397,10 +504,7 @@ async function seekToSegment(start, end) {
   const doSeek = () => {
     try {
       // ✅【新增】每次開始回看片段前，重置回看統計（避免上一段殘留）
-      watchStartAt.value = null;
-      reachedEnd.value = false;
-      watchSeconds.value = 0;
-      _resetWatchAccumulators();
+      resetWatchCounters();
 
       el.currentTime = start;
       el.play?.();
@@ -559,35 +663,59 @@ onMounted(async () => {
   }
 });
 
-async function sendWatchLog() {
-  const attemptId = route.query.attempt_id ? String(route.query.attempt_id) : "";
-  if (!attemptId) return;
-
+async function sendWatchLog(eventType = "video_progress") {
   const vid = selectedVideoId.value
     ? String(selectedVideoId.value)
     : (route.params.videoId ? String(route.params.videoId) : "");
+  if (!vid) return;
+
+  const el = player.value;
+  const watchTotal = Math.round(Number(watchSeconds.value || 0));
+  const watchDelta = Math.max(0, watchTotal - Math.round(Number(_lastSentWatchSeconds || 0)));
+  if (eventType === "video_progress" && watchDelta <= 0 && !reachedEnd.value) return;
 
   const payload = {
-    attempt_id: attemptId,
+    event_type: eventType,
     video_id: vid,
-    task_id: route.query.task_id ? String(route.query.task_id) : "",
+    unit_id: currentUnit.value || selectedVideo.value?.unit || "",
+    video_title: currentTitle.value || selectedVideo.value?.title || "",
+    watch_session_id: _watchSessionId,
+    attempt_id: route.query.attempt_id ? String(route.query.attempt_id) : "",
+    task_id: null,
     start_sec: route.query.start != null ? Number(route.query.start) : null,
     end_sec: route.query.end != null ? Number(route.query.end) : null,
-
-    watch_seconds: Math.round(Number(watchSeconds.value || 0)), // ✅【修正】送出整數秒
+    watch_seconds: watchTotal,
+    watch_delta_sec: watchDelta,
+    current_time_sec: el ? Number(el.currentTime || 0) : null,
+    video_duration_sec: el && Number.isFinite(Number(el.duration)) ? Number(el.duration) : null,
+    playback_rate: el ? Number(el.playbackRate || 1) : 1,
     reached_end: Boolean(reachedEnd.value),
     watch_start_at: watchStartAt.value,
     watch_end_at: new Date().toISOString(),
+    event_at: new Date().toISOString(),
+    page: "student_learning",
+    route_path: route.fullPath,
   };
 
   try {
-    await fetch(`${API_BASE}/api/parsons/review_watch`, {
+    const token = String(localStorage.getItem("token") || "").trim();
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(`${API_BASE}/api/video_rewatch_logs`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
       keepalive: true,
     });
-  } catch (_) {}
+    if (response.ok) {
+      _lastSentWatchSeconds = watchTotal;
+    } else {
+      const text = await response.text().catch(() => "");
+      console.warn("video watch log failed", response.status, text);
+    }
+  } catch (err) {
+    console.warn("video watch log failed", err);
+  }
 }
 
 onBeforeUnmount(() => {
@@ -595,12 +723,12 @@ onBeforeUnmount(() => {
     clearInterval(autoSaveTimer);
     autoSaveTimer = null;
   }
-  sendWatchLog();
+  sendWatchLog("video_leave");
 });
 
 // 返回練習」按鈕 backToPractice() 裡也先送再跳
 async function backToPractice() {
-  await sendWatchLog();
+  await sendWatchLog("video_leave");
   router.push({
     path: `/parsons/${selectedVideoId.value || route.params.videoId}`,
     query: {
@@ -672,21 +800,8 @@ function stopAutoSave() {
 // ✅【新增】送 watch 資料到後端
 // ==============================
 async function sendWatchToServer() {
-  const attempt_id = String(route.query.attempt_id || "");
-  if (!attempt_id) return;
-
   try {
-    await fetch(`${API_BASE}/api/parsons/review_watch`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        attempt_id,
-        watch_seconds: Math.floor(watchSeconds.value),
-        reached_end: reachedEnd.value,
-        watch_start_at: watchStartAt.value,
-        watch_end_at: new Date().toISOString(),
-      }),
-    });
+    await sendWatchLog("video_progress");
   } catch (e) {
     console.warn("watch save failed", e);
   }

@@ -44,6 +44,19 @@ CORE_INDEXES = {
         ([("attempt_id", ASCENDING)], "attempt_id_1", False),
         ([("event_at", ASCENDING)], "event_at_1", False),
     ],
+    "video_rewatch_logs": [
+        ([("student_id", ASCENDING)], "student_id_1", False),
+        ([("class_name", ASCENDING)], "class_name_1", False),
+        ([("group_type", ASCENDING)], "group_type_1", False),
+        ([("is_test_data", ASCENDING)], "is_test_data_1", False),
+        ([("video_id", ASCENDING)], "video_id_1", False),
+        ([("unit_id", ASCENDING)], "unit_id_1", False),
+        ([("event_type", ASCENDING)], "event_type_1", False),
+        ([("event_at", ASCENDING)], "event_at_1", False),
+        ([("student_id", ASCENDING), ("event_at", ASCENDING)], "student_event_at_1", False),
+        ([("video_id", ASCENDING), ("event_at", ASCENDING)], "video_event_at_1", False),
+        ([("watch_session_id", ASCENDING), ("event_at", ASCENDING)], "watch_session_event_at_1", False),
+    ],
 }
 
 

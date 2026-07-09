@@ -5,7 +5,7 @@
       <div class="profile">
         <div class="avatar">👩‍🏫</div>
         <div class="hello">
-          <div class="hi">您好，老師</div>
+          <div class="hi">您好，管理員</div>
           <div class="sub">分析儀表板</div>
         </div>
       </div>

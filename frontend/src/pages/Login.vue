@@ -152,7 +152,7 @@ async function login() {
     const msgFromServer = e?.response?.data?.message || e?.response?.data?.error;
 
     if (status === 401 || status === 403) {
-      setError("學號或密碼錯誤，請再試一次。");
+      setError(msgFromServer || "學號或密碼錯誤，請再試一次。");
     } else if (status >= 500) {
       setError("後端伺服器錯誤（500）。請確認 Flask 有啟動，或稍後再試。");
     } else {

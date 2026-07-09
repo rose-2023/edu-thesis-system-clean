@@ -231,7 +231,7 @@ const currentAvatarEmoji = computed(() => {
   if (avatarType.value === "emoji" && ["👨", "👩"].includes(avatarSrc.value)) {
     return avatarSrc.value;
   }
-  return "👨";
+  return studentSexj.value === "girl" || studentSexj.value === "女生" ? "👩" : "👨";
 });
 const currentAvatarImageUrl = computed(() => (
   avatarType.value === "image" ? avatarAssetUrl(avatarSrc.value) : ""

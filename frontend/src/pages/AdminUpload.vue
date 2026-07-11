@@ -40,6 +40,7 @@
         <div class="row">
           <label>上傳字幕檔（必填，.srt / .txt）</label>
           <input type="file" accept=".srt,.txt" @change="onSubtitleFile" />
+          <p class="subHelp">請同時上傳 SRT 字幕檔；學生觀看影片時會自動顯示字幕。</p>
         </div>
 
         <div class="subOps">
@@ -688,6 +689,7 @@ input, textarea { padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
   border-radius: 14px;
 }
 .subTitle{ font-weight: 900; margin-bottom: 10px; }
+.subHelp{ margin: 6px 0 0; color:#64748b; font-size: 13px; line-height: 1.5; }
 .subOps{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 .subOk{ color:#065f46; font-weight: 900; font-size: 13px; }
 .subErrBox{

@@ -3,10 +3,11 @@ import re
 _re = re  # [新增] 統一使用 _re，避免未定義
 import hashlib
 import json
+import math
 import random
 import statistics
 import threading
-import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Any, Dict, Tuple, Optional
@@ -28,6 +29,7 @@ from .learning_logs import (
 )
 
 from . import parsons_ai  # [新增] 統一管理 OpenAI 呼叫（方案1）
+# 負責概念標籤、字幕章節與 block 對齊。
 from .parsons_concept_align import (
     align_task_by_concept,  # [新增] 概念章節對齊
     _WRONG_TYPE_TO_CONCEPT_TAG,
@@ -54,6 +56,7 @@ from .parsons_concept_align import (
     map_blocks_to_chapters,
     build_concept_segment_map,
 )
+# 負責從 SRT 找到最相關的字幕片段。
 from .parsons_retrieval import (
     build_subtitle_index,
     retrieve_best_segment,
@@ -84,6 +87,7 @@ from .parsons_service import (
 
 parsons_bp = Blueprint("parsons", __name__)
 
+# 學生才可以登入
 _STUDENT_PARSONS_PATHS = {
     "/task",
     "/test/status",
@@ -91,11 +95,12 @@ _STUDENT_PARSONS_PATHS = {
     "/test/submit",
     "/submit",
     "/hint",
+    "/hint_state",
     "/review_choice",
     "/review_watch",
 }
 
-
+# 老師與管理員才能管理題目
 @parsons_bp.before_request
 def enforce_parsons_session():
     subpath = request.path.removeprefix("/api/parsons")
@@ -113,10 +118,8 @@ def enforce_parsons_session():
 
 _SUBMIT_GUARD_LOCK = threading.Lock()
 _SUBMIT_ACTIVE = set()
-_SUBMIT_RECENT = {}
-_DUPLICATE_SUBMIT_WINDOW_SEC = 2.0
 
-
+# 會把這些資料做 SHA-256
 def _submit_request_key(data):
     canonical_task_id = (
         data.get("task_id")
@@ -134,20 +137,14 @@ def _submit_request_key(data):
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return current_student_id(), request.path, digest
 
-
+# 防止學生重複送出答案，避免 AI 生成提示被覆蓋
+# 若同一學生短時間重複送出完全相同內容，會回傳 409 Conflict
 def prevent_duplicate_submission(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
         key = _submit_request_key(request.get_json(silent=True) or {})
-        now = time.monotonic()
         with _SUBMIT_GUARD_LOCK:
-            expired = [
-                item for item, timestamp in _SUBMIT_RECENT.items()
-                if now - timestamp >= _DUPLICATE_SUBMIT_WINDOW_SEC
-            ]
-            for item in expired:
-                _SUBMIT_RECENT.pop(item, None)
-            if key in _SUBMIT_ACTIVE or key in _SUBMIT_RECENT:
+            if key in _SUBMIT_ACTIVE:
                 return jsonify({
                     "ok": False,
                     "error": "duplicate_submission",
@@ -160,11 +157,11 @@ def prevent_duplicate_submission(view):
         finally:
             with _SUBMIT_GUARD_LOCK:
                 _SUBMIT_ACTIVE.discard(key)
-                _SUBMIT_RECENT[key] = time.monotonic()
 
     return wrapped
 
-
+# 學生只能呼叫學生 API
+# 學生不能取得其他學生的 attempt
 def _attempt_belongs_to_current_student(attempt):
     if not isinstance(attempt, dict):
         return False
@@ -182,7 +179,8 @@ def _attempt_belongs_to_current_student(attempt):
 # =========================
 _TAIPEI_TZ = timezone(timedelta(hours=8))
 
-
+# ========================
+# MongoDB Date 使用 UTC。
 def _utc_now():
     """
     Return current UTC datetime.
@@ -190,7 +188,7 @@ def _utc_now():
     """
     return datetime.now(timezone.utc)
 
-
+# 額外保存台灣顯示時間。
 def _taiwan_time_string(value):
     """Format an aware UTC datetime for display/audit fields without changing BSON Date storage."""
     if not isinstance(value, datetime):
@@ -199,7 +197,7 @@ def _taiwan_time_string(value):
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(_TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-
+# 控制影片跳轉功能是否啟用。
 def _video_review_enabled() -> bool:
     """Return whether video review and subtitle alignment features are enabled."""
     return str(os.getenv("PARSONS_VIDEO_REVIEW_ENABLED", "0")).strip().lower() in {
@@ -209,7 +207,7 @@ def _video_review_enabled() -> bool:
         "on",
     }
 
-
+# 選擇字幕對齊模型與 AI 提示模型。
 def _video_review_disabled_response():
     return jsonify({
         "ok": False,
@@ -237,10 +235,12 @@ def _model_for_feedback() -> str:
     ).strip()
 
 # =========================
-# ✅ V1.8 Test (Pre/Post) Utils
+#  (Pre/Post) Utils
 # =========================
 _TEST_INDEX_READY = False
 
+# MongoDB Index
+# 加快學生、題目、時間與作答紀錄查詢。
 def ensure_test_indexes():
     """Keep legacy test-attempt indexes compatible with multi-question tests."""
     global _TEST_INDEX_READY
@@ -294,12 +294,14 @@ def ensure_test_indexes():
 
 # Parsons attempts v2 standardized write helpers
 _PARSONS_ATTEMPTS_V2_INDEX_READY = False
+_PARSONS_HINT_RECORD_INDEX_READY = False
 _PARSONS_ATTEMPTS_V2_TIMEZONE = "Asia/Taipei"
 _PARSONS_TEST_STUDENT_ID = "11461127"
+_PARSONS_HINT_PROMPT_VERSION = "srt_aggregated_all_errors_v2_similarity_checked"
 
 
 def ensure_parsons_attempts_v2_indexes():
-    """Create the standardized Parsons attempts v2 collection indexes."""
+    """Create indexes for per-session Parsons attempt analysis."""
     global _PARSONS_ATTEMPTS_V2_INDEX_READY
     if _PARSONS_ATTEMPTS_V2_INDEX_READY:
         return
@@ -309,7 +311,6 @@ def ensure_parsons_attempts_v2_indexes():
             if "parsons_attempts_v2" not in db.list_collection_names():
                 db.create_collection("parsons_attempts_v2")
         except Exception:
-            # create_index will also create the collection when MongoDB is reachable.
             pass
 
         for field in [
@@ -321,20 +322,33 @@ def ensure_parsons_attempts_v2_indexes():
             "test_cycle_id",
             "task_id",
             "target_concept",
+            "task_attempt_session",
+            "attempt_no",
+            "attempt_sequence_no",
             "submitted_at",
             "is_correct",
         ]:
             db.parsons_attempts_v2.create_index([(field, 1)], name=f"{field}_1")
 
+        # 舊索引保留相容性；新索引明確把「第幾次完整作答場次」納入。
         db.parsons_attempts_v2.create_index(
             [
                 ("student_id", 1),
                 ("task_id", 1),
                 ("activity_type", 1),
                 ("test_role", 1),
+                ("task_attempt_session", 1),
                 ("attempt_no", 1),
             ],
-            name="student_task_activity_role_attempt_1",
+            name="student_task_role_session_attempt_1",
+        )
+        db.parsons_attempts_v2.create_index(
+            [
+                ("student_id", 1),
+                ("task_id", 1),
+                ("attempt_sequence_no", 1),
+            ],
+            name="student_task_sequence_1",
         )
         _PARSONS_ATTEMPTS_V2_INDEX_READY = True
     except Exception as e:
@@ -345,7 +359,1001 @@ def ensure_parsons_attempts_v2_indexes():
         print("=====================================================\n")
         raise
 
+# 防止提示紀錄重複建立
+def ensure_parsons_hint_record_indexes():
+    """Create indexes for per-student per-task Parsons hint state."""
+    global _PARSONS_HINT_RECORD_INDEX_READY
+    if _PARSONS_HINT_RECORD_INDEX_READY:
+        return
+    try:
+        db.parsons_hint_records.create_index(
+            [("student_id", 1), ("task_id", 1)],
+            name="student_task_unique",
+            unique=True,
+        )
+        db.parsons_hint_records.create_index([("student_id", 1)], name="student_id_1")
+        db.parsons_hint_records.create_index([("task_id", 1)], name="task_id_1")
+        db.parsons_hint_records.create_index([("hint_id", 1)], name="hint_id_1")
+        db.parsons_hint_records.create_index([("updated_at", -1)], name="updated_at_-1")
+        _PARSONS_HINT_RECORD_INDEX_READY = True
+    except Exception as e:
+        print(f"[parsons_hint_records] index ensure failed: {e}")
 
+
+def _clean_string(value):
+    text = str(value or "").strip()
+    return text or None
+
+
+def _int_list(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        try:
+            number = int(item)
+        except Exception:
+            continue
+        if number >= 0:
+            out.append(number)
+    return sorted(set(out))
+
+
+def _hint_error_types(v2_doc=None, attempt_doc=None, primary_error_type=None):
+    v2_doc = v2_doc if isinstance(v2_doc, dict) else {}
+    attempt_doc = attempt_doc if isinstance(attempt_doc, dict) else {}
+    error_types = v2_doc.get("error_types")
+    if isinstance(error_types, list) and error_types:
+        return [str(item) for item in error_types if str(item or "").strip()]
+    if _int_list(v2_doc.get("wrong_slots")) or _int_list(attempt_doc.get("wrong_indices")):
+        guessed = ["sequence_error"]
+        if _int_list(attempt_doc.get("indent_errors")):
+            guessed.append("indentation_error")
+        return guessed
+    primary = str(primary_error_type or attempt_doc.get("primary_error_type") or attempt_doc.get("error_type") or "").strip()
+    if primary == "indentation":
+        return ["indentation_error"]
+    if primary:
+        return ["sequence_error"]
+    return []
+
+
+def _first_system_hint_text(wrong_slots, error_types):
+    positions = _int_list(wrong_slots)
+    position_text = "、".join([f"第 {idx + 1} 格" for idx in positions]) if positions else "紅色標記的位置"
+    labels = []
+    if "sequence_error" in (error_types or []):
+        labels.append("結構順序錯誤")
+    if "indentation_error" in (error_types or []):
+        labels.append("縮排錯誤")
+    label_text = "、".join(labels) if labels else "結構順序錯誤"
+    return f"{position_text}有錯誤（{label_text}）。請先檢查紅色標記的位置，重新確認程式區塊的順序或結構。"
+
+
+def _system_recheck_text(wrong_slots, error_types, attempt_no=None):
+    """Build the system-only message used from the third wrong submission onward."""
+    positions = _int_list(wrong_slots)
+    position_text = "、".join([f"第 {idx + 1} 格" for idx in positions]) if positions else "紅色標記的位置"
+    labels = []
+    if "sequence_error" in (error_types or []):
+        labels.append("結構順序錯誤")
+    if "indentation_error" in (error_types or []):
+        labels.append("縮排錯誤")
+    label_text = "、".join(labels) if labels else "待調整"
+    count = len(positions)
+    attempt_label = f"第 {int(attempt_no)} 次作答" if attempt_no else "本次作答"
+    return (
+        f"{attempt_label}目前仍有 {count} 格需要調整。"
+        f"錯誤位置為{position_text}（{label_text}）。"
+        "請依照紅色標記重新確認程式區塊的順序與縮排。"
+    )
+
+# parsons_hint_records
+# 保存同一位學生、同一道題、目前作答場次的提示狀態
+# 第一次系統提示
+# 第一次 AI 提示
+# 第二次 AI 提示
+# 兩次提示各自的 metadata
+# 提示產生次數
+# 提示查看次數
+def _empty_hint_record(student_id, task_id, group_type=None, task_attempt_session=1):
+    now = now_utc()
+    try:
+        session_no = max(1, int(task_attempt_session or 1))
+    except Exception:
+        session_no = 1
+    return {
+        "hint_id": str(uuid.uuid4()),
+        "student_id": student_id,
+        "task_id": task_id,
+        "task_attempt_session": session_no,
+        "hint_prompt_version": _PARSONS_HINT_PROMPT_VERSION,
+        "group_type": group_type,
+        "first_hint_shown": False,
+        "first_system_hint_text": None,
+        "first_error_positions": [],
+        "first_error_types": [],
+        "second_error_positions": [],
+        "second_error_types": [],
+        "latest_error_positions": [],
+        "latest_error_types": [],
+        "latest_error_count": 0,
+        "latest_attempt_v2_id": None,
+        "ai_hint_1_text": None,
+        "ai_hint_1_meta": {},
+        "ai_hint_2_text": None,
+        "ai_hint_2_meta": {},
+        "hint_generation_count": 0,
+        "hint_view_count": 0,
+        "ai_hint_generation_count": 0,
+        "ai_hint_view_count": 0,
+        "latest_ai_hint_no": 0,
+        "timezone": "Asia/Taipei",
+        "created_at": now,
+        "created_at_utc": now,
+        "created_at_taiwan": _taiwan_time_string(now),
+        "updated_at": now,
+        "updated_at_utc": now,
+        "updated_at_taiwan": _taiwan_time_string(now),
+    }
+
+
+def _get_hint_record(student_id, task_id):
+    if not student_id or not task_id:
+        return None
+    ensure_parsons_hint_record_indexes()
+    return db.parsons_hint_records.find_one({
+        "student_id": str(student_id),
+        "task_id": str(task_id),
+    })
+
+
+def _set_hint_record(student_id, task_id, set_fields=None, set_on_insert=None, inc_fields=None):
+    if not student_id or not task_id:
+        return None
+    ensure_parsons_hint_record_indexes()
+    now = now_utc()
+    set_payload = {
+        **(set_fields or {}),
+        "updated_at": now,
+        "updated_at_utc": now,
+        "updated_at_taiwan": _taiwan_time_string(now),
+        "timezone": "Asia/Taipei",
+    }
+    insert_payload = {
+        **_empty_hint_record(student_id, task_id),
+        **(set_on_insert or {}),
+    }
+    for key in set_payload:
+        insert_payload.pop(key, None)
+    for key in (inc_fields or {}):
+        insert_payload.pop(key, None)
+    update = {
+        "$set": set_payload,
+        "$setOnInsert": insert_payload,
+    }
+    if inc_fields:
+        update["$inc"] = inc_fields
+    try:
+        db.parsons_hint_records.update_one(
+            {"student_id": str(student_id), "task_id": str(task_id)},
+            update,
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        db.parsons_hint_records.update_one(
+            {"student_id": str(student_id), "task_id": str(task_id)},
+            update,
+            upsert=True,
+        )
+    return _get_hint_record(student_id, task_id)
+
+
+def _ensure_first_hint_record(
+    student_id,
+    task_id,
+    *,
+    group_type=None,
+    wrong_slots=None,
+    error_types=None,
+    task_attempt_session=1,
+):
+    positions = _int_list(wrong_slots)
+    types = [str(item) for item in (error_types or []) if str(item or "").strip()]
+    first_text = _first_system_hint_text(positions, types)
+    try:
+        session_no = max(1, int(task_attempt_session or 1))
+    except Exception:
+        session_no = 1
+
+    record = _get_hint_record(student_id, task_id)
+    # 提示限制以 student_id + task_id 為單位。重新整理、退出或重新進入
+    # 不能因 task_attempt_session 變動而清掉已產生的 AI 提示。
+    if record and record.get("first_system_hint_text"):
+        return record
+
+    return _set_hint_record(
+        student_id,
+        task_id,
+        set_fields={
+            "task_attempt_session": session_no,
+            "group_type": group_type,
+            "first_hint_shown": True,
+            "first_system_hint_text": first_text,
+            "first_error_positions": positions,
+            "first_error_types": types,
+        },
+    )
+
+# AI 提示 metadata
+# 提示紀錄的公開資訊組裝
+def _hint_record_public(record):
+    if not isinstance(record, dict):
+        return None
+    return {
+        "hint_id": record.get("hint_id"),
+        "student_id": record.get("student_id"),
+        "task_id": record.get("task_id"),
+        "task_attempt_session": int(record.get("task_attempt_session") or 1),
+        "hint_prompt_version": record.get("hint_prompt_version") or "legacy",
+        "group_type": record.get("group_type"),
+        "first_hint_shown": bool(record.get("first_hint_shown")),
+        "first_system_hint_text": record.get("first_system_hint_text"),
+        "first_error_positions": record.get("first_error_positions") or [],
+        "first_error_types": record.get("first_error_types") or [],
+        "second_error_positions": record.get("second_error_positions") or [],
+        "second_error_types": record.get("second_error_types") or [],
+        "latest_error_positions": record.get("latest_error_positions") or [],
+        "latest_error_types": record.get("latest_error_types") or [],
+        "latest_error_count": int(record.get("latest_error_count") or 0),
+        "latest_attempt_v2_id": record.get("latest_attempt_v2_id"),
+        "ai_hint_1_text": record.get("ai_hint_1_text"),
+        "ai_hint_1_meta": record.get("ai_hint_1_meta") if isinstance(record.get("ai_hint_1_meta"), dict) else {},
+        "ai_hint_2_text": record.get("ai_hint_2_text"),
+        "ai_hint_2_meta": record.get("ai_hint_2_meta") if isinstance(record.get("ai_hint_2_meta"), dict) else {},
+        "hint_generation_count": int(record.get("hint_generation_count") or record.get("ai_hint_generation_count") or 0),
+        "hint_view_count": int(record.get("hint_view_count") or record.get("ai_hint_view_count") or 0),
+        "ai_hint_generation_count": int(record.get("ai_hint_generation_count") or record.get("hint_generation_count") or 0),
+        "ai_hint_view_count": int(record.get("ai_hint_view_count") or record.get("hint_view_count") or 0),
+        "latest_ai_hint_no": int(record.get("latest_ai_hint_no") or 0),
+        "last_attempt_id": record.get("last_attempt_id"),
+        "timezone": record.get("timezone") or "Asia/Taipei",
+        "created_at_taiwan": record.get("created_at_taiwan"),
+        "updated_at_taiwan": record.get("updated_at_taiwan"),
+    }
+
+# 提示紀錄的 metadata 組裝
+def _hint_log_metadata(record, *, requested_hint_no=None, error_types=None, wrong_slots=None, repeated_error=None, extra=None):
+    public = _hint_record_public(record) or {}
+    hint_no = requested_hint_no if requested_hint_no in {1, 2} else public.get("latest_ai_hint_no")
+    hint_text = public.get("ai_hint_2_text") if hint_no == 2 else public.get("ai_hint_1_text")
+    hint_meta = public.get("ai_hint_2_meta") if hint_no == 2 else public.get("ai_hint_1_meta")
+    if not isinstance(hint_meta, dict):
+        hint_meta = {}
+    subtitle_range = hint_meta.get("subtitle_range") if isinstance(hint_meta.get("subtitle_range"), dict) else {}
+    metadata_wrong_slots = _int_list(wrong_slots or hint_meta.get("wrong_slots") or [])
+    concept_tags = [
+        normalize_concept_name(item)
+        for item in (hint_meta.get("concept_tags") or [])
+        if normalize_concept_name(item)
+    ]
+    if not concept_tags and hint_meta.get("concept_tag"):
+        concept_tags = [normalize_concept_name(hint_meta.get("concept_tag"))]
+    concept_scopes = [
+        str(item or "").strip()
+        for item in (hint_meta.get("concept_scopes") or [])
+        if str(item or "").strip()
+    ]
+    if not concept_scopes and hint_meta.get("concept_scope"):
+        concept_scopes = [str(hint_meta.get("concept_scope")).strip()]
+    metadata = {
+        "review_type": "ai_hint",
+        "hint_type": "ai_hint",
+        "hint_id": public.get("hint_id"),
+        "task_attempt_session": int(public.get("task_attempt_session") or 1),
+        "hint_prompt_version": public.get("hint_prompt_version") or "legacy",
+        "requested_hint_no": hint_no,
+        "hint_no": hint_no,
+        "hint_click_no": hint_no,
+        "max_hint_count": 2,
+        "hint_generation_count": public.get("hint_generation_count", 0),
+        "hint_view_count": public.get("hint_view_count", 0),
+        "ai_hint_generation_count": public.get("ai_hint_generation_count", public.get("hint_generation_count", 0)),
+        "ai_hint_view_count": public.get("ai_hint_view_count", public.get("hint_view_count", 0)),
+        "first_system_hint_text": public.get("first_system_hint_text"),
+        "ai_hint_1_text": public.get("ai_hint_1_text"),
+        "ai_hint_2_text": public.get("ai_hint_2_text"),
+        "ai_hint_1_meta": public.get("ai_hint_1_meta") or {},
+        "ai_hint_2_meta": public.get("ai_hint_2_meta") or {},
+        "hint_text": hint_text,
+        "hint_content": hint_text,
+        "hint_level": hint_meta.get("hint_level"),
+        "scope": hint_meta.get("scope"),
+        "aggregation_mode": hint_meta.get("aggregation_mode"),
+        "concept_tag": hint_meta.get("concept_tag"),
+        "concept_scope": hint_meta.get("concept_scope"),
+        "concept_tags": concept_tags,
+        "concept_scopes": concept_scopes,
+        "concept_count": int(hint_meta.get("concept_count") or len(concept_tags) or 0),
+        "wrong_index": hint_meta.get("wrong_index"),
+        "wrong_slot_count": int(hint_meta.get("wrong_slot_count") or len(metadata_wrong_slots)),
+        "subtitle_range": subtitle_range,
+        "subtitle_range_available": _hint_subtitle_range_available(subtitle_range),
+        "hint_source": hint_meta.get("hint_source") or "parsons_hint_records",
+        "answer_leakage_check": hint_meta.get("answer_leakage_check"),
+        "hint_quality_status": hint_meta.get("hint_quality_status"),
+        "second_hint_similarity": hint_meta.get("second_hint_similarity"),
+        "second_hint_similarity_threshold": hint_meta.get("second_hint_similarity_threshold"),
+        "hint_loaded": bool(hint_text),
+        "repeated_error": repeated_error if isinstance(repeated_error, bool) else None,
+        "error_types": error_types if isinstance(error_types, list) else [],
+        "wrong_slots": metadata_wrong_slots,
+    }
+    if isinstance(extra, dict):
+        metadata.update(extra)
+    return metadata
+
+
+def _hint_float_or_none(value):
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _hint_range_payload(value, *, fallback_source=""):
+    source = str(fallback_source or "").strip()
+    if isinstance(value, dict):
+        start = _hint_float_or_none(value.get("start"))
+        end = _hint_float_or_none(value.get("end"))
+        source = str(value.get("source") or source or "").strip()
+    else:
+        start = None
+        end = None
+    if start is None or end is None or start < 0 or end <= start:
+        return {"start": None, "end": None, "source": source}
+    return {
+        "start": round(start, 2),
+        "end": round(end, 2),
+        "source": source,
+    }
+
+
+def _hint_subtitle_range_available(value):
+    if not isinstance(value, dict):
+        return False
+    start = _hint_float_or_none(value.get("start"))
+    end = _hint_float_or_none(value.get("end"))
+    return bool(start is not None and end is not None and start >= 0 and end > start)
+
+
+def _attempt_wrong_positions_for_hint(att):
+    if not isinstance(att, dict):
+        return []
+    candidates = []
+    for key in ("incorrect_slots", "wrong_indices", "wrong_slots"):
+        values = att.get(key)
+        if isinstance(values, list):
+            candidates.extend(values)
+        elif values is not None:
+            candidates.append(values)
+    if not candidates:
+        for key in ("wrong_index", "primary_wrong_index"):
+            if att.get(key) is not None:
+                candidates.append(att.get(key))
+
+    output = []
+    seen = set()
+    for item in candidates:
+        try:
+            number = int(item)
+        except Exception:
+            continue
+        if number < 0 or number in seen:
+            continue
+        seen.add(number)
+        output.append(number)
+    return output
+
+
+def _attempt_primary_wrong_index_for_hint(att):
+    positions = _attempt_wrong_positions_for_hint(att)
+    return positions[0] if positions else None
+
+
+def _collect_all_wrong_slot_contexts(att, task):
+    """Collect per-slot hint context for all current wrong slots."""
+    if not isinstance(att, dict):
+        att = {}
+    if not isinstance(task, dict):
+        task = {}
+
+    wrong_slots = _attempt_wrong_positions_for_hint(att)
+    sequence_slots = _int_list(att.get("sequence_slots") or att.get("wrong_indices") or att.get("wrong_slots") or [])
+    indentation_slots = _int_list(att.get("indentation_slots") or att.get("indent_errors") or [])
+    if not sequence_slots and not indentation_slots:
+        sequence_slots = list(wrong_slots)
+
+    try:
+        parsed = t5doc_to_parsons_task(task)
+    except Exception:
+        parsed = {}
+
+    pool = {
+        str(block.get("id")): block
+        for block in (parsed.get("pool") or [])
+        if isinstance(block, dict)
+    }
+    template_slots = parsed.get("template_slots") or []
+    expected_ids = [
+        str(slot.get("expected_id"))
+        for slot in template_slots
+    ]
+    answer_ids = [str(item) for item in (att.get("answer_ids") or att.get("submitted_order") or [])]
+
+    try:
+        slot_concept_map = _derive_slot_concept_map(task) or {}
+    except Exception:
+        slot_concept_map = {}
+
+    details = []
+    for slot_index in wrong_slots:
+        slot_errors = []
+        if slot_index in sequence_slots:
+            slot_errors.append("sequence_error")
+        if slot_index in indentation_slots:
+            slot_errors.append("indentation_error")
+        if not slot_errors:
+            slot_errors.append("sequence_error")
+
+        expected_block_id = expected_ids[slot_index] if 0 <= slot_index < len(expected_ids) else ""
+        submitted_block_id = answer_ids[slot_index] if 0 <= slot_index < len(answer_ids) else ""
+        expected_text = str(pool.get(expected_block_id, {}).get("text") or "").strip()
+        submitted_text = str(pool.get(submitted_block_id, {}).get("text") or "").strip()
+
+        concept_tag = normalize_concept_name(slot_concept_map.get(str(slot_index)) or "")
+        if not concept_tag:
+            try:
+                concept_tag = normalize_concept_name(
+                    infer_concept_tag_from_text("\n".join([expected_text, submitted_text]))
+                )
+            except Exception:
+                concept_tag = ""
+
+        concept = concept_tag or ("indentation_error" if "indentation_error" in slot_errors else "sequence_error")
+        concept_scope = _progressive_hint_concept_label(concept, concept_tag)
+
+        details.append({
+            "slot_index": slot_index,
+            "slot_label": f"第{slot_index + 1}格",
+            "error_types": slot_errors,
+            "submitted_block_id": submitted_block_id,
+            "expected_block_id": expected_block_id,
+            "submitted_text": submitted_text,
+            "expected_text": expected_text,
+            "concept": concept,
+            "concept_tag": concept_tag,
+            "concept_scope": concept_scope,
+        })
+
+    return details
+
+
+def _aggregate_wrong_slot_contexts(slot_contexts):
+    contexts = [item for item in (slot_contexts or []) if isinstance(item, dict)]
+    concept_tags = []
+    concept_scopes = []
+    concept_error_types = {}
+    concept_slots = {}
+    seen = set()
+    for item in contexts:
+        raw_tag = normalize_concept_name(item.get("concept_tag") or item.get("concept") or "")
+        tag = raw_tag or "unknown"
+        scope = str(item.get("concept_scope") or _progressive_hint_concept_label(tag, raw_tag) or "待釐清概念").strip()
+        if tag not in seen:
+            seen.add(tag)
+            concept_tags.append(tag)
+            concept_scopes.append(scope)
+        concept_error_types.setdefault(tag, set()).update(str(x) for x in (item.get("error_types") or []) if str(x or "").strip())
+        concept_slots.setdefault(tag, []).append(int(item.get("slot_index")))
+
+    return {
+        "concept_tags": concept_tags,
+        "concept_scopes": concept_scopes,
+        "concept_error_types": {
+            key: sorted(value)
+            for key, value in concept_error_types.items()
+        },
+        "concept_slots": {
+            key: sorted(set(value))
+            for key, value in concept_slots.items()
+        },
+    }
+
+
+def _compact_subtitle_basis(value, fallback=""):
+    text = " ".join(str(value or fallback or "").replace("\n", " ").split())
+    if len(text) <= 180:
+        return text
+    return text[:180].rstrip("，。；;,.!?！？ ") + "..."
+
+
+def _public_wrong_slot_details(slot_contexts):
+    output = []
+    for item in (slot_contexts or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            slot_index = int(item.get("slot_index"))
+        except Exception:
+            continue
+        if slot_index < 0:
+            continue
+        output.append({
+            "slot_index": slot_index,
+            "slot_label": str(item.get("slot_label") or f"第{slot_index + 1}格"),
+            "error_types": [str(x) for x in (item.get("error_types") or []) if str(x or "").strip()],
+            "concept_tag": normalize_concept_name(item.get("concept_tag") or ""),
+            "concept_scope": str(item.get("concept_scope") or "").strip(),
+        })
+    return sorted(output)
+
+
+def _public_subtitle_ranges(ranges):
+    output = []
+    for item in (ranges or []):
+        if not isinstance(item, dict):
+            continue
+        range_payload = _hint_range_payload(item)
+        output.append({
+            "concept_tag": normalize_concept_name(item.get("concept_tag") or ""),
+            "concept_scope": str(item.get("concept_scope") or "").strip(),
+            "start": range_payload.get("start"),
+            "end": range_payload.get("end"),
+            "source": range_payload.get("source") or str(item.get("source") or "").strip(),
+        })
+    return output
+
+
+def _build_aggregated_hint_detail(att, task, requested_hint_no=1):
+    level = 2 if int(requested_hint_no or 1) == 2 else 1
+    scope_name = "narrow" if level == 2 else "broad"
+    slot_contexts = _collect_all_wrong_slot_contexts(att, task)
+    public_details = _public_wrong_slot_details(slot_contexts)
+    aggregate = _aggregate_wrong_slot_contexts(slot_contexts)
+    wrong_slots = sorted(set([int(item["slot_index"]) for item in public_details]))
+
+    subtitle_ranges = []
+    error_concepts = []
+    first_selected_range = {}
+    first_broad_range = {}
+    first_narrow_range = {}
+    first_basis = ""
+
+    for concept_tag, concept_scope in zip(aggregate.get("concept_tags") or [], aggregate.get("concept_scopes") or []):
+        concept_slots = aggregate.get("concept_slots", {}).get(concept_tag) or wrong_slots
+        slot_index = concept_slots[0] if concept_slots else (wrong_slots[0] if wrong_slots else None)
+        try:
+            scope = _build_progressive_subtitle_scope(
+                task,
+                slot_index,
+                concept_tag or "logic",
+                level,
+            )
+        except Exception:
+            scope = {}
+
+        selected = _hint_range_payload({
+            "start": scope.get("start"),
+            "end": scope.get("end"),
+            "source": scope.get("source"),
+        })
+        broad = _hint_range_payload(scope.get("broad_range") or {})
+        narrow = _hint_range_payload(scope.get("narrow_range") or {})
+        basis = _compact_subtitle_basis(scope.get("subtitle_excerpt"), concept_scope)
+
+        subtitle_ranges.append({
+            "concept_tag": concept_tag,
+            "concept_scope": concept_scope,
+            "start": selected.get("start"),
+            "end": selected.get("end"),
+            "source": selected.get("source"),
+        })
+        concept_error_types = aggregate.get("concept_error_types", {}).get(concept_tag) or []
+        error_concepts.append({
+            "concept_tag": concept_tag,
+            "concept_scope": concept_scope,
+            "error_types": concept_error_types,
+            "subtitle_basis": basis,
+        })
+
+        if not first_selected_range:
+            first_selected_range = selected
+            first_broad_range = broad
+            first_narrow_range = narrow
+            first_basis = basis
+
+    if not error_concepts:
+        fallback_scope = "程式流程與區塊順序"
+        error_concepts.append({
+            "concept_tag": "unknown",
+            "concept_scope": fallback_scope,
+            "error_types": [],
+            "subtitle_basis": fallback_scope,
+        })
+
+    covered_wrong_slots = wrong_slots if aggregate.get("concept_tags") else []
+    uncovered_wrong_slots = [] if aggregate.get("concept_tags") else wrong_slots
+
+    return {
+        "hint_level": level,
+        "scope": scope_name,
+        "aggregation_mode": "all_current_errors",
+        "wrong_slots": wrong_slots,
+        "wrong_slot_count": len(wrong_slots),
+        "wrong_slot_details": public_details,
+        "concept_tags": aggregate.get("concept_tags") or ["unknown"],
+        "concept_scopes": aggregate.get("concept_scopes") or ["程式流程與區塊順序"],
+        "concept_count": len(aggregate.get("concept_tags") or ["unknown"]),
+        "covered_wrong_slots": covered_wrong_slots,
+        "uncovered_wrong_slots": uncovered_wrong_slots,
+        "subtitle_ranges": subtitle_ranges,
+        "subtitle_range": first_selected_range,
+        "subtitle_broad_range": first_broad_range,
+        "subtitle_narrow_range": first_narrow_range,
+        "subtitle_basis": first_basis,
+        "error_concepts": error_concepts,
+    }
+
+
+def _aggregated_hint_fallback(detail, hint_level=1):
+    scopes = [
+        str(item or "").strip()
+        for item in (detail.get("concept_scopes") or [])
+        if str(item or "").strip()
+    ]
+    scope_text = "、".join(scopes[:4]) if scopes else "程式流程與區塊順序"
+    level = 2 if int(hint_level or 1) == 2 else 1
+    if level == 2:
+        return f"再聚焦檢查{scope_text}之間的先後關係、作用範圍與資料流，想一想哪些步驟必須先成立，哪些步驟才適合接著執行。"
+    return f"目前需要同時檢查{scope_text}。請先思考各程式區塊在整體流程中扮演的角色，以及彼此之間的先後依賴。"
+
+
+def _build_ai_hint_meta_from_detail(detail, ctx, *, wrong_slots=None, requested_hint_no=1):
+    detail = detail if isinstance(detail, dict) else {}
+    ctx = ctx if isinstance(ctx, dict) else {}
+    level = 2 if int(requested_hint_no or 1) == 2 else 1
+    scope_name = "narrow" if level == 2 else "broad"
+
+    broad_range = _hint_range_payload(detail.get("subtitle_broad_range"))
+    narrow_range = _hint_range_payload(detail.get("subtitle_narrow_range"))
+    selected_range = _hint_range_payload(detail.get("subtitle_range"))
+    if not _hint_subtitle_range_available(selected_range):
+        selected_range = narrow_range if level == 2 else broad_range
+
+    positions = _int_list(wrong_slots or ctx.get("wrong_slots") or [])
+    wrong_index = ctx.get("wrong_index")
+    try:
+        wrong_index = int(wrong_index) if wrong_index is not None else None
+    except Exception:
+        wrong_index = None
+    if wrong_index is None and positions:
+        wrong_index = positions[0]
+
+    concept = str(detail.get("concept") or ctx.get("feedback_error_type") or "logic").strip() or "logic"
+    concept_tag = str(detail.get("concept_tag") or ctx.get("concept_tag") or "").strip()
+    concept_scope = str(
+        detail.get("concept_scope")
+        or detail.get("concept_explanation")
+        or ctx.get("concept_scope")
+        or _progressive_hint_concept_label(concept, concept_tag)
+        or ""
+    ).strip()
+    wrong_slot_details = _public_wrong_slot_details(
+        detail.get("wrong_slot_details") or ctx.get("wrong_slot_details") or []
+    )
+    if wrong_slot_details:
+        positions = sorted(set([int(item["slot_index"]) for item in wrong_slot_details]))
+
+    concept_tags = [
+        normalize_concept_name(item)
+        for item in (detail.get("concept_tags") or ctx.get("concept_tags") or [])
+        if normalize_concept_name(item)
+    ]
+    concept_scopes = [
+        str(item or "").strip()
+        for item in (detail.get("concept_scopes") or ctx.get("concept_scopes") or [])
+        if str(item or "").strip()
+    ]
+    if not concept_tags and concept_tag:
+        concept_tags = [normalize_concept_name(concept_tag)]
+    if not concept_scopes and concept_scope:
+        concept_scopes = [concept_scope]
+
+    subtitle_ranges = _public_subtitle_ranges(detail.get("subtitle_ranges") or [])
+    covered_wrong_slots = _int_list(detail.get("covered_wrong_slots") or positions)
+    uncovered_wrong_slots = _int_list(detail.get("uncovered_wrong_slots") or [])
+
+    return {
+        "hint_level": level,
+        "scope": scope_name,
+        "aggregation_mode": detail.get("aggregation_mode") or "all_current_errors",
+        "concept": concept,
+        "concept_tag": concept_tag,
+        "concept_scope": concept_scope,
+        "wrong_index": wrong_index,
+        "wrong_slots": positions,
+        "wrong_slot_count": len(positions),
+        "wrong_slot_details": wrong_slot_details,
+        "concept_tags": concept_tags,
+        "concept_scopes": concept_scopes,
+        "concept_count": len(concept_tags),
+        "covered_wrong_slots": covered_wrong_slots,
+        "uncovered_wrong_slots": uncovered_wrong_slots,
+        "subtitle_ranges": subtitle_ranges,
+        "subtitle_range": selected_range,
+        "subtitle_broad_range": broad_range,
+        "subtitle_narrow_range": narrow_range,
+        "subtitle_basis": _compact_subtitle_basis(detail.get("subtitle_basis"), concept_scope),
+        "hint_source": str(detail.get("hint_source") or "system_fallback").strip() or "system_fallback",
+        "answer_leakage_check": str(detail.get("answer_leakage_check") or "unknown").strip() or "unknown",
+        "hint_quality_status": str(detail.get("hint_quality_status") or "not_checked").strip() or "not_checked",
+        "second_hint_similarity": _hint_float_or_none(detail.get("second_hint_similarity")),
+        "second_hint_similarity_threshold": (
+            _hint_float_or_none(detail.get("second_hint_similarity_threshold"))
+            if detail.get("second_hint_similarity_threshold") is not None
+            else 0.72
+        ),
+        "generated_at_taiwan": _taiwan_time_string(now_utc()),
+    }
+
+
+def _build_ai_hint_meta_for_attempt(att, task, requested_hint_no, detail=None):
+    detail = detail if isinstance(detail, dict) else {}
+    ctx = _attempt_hint_context(att, task)
+    aggregate_detail = _build_aggregated_hint_detail(att, task, requested_hint_no)
+    detail = {
+        **aggregate_detail,
+        **detail,
+        "aggregation_mode": detail.get("aggregation_mode") or aggregate_detail.get("aggregation_mode"),
+        "wrong_slot_details": detail.get("wrong_slot_details") or aggregate_detail.get("wrong_slot_details"),
+        "concept_tags": detail.get("concept_tags") or aggregate_detail.get("concept_tags"),
+        "concept_scopes": detail.get("concept_scopes") or aggregate_detail.get("concept_scopes"),
+        "subtitle_ranges": detail.get("subtitle_ranges") or aggregate_detail.get("subtitle_ranges"),
+        "covered_wrong_slots": detail.get("covered_wrong_slots") or aggregate_detail.get("covered_wrong_slots"),
+        "uncovered_wrong_slots": detail.get("uncovered_wrong_slots") or aggregate_detail.get("uncovered_wrong_slots"),
+        "wrong_slots": detail.get("wrong_slots") or aggregate_detail.get("wrong_slots"),
+        "wrong_slot_count": detail.get("wrong_slot_count") or aggregate_detail.get("wrong_slot_count"),
+        "hint_source": detail.get("hint_source") or detail.get("source") or "metadata_reconstructed",
+        "answer_leakage_check": detail.get("answer_leakage_check") or "unknown",
+    }
+    return _build_ai_hint_meta_from_detail(
+        detail,
+        ctx,
+        wrong_slots=detail.get("wrong_slots") or ctx.get("wrong_slots"),
+        requested_hint_no=requested_hint_no,
+    )
+
+def _resolve_attempt_v2_for_hint(att, explicit_attempt_v2_id=None, record=None):
+    """Resolve the v2 attempt linked to one legacy attempt/hint request."""
+    def _matches_context(doc):
+        if not isinstance(doc, dict):
+            return False
+        expected_student = str((att or {}).get("student_id") or current_student_id() or "").strip()
+        expected_task = str((att or {}).get("task_id") or "").strip()
+        if expected_student and str(doc.get("student_id") or "").strip() != expected_student:
+            return False
+        if expected_task and str(doc.get("task_id") or "").strip() != expected_task:
+            return False
+        return True
+
+    candidates = [
+        explicit_attempt_v2_id,
+        (att or {}).get("attempt_v2_id"),
+        (record or {}).get("latest_attempt_v2_id"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value or not ObjectId.is_valid(value):
+            continue
+        doc = db.parsons_attempts_v2.find_one({"_id": ObjectId(value)})
+        if doc and _matches_context(doc):
+            return doc
+
+    legacy_id = str((att or {}).get("_id") or "").strip()
+    if legacy_id:
+        doc = db.parsons_attempts_v2.find_one({"legacy_attempt_id": legacy_id})
+        if doc and _matches_context(doc):
+            return doc
+
+    student_id = str((att or {}).get("student_id") or current_student_id() or "").strip()
+    task_id = str((att or {}).get("task_id") or "").strip()
+    if not student_id or not task_id:
+        return None
+    query = {"student_id": student_id, "task_id": task_id, "activity_type": "practice"}
+    try:
+        session_no = int(
+            (att or {}).get("task_attempt_session")
+            or (record or {}).get("task_attempt_session")
+            or 0
+        )
+    except Exception:
+        session_no = 0
+    if session_no > 0:
+        query["task_attempt_session"] = session_no
+    return db.parsons_attempts_v2.find_one(
+        query,
+        sort=[("attempt_no", -1), ("submitted_at", -1), ("_id", -1)],
+    )
+
+
+def _merge_attempt_v2_hint_context(att, attempt_v2):
+    """Use the latest v2 attempt fields as the authoritative hint context."""
+    merged = dict(att or {})
+    if not isinstance(attempt_v2, dict) or not attempt_v2:
+        return merged
+
+    if attempt_v2.get("_id") is not None:
+        merged["attempt_v2_id"] = str(attempt_v2.get("_id"))
+
+    for key in (
+        "task_attempt_session",
+        "attempt_no",
+        "attempt_sequence_no",
+        "answer_ids",
+        "submitted_order",
+        "submitted_indentation",
+        "wrong_slots",
+        "incorrect_slots",
+        "sequence_slots",
+        "indentation_slots",
+        "error_count",
+        "error_types",
+        "repeated_error",
+        "block_results",
+        "target_concept",
+        "submitted_answer_raw",
+    ):
+        if attempt_v2.get(key) is not None:
+            merged[key] = attempt_v2.get(key)
+
+    if isinstance(attempt_v2.get("incorrect_slots"), list):
+        merged["wrong_indices"] = attempt_v2.get("incorrect_slots")
+    elif isinstance(attempt_v2.get("wrong_slots"), list):
+        merged["wrong_indices"] = attempt_v2.get("wrong_slots")
+
+    return merged
+
+
+def _update_attempt_v2_ai_hint_event(
+    att,
+    record,
+    *,
+    requested_hint_no,
+    explicit_attempt_v2_id=None,
+    hint_text_override="",
+    hint_meta_override=None,
+    event_type="ai_hint_view",
+    generated=False,
+    trigger_method="",
+    button_name="",
+):
+    """
+    Denormalize AI hint text/click summary into parsons_attempts_v2.
+
+    learning_logs remains the detailed event stream. This copy makes statistical
+    joins and exports possible without reconstructing every click from logs.
+    """
+    attempt_v2 = _resolve_attempt_v2_for_hint(att, explicit_attempt_v2_id, record)
+    if not attempt_v2:
+        return None
+
+    public = _hint_record_public(record) or {}
+    hint_no = 2 if int(requested_hint_no or 1) == 2 else 1
+    hint_text = str(
+        hint_text_override
+        or public.get("ai_hint_2_text" if hint_no == 2 else "ai_hint_1_text")
+        or ""
+    ).strip()
+    hint_meta = hint_meta_override if isinstance(hint_meta_override, dict) else {}
+    if not hint_meta:
+        hint_meta = public.get("ai_hint_2_meta" if hint_no == 2 else "ai_hint_1_meta") or {}
+    if not isinstance(hint_meta, dict):
+        hint_meta = {}
+
+    hint_1_text = str(public.get("ai_hint_1_text") or attempt_v2.get("ai_hint_1_text") or "").strip()
+    hint_2_text = str(public.get("ai_hint_2_text") or attempt_v2.get("ai_hint_2_text") or "").strip()
+    hint_1_meta = public.get("ai_hint_1_meta") if isinstance(public.get("ai_hint_1_meta"), dict) else (attempt_v2.get("ai_hint_1_meta") or {})
+    hint_2_meta = public.get("ai_hint_2_meta") if isinstance(public.get("ai_hint_2_meta"), dict) else (attempt_v2.get("ai_hint_2_meta") or {})
+    if hint_no == 1 and hint_text:
+        hint_1_text, hint_1_meta = hint_text, hint_meta
+    if hint_no == 2 and hint_text:
+        hint_2_text, hint_2_meta = hint_text, hint_meta
+
+    hint_texts = []
+    if hint_1_text:
+        hint_texts.append({"hint_no": 1, "text": hint_1_text, "meta": hint_1_meta})
+    if hint_2_text:
+        hint_texts.append({"hint_no": 2, "text": hint_2_text, "meta": hint_2_meta})
+
+    aggregation_meta = hint_meta if isinstance(hint_meta, dict) else {}
+    if not aggregation_meta.get("aggregation_mode"):
+        aggregation_meta = hint_2_meta if isinstance(hint_2_meta, dict) and hint_2_meta.get("aggregation_mode") else aggregation_meta
+    if not aggregation_meta.get("aggregation_mode"):
+        aggregation_meta = hint_1_meta if isinstance(hint_1_meta, dict) and hint_1_meta.get("aggregation_mode") else aggregation_meta
+
+    aggregation_mode = str(aggregation_meta.get("aggregation_mode") or "").strip() or None
+    concept_tags = [
+        normalize_concept_name(item)
+        for item in (aggregation_meta.get("concept_tags") or [])
+        if normalize_concept_name(item)
+    ]
+    if not concept_tags and aggregation_meta.get("concept_tag"):
+        concept_tags = [normalize_concept_name(aggregation_meta.get("concept_tag"))]
+    concept_scopes = [
+        str(item or "").strip()
+        for item in (aggregation_meta.get("concept_scopes") or [])
+        if str(item or "").strip()
+    ]
+    if not concept_scopes and aggregation_meta.get("concept_scope"):
+        concept_scopes = [str(aggregation_meta.get("concept_scope")).strip()]
+    hint_wrong_slots = _int_list(aggregation_meta.get("wrong_slots") or [])
+
+    now = now_utc()
+    click_event = {
+        "hint_no": hint_no,
+        "hint_text": hint_text,
+        "hint_meta": hint_meta,
+        "event_type": str(event_type or "ai_hint_view"),
+        "generated": bool(generated),
+        "trigger_method": str(trigger_method or ""),
+        "button_name": str(button_name or ""),
+        "viewed_at": now,
+        "viewed_at_taiwan": _taiwan_time_string(now),
+    }
+
+    set_fields = {
+        "ai_hint_prompt_version": public.get("hint_prompt_version") or _PARSONS_HINT_PROMPT_VERSION,
+        "ai_hint_1_text": hint_1_text or None,
+        "ai_hint_1_meta": hint_1_meta if isinstance(hint_1_meta, dict) else {},
+        "ai_hint_2_text": hint_2_text or None,
+        "ai_hint_2_meta": hint_2_meta if isinstance(hint_2_meta, dict) else {},
+        "ai_hint_texts": hint_texts,
+        "ai_hint_generation_count": int(public.get("ai_hint_generation_count") or public.get("hint_generation_count") or 0),
+        "ai_hint_view_count": int(public.get("ai_hint_view_count") or public.get("hint_view_count") or 0),
+        "ai_hint_clicked": True,
+        "ai_hint_last_viewed_no": hint_no,
+        "ai_hint_last_viewed_at": now,
+        "ai_hint_last_viewed_at_taiwan": _taiwan_time_string(now),
+        "source_hint_id": public.get("hint_id") or attempt_v2.get("source_hint_id"),
+        "ai_hint_aggregation_mode": aggregation_mode,
+        "ai_hint_concept_tags": concept_tags,
+        "ai_hint_concept_scopes": concept_scopes,
+        "ai_hint_wrong_slots": hint_wrong_slots,
+        "updated_at": now,
+        "updated_at_utc": now,
+        "updated_at_taiwan": _taiwan_time_string(now),
+    }
+
+    db.parsons_attempts_v2.update_one(
+        {"_id": attempt_v2["_id"]},
+        {
+            "$set": set_fields,
+            "$addToSet": {"ai_hint_viewed_numbers": hint_no},
+            "$push": {"ai_hint_clicks": {"$each": [click_event], "$slice": -50}},
+        },
+    )
+    return str(attempt_v2["_id"])
+
+
+# 作答時間處理
+# 包括:計算學生此次作答秒數
+# 排除負數
+# 排除超過一小時的長時間開頁
+# 標記 duration outlier
 def _parse_attempt_v2_datetime(value):
     """Normalize a submitted timestamp to an aware UTC datetime for BSON Date storage."""
     if value is None or value == "":
@@ -377,7 +1385,7 @@ def _parse_attempt_v2_datetime(value):
             return None
     return None
 
-
+# 標準答案與錯誤判斷
 def _build_attempt_v2_duration_fields(started_at, submitted_at) -> dict:
     result = {
         "elapsed_sec_raw": None,
@@ -622,13 +1630,25 @@ def _build_attempt_v2_error_analysis(
     target_concept,
     previous_error_types=None,
 ) -> dict:
+    repeated_basis = "same_task_same_error_type"
+    repeated_rule_version = 1
+    concept = str(target_concept or "").strip() or "unknown"
+
     if bool(is_correct):
         return {
             "error_count": 0,
             "error_types": [],
             "wrong_slots": [],
+            "incorrect_slots": [],
+            "sequence_slots": [],
+            "indentation_slots": [],
+            "error_details": [],
             "error_concept": None,
             "repeated_error": False,
+            "repeated_error_types": [],
+            "repeated_error_count": 0,
+            "repeated_error_basis": repeated_basis,
+            "repeated_error_rule_version": repeated_rule_version,
         }
 
     correct = correct_answer if isinstance(correct_answer, dict) else {}
@@ -646,20 +1666,45 @@ def _build_attempt_v2_error_analysis(
     )
 
     sequence_slots = []
+    order_error_details = []
     if expected_order:
+        expected_position_by_block = {
+            str(block_id): index
+            for index, block_id in enumerate(expected_order)
+            if block_id is not None
+        }
         for index in range(max(len(actual_order), len(expected_order))):
             actual = actual_order[index] if index < len(actual_order) else None
             expected = expected_order[index] if index < len(expected_order) else None
             if str(actual) != str(expected):
                 sequence_slots.append(index)
+                order_error_details.append({
+                    "slot": index,
+                    "block_id": str(actual) if actual is not None else None,
+                    "error_type": "order",
+                    "expected_block_id": str(expected) if expected is not None else None,
+                    "submitted_position": index if actual is not None else None,
+                    "expected_position": expected_position_by_block.get(str(actual)) if actual is not None else None,
+                    "concept_tag": concept,
+                })
 
     indentation_slots = []
+    indentation_error_details = []
     if actual_indentation and expected_indentation:
         for index in range(max(len(actual_indentation), len(expected_indentation))):
             actual = actual_indentation[index] if index < len(actual_indentation) else None
             expected = expected_indentation[index] if index < len(expected_indentation) else None
             if actual != expected:
                 indentation_slots.append(index)
+                block_id = actual_order[index] if index < len(actual_order) else None
+                indentation_error_details.append({
+                    "slot": index,
+                    "block_id": str(block_id) if block_id is not None else None,
+                    "error_type": "indentation",
+                    "submitted_indent": actual,
+                    "expected_indent": expected,
+                    "concept_tag": concept,
+                })
 
     error_types = []
     if sequence_slots:
@@ -671,17 +1716,364 @@ def _build_attempt_v2_error_analysis(
     wrong_slots = sorted(set(sequence_slots))
     # error_count counts distinct slots with either a sequence or indentation error.
     incorrect_slots = sorted(set(sequence_slots + indentation_slots))
-    previous_types = set(previous_error_types or [])
-    repeated_error = bool(previous_types.intersection(error_types))
-    concept = str(target_concept or "").strip() or "unknown"
+    error_details = order_error_details + indentation_error_details
+    detail_error_types = sorted({
+        str(item.get("error_type") or "").strip()
+        for item in error_details
+        if str(item.get("error_type") or "").strip()
+    })
+    previous_types = {
+        "order" if str(item) == "sequence_error" else "indentation" if str(item) == "indentation_error" else str(item)
+        for item in (previous_error_types or [])
+        if str(item or "").strip()
+    }
+    repeated_error_types = sorted(set(detail_error_types).intersection(previous_types))
+    repeated_error_count = sum(
+        1
+        for item in error_details
+        if item.get("error_type") in repeated_error_types
+    )
+    repeated_error = bool(repeated_error_types)
 
     return {
         "error_count": len(incorrect_slots),
         "error_types": error_types,
+        # wrong_slots 保留相容性：只代表順序錯誤位置。
         "wrong_slots": wrong_slots,
+        # incorrect_slots 才是畫面紅色標記應使用的完整位置：
+        # 順序錯誤與縮排錯誤的聯集。
+        "incorrect_slots": incorrect_slots,
+        "sequence_slots": sorted(set(sequence_slots)),
+        "indentation_slots": sorted(set(indentation_slots)),
+        "error_details": error_details,
         "error_concept": concept,
         "repeated_error": repeated_error,
+        "repeated_error_types": repeated_error_types,
+        "repeated_error_count": repeated_error_count,
+        "repeated_error_basis": repeated_basis,
+        "repeated_error_rule_version": repeated_rule_version,
     }
+
+
+
+def _normalize_attempt_v2_block_text(value) -> str:
+    return str(value or "").replace("\t", "    ").strip()
+
+
+def _attempt_v2_block_lookup(task_doc: dict) -> dict:
+    """Return block_id -> normalized block metadata for exact audit trails."""
+    lookup = {}
+    try:
+        parsed = t5doc_to_parsons_task(task_doc if isinstance(task_doc, dict) else {})
+    except Exception:
+        parsed = {}
+
+    collections = [
+        parsed.get("pool") or [],
+        parsed.get("solution_blocks") or [],
+        parsed.get("distractor_blocks") or [],
+    ]
+    for blocks in collections:
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_id = str(block.get("id") or block.get("_id") or "").strip()
+            if not block_id:
+                continue
+            if block_id not in lookup:
+                lookup[block_id] = {
+                    "id": block_id,
+                    "text": str(block.get("text") or block.get("code") or ""),
+                    "indent": block.get("indent", block.get("indent_level")),
+                    "type": block.get("type"),
+                }
+    return lookup
+
+
+def _attempt_v2_base_query(student_id: str, task_id: str, activity_type: str, test_role):
+    return {
+        "student_id": str(student_id or "").strip(),
+        "task_id": str(task_id or "").strip(),
+        "activity_type": str(activity_type or "").strip() or None,
+        "test_role": test_role,
+    }
+
+
+def _latest_attempt_v2_doc(student_id: str, task_id: str, activity_type: str, test_role):
+    query = _attempt_v2_base_query(student_id, task_id, activity_type, test_role)
+    if not query["student_id"] or not query["task_id"]:
+        return None
+    return db.parsons_attempts_v2.find_one(
+        query,
+        sort=[("submitted_at", -1), ("created_at", -1), ("_id", -1)],
+    )
+
+# 作答場次管理
+def _resolve_task_attempt_session(student_id: str, task_id: str, activity_type: str, test_role):
+    """
+    Return (task_attempt_session, attempt_no_in_session, attempt_sequence_no, previous_in_session).
+
+    - attempt_no：同一完整作答場次內的第幾次送出。
+    - task_attempt_session：答對後重新進入同題時加 1。
+    - attempt_sequence_no：跨場次的全域送出順序，方便排序。
+    """
+    query = _attempt_v2_base_query(student_id, task_id, activity_type, test_role)
+    if not query["student_id"] or not query["task_id"]:
+        return 1, 1, 1, None
+
+    latest = _latest_attempt_v2_doc(student_id, task_id, activity_type, test_role)
+    total_existing = db.parsons_attempts_v2.count_documents(query)
+    sequence_no = int(total_existing) + 1
+
+    if not latest:
+        return 1, 1, sequence_no, None
+
+    try:
+        latest_session = max(1, int(latest.get("task_attempt_session") or 1))
+    except Exception:
+        latest_session = 1
+
+    if bool(latest.get("is_correct")):
+        return latest_session + 1, 1, sequence_no, None
+
+    try:
+        next_attempt_no = max(1, int(latest.get("attempt_no") or 0) + 1)
+    except Exception:
+        next_attempt_no = 1
+    return latest_session, next_attempt_no, sequence_no, latest
+
+
+def _previous_attempt_v2_doc(
+    student_id: str,
+    task_id: str,
+    activity_type: str,
+    test_role,
+    task_attempt_session=None,
+):
+    query = _attempt_v2_base_query(student_id, task_id, activity_type, test_role)
+    if not query["student_id"] or not query["task_id"]:
+        return None
+    if task_attempt_session is not None:
+        query["task_attempt_session"] = int(task_attempt_session)
+    return db.parsons_attempts_v2.find_one(
+        query,
+        sort=[("attempt_no", -1), ("submitted_at", -1), ("_id", -1)],
+    )
+
+# 會逐格比較這次與前一次作答
+# 包括:這一格是否正確
+# 原本錯誤是否修正
+# 原本正確是否被改錯
+# 是否持續錯誤
+def _build_attempt_v2_block_results(
+    *,
+    task_doc: dict,
+    submitted_order,
+    submitted_indentation,
+    correct_answer,
+    previous_attempt=None,
+):
+    """
+    Build per-slot/per-block audit rows.
+
+    Each row preserves both submitted and expected block IDs, so the teacher
+    dashboard can determine exactly which block was corrected after an AI hint.
+    """
+    actual_order = list(submitted_order) if isinstance(submitted_order, list) else []
+    actual_indentation = (
+        list(submitted_indentation)
+        if isinstance(submitted_indentation, list)
+        else []
+    )
+    correct = correct_answer if isinstance(correct_answer, dict) else {}
+    expected_order = (
+        list(correct.get("order"))
+        if isinstance(correct.get("order"), list)
+        else []
+    )
+    expected_indentation = (
+        list(correct.get("indentation"))
+        if isinstance(correct.get("indentation"), list)
+        else []
+    )
+    block_lookup = _attempt_v2_block_lookup(task_doc)
+
+    previous = previous_attempt if isinstance(previous_attempt, dict) else {}
+    previous_order = (
+        list(previous.get("submitted_order"))
+        if isinstance(previous.get("submitted_order"), list)
+        else []
+    )
+    previous_indentation = (
+        list(previous.get("submitted_indentation"))
+        if isinstance(previous.get("submitted_indentation"), list)
+        else []
+    )
+
+    total_slots = max(
+        len(expected_order),
+        len(actual_order),
+        len(expected_indentation),
+        len(actual_indentation),
+    )
+
+    def _state_at(order, indentation, index):
+        submitted_id = (
+            str(order[index]).strip()
+            if index < len(order) and order[index] is not None
+            else ""
+        )
+        expected_id = (
+            str(expected_order[index]).strip()
+            if index < len(expected_order) and expected_order[index] is not None
+            else ""
+        )
+        submitted_block = block_lookup.get(submitted_id) or {}
+        expected_block = block_lookup.get(expected_id) or {}
+        submitted_text = str(submitted_block.get("text") or "")
+        expected_text = str(expected_block.get("text") or "")
+
+        block_id_match = bool(
+            submitted_id
+            and expected_id
+            and submitted_id == expected_id
+        )
+        content_equivalent = bool(
+            submitted_id
+            and expected_id
+            and _normalize_attempt_v2_block_text(submitted_text)
+            and _normalize_attempt_v2_block_text(submitted_text)
+            == _normalize_attempt_v2_block_text(expected_text)
+        )
+        sequence_correct = bool(block_id_match or content_equivalent)
+
+        submitted_indent = (
+            indentation[index]
+            if index < len(indentation)
+            else None
+        )
+        expected_indent = (
+            expected_indentation[index]
+            if index < len(expected_indentation)
+            else None
+        )
+        if expected_indent is None:
+            indentation_correct = bool(submitted_id)
+        else:
+            indentation_correct = bool(
+                submitted_id
+                and submitted_indent is not None
+                and submitted_indent == expected_indent
+            )
+
+        slot_correct = bool(sequence_correct and indentation_correct)
+        return {
+            "slot_index": index,
+            "slot_label": f"第{index + 1}格",
+            "submitted_block_id": submitted_id or None,
+            "expected_block_id": expected_id or None,
+            "submitted_text": submitted_text or None,
+            "expected_text": expected_text or None,
+            "block_id_match": block_id_match,
+            "content_equivalent": content_equivalent,
+            "submitted_indentation": submitted_indent,
+            "expected_indentation": expected_indent,
+            "sequence_correct": sequence_correct,
+            "indentation_correct": indentation_correct,
+            "slot_correct": slot_correct,
+        }
+
+    current_rows = [_state_at(actual_order, actual_indentation, i) for i in range(total_slots)]
+    previous_rows = (
+        [_state_at(previous_order, previous_indentation, i) for i in range(total_slots)]
+        if previous
+        else []
+    )
+
+    corrected_block_ids = []
+    remaining_wrong_block_ids = []
+    remaining_wrong_submitted_block_ids = []
+    newly_wrong_block_ids = []
+    corrected_slot_indices = []
+    remaining_wrong_slot_indices = []
+    newly_wrong_slot_indices = []
+
+    for index, row in enumerate(current_rows):
+        previous_row = previous_rows[index] if index < len(previous_rows) else None
+        previous_slot_correct = (
+            bool(previous_row.get("slot_correct"))
+            if isinstance(previous_row, dict)
+            else None
+        )
+        current_slot_correct = bool(row.get("slot_correct"))
+
+        corrected = bool(
+            previous_slot_correct is False
+            and current_slot_correct is True
+        )
+        regressed = bool(
+            previous_slot_correct is True
+            and current_slot_correct is False
+        )
+        remained_wrong = bool(
+            previous_slot_correct is False
+            and current_slot_correct is False
+        )
+
+        if previous_slot_correct is None:
+            status_change = "first_attempt_correct" if current_slot_correct else "first_attempt_wrong"
+        elif corrected:
+            status_change = "corrected"
+        elif regressed:
+            status_change = "regressed"
+        elif remained_wrong:
+            status_change = "still_wrong"
+        else:
+            status_change = "still_correct"
+
+        row.update({
+            "previous_slot_correct": previous_slot_correct,
+            "corrected_since_previous": corrected,
+            "regressed_since_previous": regressed,
+            "remained_wrong": remained_wrong,
+            "status_change": status_change,
+        })
+
+        expected_id = row.get("expected_block_id")
+        submitted_id = row.get("submitted_block_id")
+        if corrected:
+            corrected_slot_indices.append(index)
+            if expected_id:
+                corrected_block_ids.append(expected_id)
+        if not current_slot_correct:
+            remaining_wrong_slot_indices.append(index)
+            if expected_id:
+                remaining_wrong_block_ids.append(expected_id)
+            if submitted_id:
+                remaining_wrong_submitted_block_ids.append(submitted_id)
+        if regressed:
+            newly_wrong_slot_indices.append(index)
+            if expected_id:
+                newly_wrong_block_ids.append(expected_id)
+
+    def _unique(values):
+        return list(dict.fromkeys([value for value in values if value]))
+
+    summary = {
+        "previous_attempt_id": str(previous.get("_id")) if previous.get("_id") is not None else None,
+        "previous_attempt_no": previous.get("attempt_no"),
+        "corrected_block_ids": _unique(corrected_block_ids),
+        "remaining_wrong_block_ids": _unique(remaining_wrong_block_ids),
+        "remaining_wrong_submitted_block_ids": _unique(remaining_wrong_submitted_block_ids),
+        "newly_wrong_block_ids": _unique(newly_wrong_block_ids),
+        "corrected_slot_indices": sorted(set(corrected_slot_indices)),
+        "remaining_wrong_slot_indices": sorted(set(remaining_wrong_slot_indices)),
+        "newly_wrong_slot_indices": sorted(set(newly_wrong_slot_indices)),
+        "corrected_block_count": len(set(corrected_slot_indices)),
+        "remaining_wrong_block_count": len(set(remaining_wrong_slot_indices)),
+        "newly_wrong_block_count": len(set(newly_wrong_slot_indices)),
+    }
+    return current_rows, summary
 
 
 def _calculate_attempt_v2_score(
@@ -704,16 +2096,34 @@ def _calculate_attempt_v2_score(
     return round((total_slots - incorrect_slots) / total_slots, 6)
 
 
-def _previous_attempt_v2_error_types(student_id: str, task_id: str) -> list:
+def _previous_attempt_v2_error_types(
+    student_id: str,
+    task_id: str,
+    task_attempt_session=None,
+) -> list:
     sid = str(student_id or "").strip()
     tid = str(task_id or "").strip()
     if not sid or not tid:
         return []
+    query = {"student_id": sid, "task_id": tid}
+    if task_attempt_session is not None:
+        query["task_attempt_session"] = int(task_attempt_session)
     previous = db.parsons_attempts_v2.find_one(
-        {"student_id": sid, "task_id": tid},
-        {"error_types": 1},
+        query,
+        {"error_types": 1, "error_details": 1},
         sort=[("submitted_at", -1), ("created_at", -1), ("_id", -1)],
     )
+    error_details = (previous or {}).get("error_details")
+    if isinstance(error_details, list) and error_details:
+        detail_types = []
+        for item in error_details:
+            if not isinstance(item, dict):
+                continue
+            error_type = str(item.get("error_type") or "").strip()
+            if error_type:
+                detail_types.append(error_type)
+        if detail_types:
+            return sorted(set(detail_types))
     error_types = (previous or {}).get("error_types")
     return error_types if isinstance(error_types, list) else []
 
@@ -734,16 +2144,30 @@ def _normalize_attempt_v2_test_cycle_id(test_cycle_id):
     return cycle_id
 
 
-def _next_attempt_v2_no(student_id: str, task_id: str, activity_type: str, test_role):
-    query = {
-        "student_id": student_id,
-        "task_id": task_id,
-        "activity_type": activity_type,
-        "test_role": test_role,
-    }
-    latest = db.parsons_attempts_v2.find_one(query, sort=[("attempt_no", -1)])
+def _next_attempt_v2_no(
+    student_id: str,
+    task_id: str,
+    activity_type: str,
+    test_role,
+    task_attempt_session=None,
+):
+    if task_attempt_session is None:
+        _, attempt_no, _, _ = _resolve_task_attempt_session(
+            student_id,
+            task_id,
+            activity_type,
+            test_role,
+        )
+        return attempt_no
+    previous = _previous_attempt_v2_doc(
+        student_id,
+        task_id,
+        activity_type,
+        test_role,
+        task_attempt_session=task_attempt_session,
+    )
     try:
-        return int((latest or {}).get("attempt_no") or 0) + 1
+        return int((previous or {}).get("attempt_no") or 0) + 1
     except Exception:
         return 1
 
@@ -753,7 +2177,9 @@ def _validate_attempt_v2_doc(doc: dict) -> list:
     for key in [
         "student_id",
         "task_id",
+        "task_attempt_session",
         "attempt_no",
+        "attempt_sequence_no",
         "is_correct",
         "is_test_data",
         "submitted_at",
@@ -767,7 +2193,7 @@ def _validate_attempt_v2_doc(doc: dict) -> list:
         if key in ("is_correct", "is_test_data"):
             if not isinstance(value, bool):
                 missing.append(key)
-        elif key == "attempt_no":
+        elif key in ("task_attempt_session", "attempt_no", "attempt_sequence_no"):
             try:
                 if int(value) < 1:
                     missing.append(key)
@@ -782,7 +2208,7 @@ def _validate_attempt_v2_doc(doc: dict) -> list:
             missing.append(key)
     if not isinstance(doc.get("error_count"), int) or doc.get("error_count", -1) < 0:
         missing.append("error_count")
-    for key in ("error_types", "wrong_slots"):
+    for key in ("error_types", "wrong_slots", "incorrect_slots"):
         if not isinstance(doc.get(key), list):
             missing.append(key)
     if not isinstance(doc.get("repeated_error"), bool):
@@ -797,6 +2223,36 @@ def _validate_attempt_v2_doc(doc: dict) -> list:
             missing.append("error_count")
     if not isinstance(doc.get("submitted_indentation_by_block"), dict):
         missing.append("submitted_indentation_by_block")
+    if not isinstance(doc.get("block_results"), list):
+        missing.append("block_results")
+    for key in (
+        "corrected_block_ids",
+        "remaining_wrong_block_ids",
+        "remaining_wrong_submitted_block_ids",
+        "newly_wrong_block_ids",
+        "corrected_slot_indices",
+        "remaining_wrong_slot_indices",
+        "newly_wrong_slot_indices",
+        "ai_hint_texts",
+        "ai_hint_viewed_numbers",
+        "ai_hint_clicks",
+    ):
+        if not isinstance(doc.get(key), list):
+            missing.append(key)
+    for key in (
+        "submitted_after_ai_hint",
+        "ai_hint_generated_before_submit",
+        "ai_hint_viewed_before_submit",
+        "ai_hint_clicked",
+    ):
+        if not isinstance(doc.get(key), bool):
+            missing.append(key)
+    for key in ("ai_hint_1_meta", "ai_hint_2_meta"):
+        if not isinstance(doc.get(key), dict):
+            missing.append(key)
+    for key in ("ai_hint_generation_count", "ai_hint_view_count"):
+        if not isinstance(doc.get(key), int) or doc.get(key) < 0:
+            missing.append(key)
     if not isinstance(doc.get("needs_review"), bool):
         missing.append("needs_review")
     if not isinstance(doc.get("review_reason"), list):
@@ -821,7 +2277,7 @@ def _validate_attempt_v2_doc(doc: dict) -> list:
         missing.append("duration_outlier_reason")
     return missing
 
-
+# 負責把一次送出的所有資料組成 MongoDB 文件(重要)
 def _build_parsons_attempt_v2_doc(
     *,
     data: dict,
@@ -833,13 +2289,12 @@ def _build_parsons_attempt_v2_doc(
     test_cycle_id,
     task_id: str,
     video_id,
-    level,
     answer_ids,
     answer_lines,
     is_correct: bool,
     score,
 ):
-    del score  # v2 score is recalculated from normalized slot errors below.
+    del score
 
     sid = (student_id or "").strip()
     tid = (task_id or "").strip()
@@ -852,7 +2307,13 @@ def _build_parsons_attempt_v2_doc(
     duration_fields = _build_attempt_v2_duration_fields(started_at, submitted_at)
     profile = _lookup_attempt_v2_user_profile(sid, participant_id)
 
-    attempt_no = _next_attempt_v2_no(sid, tid, activity, v2_test_role) if sid and tid and activity else None
+    task_attempt_session, attempt_no, attempt_sequence_no, previous_attempt = _resolve_task_attempt_session(
+        sid,
+        tid,
+        activity,
+        v2_test_role,
+    ) if sid and tid and activity else (1, 1, 1, None)
+
     submitted_order = list(answer_ids) if isinstance(answer_ids, list) else None
     submitted_indentation = _submitted_indentation_from_lines(answer_lines)
     submitted_indentation_by_block = _submitted_indentation_by_block(
@@ -861,13 +2322,75 @@ def _build_parsons_attempt_v2_doc(
     )
     correct_answer = _correct_answer_from_task(task_doc)
     target_concept = _extract_attempt_v2_target_concept(task_doc)
+    block_results, block_change_summary = _build_attempt_v2_block_results(
+        task_doc=task_doc,
+        submitted_order=submitted_order,
+        submitted_indentation=submitted_indentation,
+        correct_answer=correct_answer,
+        previous_attempt=previous_attempt,
+    )
+
+    hint_record_before_submit = None
+    if activity == "practice" and sid and tid:
+        hint_record_before_submit = _get_hint_record(sid, tid)
+
+    ai_hint_generation_count_before_submit = int(
+        (hint_record_before_submit or {}).get("ai_hint_generation_count")
+        or (hint_record_before_submit or {}).get("hint_generation_count")
+        or 0
+    )
+    ai_hint_view_count_before_submit = int(
+        (hint_record_before_submit or {}).get("ai_hint_view_count")
+        or (hint_record_before_submit or {}).get("hint_view_count")
+        or 0
+    )
+    ai_hint_1_text = str((hint_record_before_submit or {}).get("ai_hint_1_text") or "").strip()
+    ai_hint_2_text = str((hint_record_before_submit or {}).get("ai_hint_2_text") or "").strip()
+    ai_hint_1_meta = (
+        (hint_record_before_submit or {}).get("ai_hint_1_meta")
+        if isinstance((hint_record_before_submit or {}).get("ai_hint_1_meta"), dict)
+        else {}
+    )
+    ai_hint_2_meta = (
+        (hint_record_before_submit or {}).get("ai_hint_2_meta")
+        if isinstance((hint_record_before_submit or {}).get("ai_hint_2_meta"), dict)
+        else {}
+    )
+    ai_hint_generated_before_submit = bool(
+        ai_hint_generation_count_before_submit > 0 or ai_hint_1_text or ai_hint_2_text
+    )
+    ai_hint_viewed_before_submit = bool(ai_hint_view_count_before_submit > 0)
+    ai_hint_texts = []
+    if ai_hint_1_text:
+        ai_hint_texts.append({"hint_no": 1, "text": ai_hint_1_text, "meta": ai_hint_1_meta})
+    if ai_hint_2_text:
+        ai_hint_texts.append({"hint_no": 2, "text": ai_hint_2_text, "meta": ai_hint_2_meta})
+
+    previous_error_details = (
+        previous_attempt.get("error_details")
+        if isinstance((previous_attempt or {}).get("error_details"), list)
+        else []
+    )
+    previous_error_types = []
+    for item in previous_error_details:
+        if not isinstance(item, dict):
+            continue
+        error_type = str(item.get("error_type") or "").strip()
+        if error_type:
+            previous_error_types.append(error_type)
+    if not previous_error_types:
+        previous_error_types = (
+            previous_attempt.get("error_types")
+            if isinstance((previous_attempt or {}).get("error_types"), list)
+            else []
+        )
     error_analysis = _build_attempt_v2_error_analysis(
         is_correct=bool(is_correct),
         submitted_order=submitted_order,
         submitted_indentation=submitted_indentation,
         correct_answer=correct_answer,
         target_concept=target_concept,
-        previous_error_types=_previous_attempt_v2_error_types(sid, tid),
+        previous_error_types=previous_error_types,
     )
     normalized_score = _calculate_attempt_v2_score(
         is_correct=bool(is_correct),
@@ -884,7 +2407,7 @@ def _build_parsons_attempt_v2_doc(
     if not is_test_data and str(target_concept or "").strip().lower() == "unknown":
         review_reason.append("unknown_target_concept")
     now = now_utc()
-    # parsons_attempts_v2 的資料庫欄位
+
     doc = {
         "schema_version": 2,
         "student_id": sid or None,
@@ -898,13 +2421,47 @@ def _build_parsons_attempt_v2_doc(
         "video_id": normalize_video_id(video_id) or None,
         "task_title": _extract_attempt_v2_task_title(task_doc),
         "target_concept": target_concept,
-        "attempt_no": attempt_no,
+        "task_attempt_session": int(task_attempt_session),
+        "attempt_no": int(attempt_no),
+        "attempt_sequence_no": int(attempt_sequence_no),
         "is_correct": bool(is_correct),
         "score": normalized_score,
         "submitted_order": submitted_order,
         "submitted_indentation": submitted_indentation,
         "submitted_indentation_by_block": submitted_indentation_by_block,
         "correct_answer": correct_answer,
+        "block_results": block_results,
+        **block_change_summary,
+
+        # 方便直接從 parsons_attempts_v2 分析 AI 提示內容與點擊摘要。
+        "ai_hint_prompt_version": str((hint_record_before_submit or {}).get("hint_prompt_version") or _PARSONS_HINT_PROMPT_VERSION),
+        "ai_hint_1_text": ai_hint_1_text or None,
+        "ai_hint_1_meta": ai_hint_1_meta,
+        "ai_hint_2_text": ai_hint_2_text or None,
+        "ai_hint_2_meta": ai_hint_2_meta,
+        "ai_hint_texts": ai_hint_texts,
+        "ai_hint_generation_count": ai_hint_generation_count_before_submit,
+        "ai_hint_view_count": ai_hint_view_count_before_submit,
+        "ai_hint_clicked": ai_hint_viewed_before_submit,
+        "ai_hint_viewed_numbers": [],
+        "ai_hint_clicks": [],
+        "ai_hint_last_viewed_no": int((hint_record_before_submit or {}).get("latest_ai_hint_no") or 0),
+        "ai_hint_last_viewed_at": None,
+        "ai_hint_last_viewed_at_taiwan": None,
+
+        "submitted_after_ai_hint": ai_hint_viewed_before_submit,
+        "ai_hint_generated_before_submit": ai_hint_generated_before_submit,
+        "ai_hint_viewed_before_submit": ai_hint_viewed_before_submit,
+        "ai_hint_generation_count_before_submit": ai_hint_generation_count_before_submit,
+        "ai_hint_view_count_before_submit": ai_hint_view_count_before_submit,
+        "latest_ai_hint_no_before_submit": int(
+            (hint_record_before_submit or {}).get("latest_ai_hint_no") or 0
+        ),
+        "source_hint_id": (
+            (hint_record_before_submit or {}).get("hint_id")
+            if hint_record_before_submit
+            else None
+        ),
         **error_analysis,
         "started_at": started_at,
         "started_at_utc": started_at,
@@ -989,19 +2546,23 @@ def _normalize_dt_for_sort(v):
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _refresh_first_wrong_flag_for_group(student_id: str, task_id: str) -> str:
-    """
-    Mark the first wrong attempt in one (student_id, task_id) sequence.
-    - is_first_wrong=True only for the earliest attempt where is_correct=False
-    - others are set to False
-    """
+def _refresh_first_wrong_flag_for_group(
+    student_id: str,
+    task_id: str,
+    task_attempt_session=None,
+) -> str:
+    """Mark the earliest wrong attempt inside one task-attempt session."""
     sid = (student_id or "").strip()
     tid = (task_id or "").strip()
     if not sid or sid.lower() == "unknown" or not tid:
         return ""
 
+    query = {"student_id": sid, "task_id": tid}
+    if task_attempt_session is not None:
+        query["task_attempt_session"] = int(task_attempt_session)
+
     docs = list(db.parsons_attempts.find(
-        {"student_id": sid, "task_id": tid},
+        query,
         {"_id": 1, "is_correct": 1, "created_at": 1}
     ))
     if not docs:
@@ -1010,24 +2571,20 @@ def _refresh_first_wrong_flag_for_group(student_id: str, task_id: str) -> str:
     docs.sort(key=lambda d: (_normalize_dt_for_sort(d.get("created_at")), str(d.get("_id") or "")))
 
     first_wrong_id = None
-    for d in docs:
-        if bool(d.get("is_correct", False)):
+    for doc in docs:
+        if bool(doc.get("is_correct", False)):
             continue
-        first_wrong_id = d.get("_id")
+        first_wrong_id = doc.get("_id")
         break
 
-    db.parsons_attempts.update_many(
-        {"student_id": sid, "task_id": tid},
-        {"$set": {"is_first_wrong": False}}
-    )
+    db.parsons_attempts.update_many(query, {"$set": {"is_first_wrong": False}})
 
     if first_wrong_id is not None:
         db.parsons_attempts.update_one(
             {"_id": first_wrong_id},
-            {"$set": {"is_first_wrong": True}}
+            {"$set": {"is_first_wrong": True}},
         )
         return str(first_wrong_id)
-
     return ""
 
 
@@ -1040,8 +2597,8 @@ def t5doc_to_parsons_task(doc: dict) -> dict:
     """
     question_text = doc.get("question_text") or doc.get("question") or ""
     solution_blocks = doc.get("solution_blocks") or []
-    distractor_blocks = doc.get("distractor_blocks") or []
-    template_slots = doc.get("template_slots") or []
+    distractor_blocks = doc.get("distractor_blocks") or [] #移除停用的干擾 block。
+    template_slots = doc.get("template_slots") or [] #打亂右側 block 池順序。
 
     # --- Normalize blocks (防呆：若舊資料是 string list) ---
     def _norm_blocks(blocks):
@@ -1256,7 +2813,7 @@ def save_fixed_task():
         "ai_generated": False, # 固定題預設不是 AI 生成
         "ai_segment_map": {}, # AI 推估的 slot -> segment（start/end/evidence）
         "teacher_segment_map": {}, # 老師手動修正的 slot -> segment（submit 優先）
-        "teacher_concept_segment_map": {},
+        "teacher_concept_segment_map": {}, #老師確認的概念章節
         "ai_slot_hints": {}, # AI 推估的 slot -> 中文提示
         "ai_segments_compact": "", # AI 生成時用的字幕精簡版（冗長，先不存）
         "subtitle_range": subtitle_range,
@@ -1338,7 +2895,7 @@ def get_fixed_task():
 
 # ========================
 # [新增] POST /fixed_task/save_teacher_concept_chapters
-# 老師手動儲存/確認概念章節草稿
+# 老師手動儲存/確認概念章節草稿(不使用)
 # ========================
 @parsons_bp.post("/fixed_task/save_teacher_concept_chapters")
 def save_teacher_concept_chapters():
@@ -1608,10 +3165,10 @@ def save_teacher_concept_chapters():
             "effective_segments_count": len(effective_segments),
             "block_chapter_map": block_chapter_map,
             "block_chapter_code_map": block_chapter_map,
-            "teacher_segment_map": teacher_segment_map,
+            "teacher_segment_map": teacher_segment_map, #老師針對某一格設定的時間
             "teacher_concept_segment_map": teacher_concept_segment_map,
-            "concept_segment_map": teacher_concept_segment_map,
-            "ai_segment_map": teacher_segment_map,
+            "concept_segment_map": teacher_concept_segment_map,#系統整理的概念範圍
+            "ai_segment_map": teacher_segment_map, #先前建立的自動對齊結果
             "subtitle_range": subtitle_range or (task.get("subtitle_range") or {}),
         }}
     )
@@ -2490,202 +4047,6 @@ def align_fixed_task_subtitle():
         "message": "IR 對齊完成，共 %d 個 slot" % len(ai_segment_map),
     })
 
-    def _structural_query(text: str) -> str:
-        """Normalize variable names/literals so fixed tasks still align when symbols change."""
-        t = str(text or "")
-        if not t:
-            return ""
-        keep = {
-            "if", "elif", "else", "return", "print", "input",
-            "int", "float", "str", "for", "while", "in", "range",
-            "def", "and", "or", "not",
-        }
-
-        def _id_repl(m):
-            tok = str(m.group(0) or "")
-            low = tok.lower()
-            return tok if low in keep else "VAR"
-
-        t = _re.sub(r"\b\d+(?:\.\d+)?\b", " NUM ", t)
-        t = _re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", _id_repl, t)
-        return " ".join(t.split())
-
-    subtitle_index = build_subtitle_index(segs)
-    retrieval_mode = str((subtitle_index or {}).get("mode") or get_retrieval_mode())
-
-    ai_segment_map = {}
-    prev_end = 0.0
-    used_ranges = set()
-    for i, block in enumerate(solution_blocks):
-        q_text = str((block or {}).get("text") or "").strip()
-        q_sem = str((block or {}).get("semantic_zh") or "").strip()
-        query = (q_text + " " + q_sem + " " + _structural_query(q_text)).strip()
-
-        best, score = retrieve_best_segment(query, subtitle_index)
-        top_hits = retrieve_top_k_segments(query, subtitle_index, k=6)
-        rule_best = _find_rule_segment_for_block(q_text, q_sem)
-
-        candidates = []
-        if isinstance(best, dict):
-            candidates.append({
-                "start": float(best.get("start", 0.0)),
-                "end": float(best.get("end", 0.0)),
-                "text": str(best.get("text") or ""),
-                "score": float(score or 0.0),
-            })
-        for hit in (top_hits or []):
-            if not isinstance(hit, dict):
-                continue
-            hs = float(hit.get("start", 0.0))
-            he = float(hit.get("end", 0.0))
-            if he <= hs:
-                continue
-            candidates.append({
-                "start": hs,
-                "end": he,
-                "text": str(hit.get("text") or ""),
-                "score": float(hit.get("score") or 0.0),
-            })
-
-        if rule_best:
-            best_text = str((best or {}).get("text") or "") if isinstance(best, dict) else ""
-            best_op_score = _calc_operator_score(best_text, _detect_calc_ops(query)) if best_text else 0
-            # Use rule result when IR evidence does not carry operator cues strongly.
-            if (not best) or (best_op_score <= 0) or (float(score or 0.0) < 0.45):
-                rb = {
-                    "start": float(rule_best.get("start", 0.0)),
-                    "end": float(rule_best.get("end", 0.0)),
-                    "text": str(rule_best.get("text") or ""),
-                }
-                candidates.append({
-                    "start": float(rb.get("start", 0.0)),
-                    "end": float(rb.get("end", 0.0)),
-                    "text": str(rb.get("text") or ""),
-                    "score": max(float(score or 0.0), 0.55),
-                })
-
-        chosen = None
-        chosen_adj = -1e9
-        valid_candidates = []
-        forward_candidates = []
-        for cand in candidates:
-            cs = float(cand.get("start", 0.0))
-            ce = float(cand.get("end", 0.0))
-            if ce <= cs:
-                continue
-            valid_candidates.append(cand)
-            if cs >= (prev_end - 0.5):
-                forward_candidates.append(cand)
-
-        pick_pool = forward_candidates if forward_candidates else valid_candidates
-
-        for cand in pick_pool:
-            cs = float(cand.get("start", 0.0))
-            ce = float(cand.get("end", 0.0))
-            key = (round(cs, 1), round(ce, 1))
-            base = float(cand.get("score") or 0.0)
-
-            # Avoid repeatedly selecting the same subtitle slice across slots.
-            dup_penalty = 0.25 if key in used_ranges else 0.0
-
-            # Encourage monotonic progression while still allowing tiny overlap.
-            backward_penalty = 0.0
-            if cs + 0.15 < prev_end:
-                backward_penalty = min(0.35, (prev_end - cs) / 24.0)
-            forward_bonus = 0.06 if cs >= (prev_end - 0.5) else 0.0
-
-            adj = base + forward_bonus - dup_penalty - backward_penalty
-            if chosen is None or adj > chosen_adj:
-                chosen = cand
-                chosen_adj = adj
-
-        if chosen is not None:
-            best = {
-                "start": float(chosen.get("start", 0.0)),
-                "end": float(chosen.get("end", 0.0)),
-                "text": str(chosen.get("text") or ""),
-            }
-            score = float(chosen.get("score") or 0.0)
-            used_ranges.add((round(float(best.get("start", 0.0)), 1), round(float(best.get("end", 0.0)), 1)))
-            prev_end = max(prev_end, float(best.get("end", 0.0)))
-
-        if best:
-            ai_segment_map[str(i)] = {
-                "start": float(best.get("start", 0.0)),
-                "end": float(best.get("end", 0.0)),
-                "score": float(score),
-                "evidence": str(best.get("text") or ""),
-            }
-        else:
-            ai_segment_map[str(i)] = {
-                "start": 0.0,
-                "end": 0.0,
-                "score": 0.0,
-                "evidence": "",
-            }
-
-    update = {
-        "ai_segment_map": ai_segment_map,
-        "ai_segments_compact": compact_segments_for_prompt(segs, max_chars=12000),
-        "subtitle_ir_cache": subtitle_index,
-        "subtitle_ir_cache_updated_at": now_utc(),
-    }
-
-    # Structured mapping cache: slot -> concept, concept -> segment.
-    slot_concept_map = {}
-    concept_segment_map = {}
-    for i, block in enumerate(solution_blocks):
-        text_for_concept = (
-            str((block or {}).get("text") or "")
-            + " "
-            + str((block or {}).get("semantic_zh") or (block or {}).get("meaning_zh") or "")
-        ).strip()
-        concept = _extract_operation_from_code_text(text_for_concept)
-        if not concept:
-            continue
-        slot_concept_map[str(i)] = concept
-        seg = ai_segment_map.get(str(i)) or {}
-        try:
-            s = float(seg.get("start", 0.0))
-            e = float(seg.get("end", 0.0))
-        except Exception:
-            continue
-        if e <= s:
-            continue
-        cur = concept_segment_map.get(concept)
-        if not cur:
-            concept_segment_map[concept] = {"start": s, "end": e}
-        else:
-            concept_segment_map[concept]["start"] = min(float(cur.get("start", s)), s)
-            concept_segment_map[concept]["end"] = max(float(cur.get("end", e)), e)
-
-    if slot_concept_map:
-        update["slot_concept_map"] = slot_concept_map
-    if concept_segment_map:
-        update["concept_segment_map"] = concept_segment_map
-
-    valid_ranges = [
-        (float(v.get("start", 0.0)), float(v.get("end", 0.0)))
-        for v in ai_segment_map.values()
-        if isinstance(v, dict) and float(v.get("end", 0.0)) > float(v.get("start", 0.0))
-    ]
-    if valid_ranges:
-        update["subtitle_range"] = {
-            "start": min(x[0] for x in valid_ranges),
-            "end": max(x[1] for x in valid_ranges),
-        }
-
-    db.parsons_tasks.update_one({"_id": task["_id"]}, {"$set": update})
-
-    return jsonify({
-        "ok": True,
-        "task_id": real_task_id,
-        "retrieval_mode": retrieval_mode,
-        "subtitle_chars": len(update.get("ai_segments_compact", "")),
-        "slots_aligned": list(ai_segment_map.keys()),
-        "ai_segment_map": ai_segment_map,
-        "message": "IR 對齊完成，共 %d 個 slot" % len(ai_segment_map),
-    })
 
 
 # ========================
@@ -3001,125 +4362,6 @@ def publish_task():
 # =========================
 # AI: build hint + jump segment for wrong slot
 # =========================
-def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str, actual_text: str, level: str, slot_label: str) -> Tuple[str, Optional[float], Optional[float], str]:
-    """
-    [新增] V1.5：錯誤時的 AI 回饋與回看時間軸
-    回傳 (hint, start, end, subtitle_context)
-    - 優先使用 task.ai_segment_map / task.ai_slot_hints（生成時已產出，穩定、可重現）
-    - 若缺少，才用 OpenAI 依字幕時間戳即時推估，並回寫到 task（不改 schema，只新增欄位內容）
-    """
-    hint = ""
-    start = None
-    end = None
-    subtitle_context = ""
-
-    seg_map = (task.get("ai_segment_map") or {}) if isinstance(task.get("ai_segment_map"), dict) else {}
-    slot_hints = (task.get("ai_slot_hints") or {}) if isinstance(task.get("ai_slot_hints"), dict) else {}
-
-    seg = seg_map.get(str(slot_key)) or None
-    if isinstance(seg, dict):
-        try:
-            s = float(seg.get("start"))
-            e = float(seg.get("end"))
-            if e > s:
-                start, end = s, e
-        except Exception:
-            start, end = None, None
-
-    hint = (slot_hints.get(str(slot_key)) or "").strip()
-
-    try:
-        sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
-        if sub_path:
-            sub_text = read_subtitle_text(sub_path)
-            segs = parse_srt_segments(sub_text)
-            if start is not None and end is not None:
-                subtitle_context = extract_context_around(segs, start, end, window=5)
-            else:
-                subtitle_context = compact_segments_for_prompt(segs[:18], max_chars=3000)
-    except Exception:
-        subtitle_context = ""
-
-    if ai_enabled() and (not hint or start is None or end is None):
-        try:
-            model = _model_for_feedback()
-            segs_compact = (task.get("ai_segments_compact") or "").strip()
-            if not segs_compact:
-                sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
-                segs_compact = compact_segments_for_prompt(parse_srt_segments(read_subtitle_text(sub_path)), max_chars=12000)
-
-            prompt = f"""
-你是一位 Python 程式設計助教。學生在 Parsons 題目中把某一格放錯了。
-請你做兩件事：
-1) 給「繁體中文」提示（1~2句，針對該格錯誤）
-2) 從字幕時間戳中找出老師「邊輸入程式碼、邊口頭講解」該程式區塊的片段（start/end 必須是字幕裡實際存在的時間戳，不可捏造）
-
-請輸出「純 JSON」，不要多餘文字：
-{{
-  "hint": "繁體中文提示",
-  "start": 120.0,
-  "end": 150.0,
-  "evidence": "引用字幕關鍵句（可短）"
-}}
-
-資訊：
-- 難度 level: {level}
-- 錯誤格：{slot_label}
-- 正確應該是（expected）：{expected_text}
-- 學生放的是（actual）：{actual_text if actual_text else "（空白）"}
-
-字幕（含時間戳）如下（格式：[start-end] text）：
-{segs_compact}
-""".strip()
-
-            # [新增] OpenAI 呼叫改由 parsons_ai 統一管理（不改既有 prompt/解析）
-            data = parsons_ai.call_openai_json(
-                model=model,
-                system="你是一位 Python 程式設計助教，協助分析 Parsons 錯誤並找出老師講解程式碼的字幕時間戳。只輸出 JSON。",
-                user=prompt
-            ) or {}
-
-            ai_hint = (data.get("hint") or "").strip()
-            ai_s = data.get("start", None)
-            ai_e = data.get("end", None)
-
-            ai_start = float(ai_s) if ai_s is not None else None
-            ai_end = float(ai_e) if ai_e is not None else None
-
-            if ai_hint:
-                hint = ai_hint
-            if ai_start is not None and ai_end is not None and ai_end > ai_start:
-                start, end = ai_start, ai_end
-
-            try:
-                update = {}
-                if hint:
-                    update[f"ai_slot_hints.{str(slot_key)}"] = hint
-                if start is not None and end is not None:
-                    update[f"ai_segment_map.{str(slot_key)}"] = {
-                        "start": float(start),
-                        "end": float(end),
-                        "evidence": (data.get("evidence") or "").strip(),
-                    }
-                if update:
-                    db.parsons_tasks.update_one({"_id": task.get("_id")}, {"$set": update})
-            except Exception:
-                pass
-
-            try:
-                sub_path = ((task.get("prompt_source") or {}).get("subtitle_path") or "").strip()
-                if sub_path:
-                    sub_text = read_subtitle_text(sub_path)
-                    segs = parse_srt_segments(sub_text)
-                    if start is not None and end is not None:
-                        subtitle_context = extract_context_around(segs, start, end, window=5)
-            except Exception:
-                pass
-
-        except Exception:
-            pass
-
-    return hint, start, end, subtitle_context
 
 
 # =========================
@@ -3134,6 +4376,7 @@ def ai_hint_and_segment_for_wrong(task: dict, slot_key: str, expected_text: str,
 #    - parsons_test_attempts: {student_id, test_cycle_id, test_role, test_task_id, is_correct, score, duration_sec, wrong_indices, submitted_at}
 # =========================
 
+# 載入前測、後測題目
 @parsons_bp.get("/test/status")
 def test_status():
     ensure_test_indexes()
@@ -3322,7 +4565,7 @@ def _build_test_question_response(question_doc: dict, total: int, current_index:
         "data_source": "pre_post_parsons_questions",
     }
 
-
+# 紀錄前後測結果
 @parsons_bp.get("/test/task")
 def get_test_task():
     '''
@@ -3379,7 +4622,7 @@ def get_test_task():
         "current_index": 1
     })
 
-
+# 提交前後測答案
 @parsons_bp.post("/test/submit")
 @prevent_duplicate_submission
 def submit_test_answer():
@@ -3618,8 +4861,13 @@ def submit_test_answer():
         "wrong_slots": test_error_analysis.get("wrong_slots", []),
         "error_count": test_error_analysis.get("error_count", 0),
         "error_types": test_error_analysis.get("error_types", []),
+        "error_details": test_error_analysis.get("error_details", []),
         "error_concept": test_error_analysis.get("error_concept"),
         "repeated_error": False,
+        "repeated_error_types": test_error_analysis.get("repeated_error_types", []),
+        "repeated_error_count": test_error_analysis.get("repeated_error_count", 0),
+        "repeated_error_basis": test_error_analysis.get("repeated_error_basis"),
+        "repeated_error_rule_version": test_error_analysis.get("repeated_error_rule_version"),
         "extra_wrong_count": extra_wrong,
         "total_slots": total_slots,
         "started_at": started_at,
@@ -3695,6 +4943,7 @@ def submit_test_answer():
     })
 
 
+# 控制後測開放
 @parsons_bp.post("/test/cycle/toggle")
 def toggle_test_cycle():
     """
@@ -3777,6 +5026,7 @@ def toggle_test_cycle():
 # =========================
 # v1.8 後測開關（統一只用 test_control）
 # 新增：GET /test/cycle/get
+# 取得目前後測開放狀態，給前端判斷是否顯示「後測區塊」
 # =========================
 @parsons_bp.get("/test/cycle/get")
 def get_test_cycle_control():
@@ -3796,6 +5046,7 @@ def get_test_cycle_control():
         "_id": doc_id,
     })    
 
+# 匯出 CSV
 @parsons_bp.get("/test/export_csv")
 def export_test_csv():
     ensure_test_indexes()
@@ -5458,7 +6709,23 @@ def _resolve_subtitle_anchor_for_window(subtitle_index: dict, start_sec: float, 
         "index": int(best.get("index", 0)) if str(best.get("index", 0)).isdigit() or isinstance(best.get("index", 0), int) else 0,
     }
 
-
+#  重要: 
+'''
+執行順序:
+驗證學生
+取得題目
+接收 answer_ids 與 answer_lines
+系統判斷正誤
+建立 legacy attempt
+建立 parsons_attempts_v2
+寫入 learning_logs
+判斷第幾次錯誤
+回傳 hint_flow
+第1次錯誤 → first_system_hint
+第2次錯誤 → ai_hint
+第3次以上 → system_recheck
+答對 → 不顯示錯誤提示
+'''
 @parsons_bp.post("/submit")
 @prevent_duplicate_submission
 def submit_answer():
@@ -6373,7 +7640,6 @@ def submit_answer():
         "unit": task.get("unit"),
         "student_id": student_id or None,
         "participant_id": participant_id or None,
-        "level": level or task.get("level") or None,
         "answer_ids": answer_ids,
         "answer_lines": answer_lines,
         "answer_block_ids": answer_ids,
@@ -6401,32 +7667,67 @@ def submit_answer():
 
     try:
         v2_doc = _build_parsons_attempt_v2_doc(
-            data=data,
-            task_doc=task,
-            student_id=student_id,
+            data=data, 
+            task_doc=task, #題目資料
+            student_id=student_id, #學生學號
             participant_id=participant_id,
-            activity_type="practice",
-            test_role=None,
-            test_cycle_id=None,
-            task_id=task_id,
+            activity_type="practice", #區分資料類型
+            test_role=None, #測驗類別
+            test_cycle_id=None,  #前後測的編號
+            task_id=task_id, #題目id
             video_id=data.get("video_id") or video_id_str or task.get("video_id"),
-            level=level or task.get("level"),
-            answer_ids=answer_ids,
-            answer_lines=answer_lines,
-            is_correct=is_correct,
-            score=score,
+            answer_ids=answer_ids, #作答紀錄
+            answer_lines=answer_lines, #
+            is_correct=is_correct, #是否為測試資料
+            score=score, #作答時間
         )
     except ValueError as e:
         return jsonify({"ok": False, "message": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "message": "parsons_attempts_v2 prepare failed", "detail": str(e)}), 500
 
+    # Keep the legacy attempt collection auditable too, while parsons_attempts_v2
+    # remains the primary analysis source.
+    for _field in (
+        "task_attempt_session",
+        "attempt_no",
+        "attempt_sequence_no",
+        "block_results",
+        "previous_attempt_id",
+        "previous_attempt_no",
+        "corrected_block_ids",
+        "remaining_wrong_block_ids",
+        "remaining_wrong_submitted_block_ids",
+        "newly_wrong_block_ids",
+        "corrected_slot_indices",
+        "remaining_wrong_slot_indices",
+        "newly_wrong_slot_indices",
+        "corrected_block_count",
+        "remaining_wrong_block_count",
+        "newly_wrong_block_count",
+        "submitted_after_ai_hint",
+        "ai_hint_generated_before_submit",
+        "ai_hint_viewed_before_submit",
+        "latest_ai_hint_no_before_submit",
+        "source_hint_id",
+    ):
+        attempt_doc[_field] = v2_doc.get(_field)
+
     ins = db.parsons_attempts.insert_one(attempt_doc)
     attempt_id = str(ins.inserted_id)
 
     try:
+        v2_doc["legacy_attempt_id"] = attempt_id
         v2_ins = db.parsons_attempts_v2.insert_one(v2_doc)
         v2_attempt_id = str(v2_ins.inserted_id)
+        db.parsons_attempts.update_one(
+            {"_id": ins.inserted_id},
+            {"$set": {
+                "attempt_v2_id": v2_attempt_id,
+                "task_attempt_session": v2_doc.get("task_attempt_session"),
+                "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
+            }},
+        )
     except Exception as e:
         return jsonify({"ok": False, "message": "parsons_attempts_v2 write failed", "detail": str(e)}), 500
 
@@ -6443,17 +7744,30 @@ def submit_answer():
         "target_concept": v2_doc.get("target_concept"),
         "event_at": v2_doc.get("submitted_at"),
         "metadata": {
+            "task_attempt_session": v2_doc.get("task_attempt_session"),
+            "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
             "is_correct": v2_doc.get("is_correct"),
             "score": v2_doc.get("score"),
             "error_count": v2_doc.get("error_count"),
             "error_types": v2_doc.get("error_types", []),
             "wrong_slots": v2_doc.get("wrong_slots", []),
+            "incorrect_slots": v2_doc.get("incorrect_slots", []),
+            "block_results": v2_doc.get("block_results", []),
+            "corrected_block_ids": v2_doc.get("corrected_block_ids", []),
+            "remaining_wrong_block_ids": v2_doc.get("remaining_wrong_block_ids", []),
+            "newly_wrong_block_ids": v2_doc.get("newly_wrong_block_ids", []),
+            "submitted_after_ai_hint": v2_doc.get("submitted_after_ai_hint", False),
+            "latest_ai_hint_no_before_submit": v2_doc.get("latest_ai_hint_no_before_submit", 0),
             "repeated_error": v2_doc.get("repeated_error"),
         },
     })
 
     # 依同一學生、同一題的作答序列，標記第一次錯誤的嘗試
-    _refresh_first_wrong_flag_for_group(student_id, task_id)
+    _refresh_first_wrong_flag_for_group(
+        student_id,
+        task_id,
+        v2_doc.get("task_attempt_session"),
+    )
 
     review_attempt_id = (data.get("review_attempt_id") or "").strip()
 
@@ -6472,9 +7786,11 @@ def submit_answer():
         "ok": True,
         "attempt_id": attempt_id,
         "attempt_v2_id": v2_attempt_id,
+        "task_attempt_session": v2_doc.get("task_attempt_session"),
         "attempt_no": v2_doc.get("attempt_no"),
+        "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
         "is_correct": is_correct,
-        "score": score,
+        "score": v2_doc.get("score", score),
         "feedback": feedback,
         "wrong_index": wrong_index,
         "wrong_indices": reported_wrong_indices,
@@ -6486,6 +7802,28 @@ def submit_answer():
         "actual_text": actual_text,
         "expected_text": expected_text,
         "hint": "",
+        "error_types": v2_doc.get("error_types", []),
+        "wrong_slots": v2_doc.get("wrong_slots", []),
+        "incorrect_slots": v2_doc.get("incorrect_slots", []),
+        "current_error_positions": v2_doc.get("incorrect_slots", []),
+        "current_error_count": v2_doc.get("error_count", 0),
+        "current_error_types": v2_doc.get("error_types", []),
+        "sequence_slots": v2_doc.get("sequence_slots", []),
+        "indentation_slots": v2_doc.get("indentation_slots", []),
+        "error_count": v2_doc.get("error_count", 0),
+        "block_results": v2_doc.get("block_results", []),
+        "corrected_block_ids": v2_doc.get("corrected_block_ids", []),
+        "remaining_wrong_block_ids": v2_doc.get("remaining_wrong_block_ids", []),
+        "remaining_wrong_submitted_block_ids": v2_doc.get("remaining_wrong_submitted_block_ids", []),
+        "newly_wrong_block_ids": v2_doc.get("newly_wrong_block_ids", []),
+        "corrected_slot_indices": v2_doc.get("corrected_slot_indices", []),
+        "remaining_wrong_slot_indices": v2_doc.get("remaining_wrong_slot_indices", []),
+        "newly_wrong_slot_indices": v2_doc.get("newly_wrong_slot_indices", []),
+        "submitted_after_ai_hint": v2_doc.get("submitted_after_ai_hint", False),
+        "ai_hint_generated_before_submit": v2_doc.get("ai_hint_generated_before_submit", False),
+        "ai_hint_viewed_before_submit": v2_doc.get("ai_hint_viewed_before_submit", False),
+        "latest_ai_hint_no_before_submit": v2_doc.get("latest_ai_hint_no_before_submit", 0),
+        "repeated_error": v2_doc.get("repeated_error"),
     }
     if video_review_enabled:
         resp["review_t"] = None
@@ -6524,6 +7862,241 @@ def submit_answer():
     resp["misconception"] = system_misconception
     resp["diagnosis_mode"] = "system"
     resp["ai_feedback_pending"] = bool(not is_correct)
+
+    hint_flow = None
+    wrong_attempt_count = 0
+    attempt_for_hint = dict(attempt_doc)
+    attempt_for_hint["_id"] = ins.inserted_id
+    attempt_for_hint["attempt_v2_id"] = v2_attempt_id
+    attempt_for_hint["task_attempt_session"] = v2_doc.get("task_attempt_session")
+    repeated_error = bool(v2_doc.get("repeated_error"))
+    v2_error_types = v2_doc.get("error_types") if isinstance(v2_doc.get("error_types"), list) else []
+    # 提示與前端標色都應使用本次完整錯誤位置：
+    # 順序錯誤 + 縮排錯誤，而不是只沿用第一次錯誤位置。
+    v2_wrong_slots = (
+        v2_doc.get("incorrect_slots")
+        if isinstance(v2_doc.get("incorrect_slots"), list)
+        else (
+            v2_doc.get("wrong_slots")
+            if isinstance(v2_doc.get("wrong_slots"), list)
+            else reported_wrong_indices
+        )
+    )
+    user_profile_for_hint = db.users.find_one({"student_id": student_id}, {"group_type": 1}) or {}
+
+    if not is_correct:
+        first_record = _ensure_first_hint_record(
+            student_id,
+            task_id,
+            group_type=_clean_string(user_profile_for_hint.get("group_type")),
+            wrong_slots=v2_wrong_slots,
+            error_types=v2_error_types,
+            task_attempt_session=v2_doc.get("task_attempt_session"),
+        )
+        wrong_attempt_query = {
+            "student_id": student_id,
+            "task_id": task_id,
+            "is_correct": False,
+        }
+        activity_for_count = v2_doc.get("activity_type") or "practice"
+        if activity_for_count:
+            wrong_attempt_query["activity_type"] = activity_for_count
+        if activity_for_count == "test":
+            wrong_attempt_query["test_role"] = v2_doc.get("test_role")
+        wrong_attempt_count = db.parsons_attempts_v2.count_documents(wrong_attempt_query)
+        try:
+            attempt_no_for_hint_flow = int(v2_doc.get("attempt_no") or 0)
+        except Exception:
+            attempt_no_for_hint_flow = 0
+        is_first_wrong_for_hint_flow = (
+            wrong_attempt_count <= 1
+            and attempt_no_for_hint_flow <= 1
+        )
+        is_second_wrong_for_hint_flow = (
+            wrong_attempt_count == 2
+            or attempt_no_for_hint_flow == 2
+        )
+
+        # Always preserve the latest system evaluation separately from the
+        # immutable first/second snapshots used for research.
+        current_record = _set_hint_record(
+            student_id,
+            task_id,
+            set_fields={
+                "group_type": _clean_string(user_profile_for_hint.get("group_type")),
+                "task_attempt_session": v2_doc.get("task_attempt_session"),
+                "latest_error_positions": _int_list(v2_wrong_slots),
+                "latest_error_types": v2_error_types,
+                "latest_error_count": int(v2_doc.get("error_count") or len(_int_list(v2_wrong_slots))),
+                "last_attempt_id": str(ins.inserted_id),
+                "latest_attempt_v2_id": v2_attempt_id,
+            },
+        ) or first_record
+
+        if is_first_wrong_for_hint_flow:
+            hint_flow = {
+                "type": "first_system_hint",
+                "task_attempt_session": v2_doc.get("task_attempt_session"),
+                "auto_open_ai": False,
+                "wrong_attempt_count": int(wrong_attempt_count),
+                "hint_record": _hint_record_public(current_record),
+                "first_system_hint_text": (current_record or {}).get("first_system_hint_text"),
+                "first_error_positions": (current_record or {}).get("first_error_positions") or _int_list(v2_wrong_slots),
+                "first_error_types": (current_record or {}).get("first_error_types") or v2_error_types,
+            }
+            write_learning_log_safely({
+                "session_id": data.get("session_id"),
+                "student_id": student_id,
+                "event_type": "first_error_hint_shown",
+                "page": data.get("page") or "parsons",
+                "activity_type": "practice",
+                "test_role": None,
+                "task_id": task_id,
+                "attempt_id": v2_attempt_id,
+                "attempt_no": v2_doc.get("attempt_no"),
+                "target_concept": v2_doc.get("target_concept"),
+                "event_at": v2_doc.get("submitted_at"),
+                "metadata": _hint_log_metadata(
+                    current_record,
+                    requested_hint_no=None,
+                    error_types=v2_error_types,
+                    wrong_slots=v2_wrong_slots,
+                    repeated_error=False,
+                    extra={"hint_source": "system_first_error"},
+                ),
+            })
+
+        elif is_second_wrong_for_hint_flow:
+            # 這裡只負責通知前端開啟 AI 提示視窗。
+            # 不在 /submit 內直接呼叫 AI，避免提示生成、SRT 檢索或 MongoDB
+            # 提示寫入的例外使整次作答送出變成 HTTP 500。
+            # 前端收到 auto_open_ai=True 後，會再呼叫 /api/parsons/hint。
+            try:
+                pending_record = _set_hint_record(
+                    student_id,
+                    task_id,
+                    set_fields={
+                        "group_type": _clean_string(user_profile_for_hint.get("group_type")),
+                        "task_attempt_session": v2_doc.get("task_attempt_session"),
+                        "second_error_positions": _int_list(v2_wrong_slots),
+                        "second_error_types": v2_error_types,
+                        "latest_error_positions": _int_list(v2_wrong_slots),
+                        "latest_error_types": v2_error_types,
+                        "latest_error_count": int(v2_doc.get("error_count") or len(_int_list(v2_wrong_slots))),
+                        "last_attempt_id": str(ins.inserted_id),
+                        "latest_attempt_v2_id": v2_attempt_id,
+                    },
+                ) or current_record
+            except Exception as hint_state_error:
+                print("[parsons submit] hint state update failed:", repr(hint_state_error))
+                pending_record = current_record
+
+            existing_hint_1 = str(
+                (pending_record or {}).get("ai_hint_1_text") or ""
+            ).strip()
+            existing_hint_1_meta = (
+                (pending_record or {}).get("ai_hint_1_meta")
+                if isinstance((pending_record or {}).get("ai_hint_1_meta"), dict)
+                else {}
+            )
+            ai_hint_recovery_triggered = False
+
+            hint_flow = {
+                "type": "ai_hint",
+                "task_attempt_session": v2_doc.get("task_attempt_session"),
+                "auto_open_ai": True,
+                "requested_hint_no": 1,
+                "wrong_attempt_count": int(wrong_attempt_count),
+                "ai_hint_recovery_triggered": ai_hint_recovery_triggered,
+                "second_error_positions": _int_list(v2_wrong_slots),
+                "second_error_types": v2_error_types,
+                "hint_record": _hint_record_public(pending_record),
+                "hint": existing_hint_1,
+                "hint_meta": existing_hint_1_meta,
+                "source": "parsons_hint_records" if existing_hint_1 else "hint_api_pending",
+                "ai_feedback_detail": {},
+                "ai_diagnosis_summary": "",
+                "hint_pending": not bool(existing_hint_1),
+            }
+
+        else:
+            current_positions = _int_list(v2_wrong_slots)
+            current_error_count = int(v2_doc.get("error_count") or len(current_positions))
+            hint_flow = {
+                "type": "system_recheck",
+                "task_attempt_session": v2_doc.get("task_attempt_session"),
+                "auto_open_ai": False,
+                "wrong_attempt_count": int(wrong_attempt_count),
+                "current_error_positions": current_positions,
+                "current_error_count": current_error_count,
+                "current_error_types": v2_error_types,
+                "current_system_feedback_text": _system_recheck_text(
+                    current_positions,
+                    v2_error_types,
+                    v2_doc.get("attempt_no"),
+                ),
+                "hint_record": _hint_record_public(current_record),
+                "existing_ai_hint_available": bool(
+                    (current_record or {}).get("ai_hint_1_text")
+                ),
+                "corrected_block_ids": v2_doc.get("corrected_block_ids", []),
+                "remaining_wrong_block_ids": v2_doc.get("remaining_wrong_block_ids", []),
+                "newly_wrong_block_ids": v2_doc.get("newly_wrong_block_ids", []),
+            }
+            write_learning_log_safely({
+                "session_id": data.get("session_id"),
+                "student_id": student_id,
+                "event_type": "system_recheck_shown",
+                "page": data.get("page") or "parsons",
+                "activity_type": "practice",
+                "test_role": None,
+                "task_id": task_id,
+                "attempt_id": v2_attempt_id,
+                "attempt_no": v2_doc.get("attempt_no"),
+                "target_concept": v2_doc.get("target_concept"),
+                "event_at": v2_doc.get("submitted_at"),
+                "metadata": {
+                    "task_attempt_session": v2_doc.get("task_attempt_session"),
+                    "current_error_positions": current_positions,
+                    "current_error_count": current_error_count,
+                    "current_error_types": v2_error_types,
+                    "corrected_block_ids": v2_doc.get("corrected_block_ids", []),
+                    "remaining_wrong_block_ids": v2_doc.get("remaining_wrong_block_ids", []),
+                    "newly_wrong_block_ids": v2_doc.get("newly_wrong_block_ids", []),
+                    "submitted_after_ai_hint": v2_doc.get("submitted_after_ai_hint", False),
+                    "existing_ai_hint_available": bool(
+                        (current_record or {}).get("ai_hint_1_text")
+                    ),
+                },
+            })
+    else:
+        existing_hint_record = _get_hint_record(student_id, task_id)
+        if existing_hint_record and int(existing_hint_record.get("ai_hint_view_count") or 0) > 0:
+            write_learning_log_safely({
+                "session_id": data.get("session_id"),
+                "student_id": student_id,
+                "event_type": "submit_after_hint",
+                "page": data.get("page") or "parsons",
+                "activity_type": "practice",
+                "test_role": None,
+                "task_id": task_id,
+                "attempt_id": v2_attempt_id,
+                "attempt_no": v2_doc.get("attempt_no"),
+                "target_concept": v2_doc.get("target_concept"),
+                "event_at": v2_doc.get("submitted_at"),
+                "metadata": _hint_log_metadata(
+                    existing_hint_record,
+                    requested_hint_no=existing_hint_record.get("latest_ai_hint_no"),
+                    error_types=[],
+                    wrong_slots=[],
+                    repeated_error=False,
+                    extra={"is_correct": True, "score": v2_doc.get("score")},
+                ),
+            })
+    if not is_correct:
+        resp["wrong_attempt_count"] = int(wrong_attempt_count or 0)
+    resp["hint_flow"] = hint_flow
+
     review_video_setting = str(os.getenv("PARSONS_REVIEW_VIDEO_ON_SUBMIT", "1")).strip().lower()
     review_video_on_submit = video_review_enabled and review_video_setting in {"1", "true", "yes", "on"}
     resp["review_video_hidden"] = not review_video_on_submit
@@ -7566,7 +9139,1244 @@ def save_fixed_task_segment_override():
 
 # =========================
 # POST /hint  學生按「查看提示」後才產生 AI 提示
+# 找主要錯誤格
 # =========================
+def _attempt_hint_context(att, task):
+    """Collect the backend-selected wrong-slot context for hint generation."""
+    wrong_index = _attempt_primary_wrong_index_for_hint(att)
+    wrong_slots = _attempt_wrong_positions_for_hint(att)
+
+    slot_label = str(att.get("slot_label") or "").strip()
+    if not slot_label and wrong_index is not None:
+        slot_label = f"第 {wrong_index + 1} 格"
+    if not slot_label:
+        slot_label = "錯誤位置"
+
+    expected_text = str(att.get("expected_text") or "").strip()
+    actual_text = str(att.get("actual_text") or "").strip()
+    if (not expected_text or not actual_text) and wrong_index is not None:
+        try:
+            parsed = t5doc_to_parsons_task(task)
+            pool = {
+                str(block.get("id")): block
+                for block in (parsed.get("pool") or [])
+                if isinstance(block, dict)
+            }
+            expected_ids = [
+                str(slot.get("expected_id"))
+                for slot in (parsed.get("template_slots") or [])
+            ]
+            answer_ids = list(att.get("answer_ids") or [])
+
+            if not expected_text and 0 <= wrong_index < len(expected_ids):
+                expected_text = str(
+                    pool.get(str(expected_ids[wrong_index]), {}).get("text") or ""
+                ).strip()
+
+            if not actual_text and 0 <= wrong_index < len(answer_ids):
+                actual_text = str(
+                    pool.get(str(answer_ids[wrong_index]), {}).get("text") or ""
+                ).strip()
+        except Exception:
+            pass
+
+    primary_error_type = str(
+        att.get("primary_error_type")
+        or att.get("error_type")
+        or "logic"
+    ).strip().lower()
+
+    if primary_error_type == "condition" and (
+        str(actual_text).strip().lower().startswith("else")
+        or str(expected_text).strip().lower().startswith("else")
+    ):
+        feedback_error_type = "if_else"
+    elif primary_error_type in {
+        "indentation",
+        "calculation",
+        "structure",
+        "sequence_error",
+        "indentation_error",
+    }:
+        feedback_error_type = primary_error_type
+    else:
+        feedback_error_type = "logic"
+
+    task_concept_tag = ""
+    try:
+        slot_concept_map = _derive_slot_concept_map(task) or {}
+        if wrong_index is not None:
+            task_concept_tag = normalize_concept_name(slot_concept_map.get(str(wrong_index)) or "")
+        if not task_concept_tag:
+            task_concept_tag = normalize_concept_name(_extract_attempt_v2_target_concept(task) or "")
+    except Exception:
+        task_concept_tag = ""
+
+    return {
+        "wrong_index": wrong_index,
+        "wrong_slots": wrong_slots,
+        "slot_label": slot_label,
+        "expected_text": expected_text,
+        "actual_text": actual_text,
+        "feedback_error_type": feedback_error_type,
+        "concept_tag": task_concept_tag,
+        "concept_scope": _progressive_hint_concept_label(feedback_error_type, task_concept_tag),
+    }
+
+
+def _progressive_hint_concept_label(concept: str, concept_tag: str = "") -> str:
+    """Return a student-facing Traditional Chinese concept label."""
+    normalized_tag = normalize_concept_name(concept_tag or "")
+    if normalized_tag:
+        try:
+            label = str(concept_tag_to_label(normalized_tag) or "").strip()
+            if label and label != normalized_tag:
+                return label
+        except Exception:
+            pass
+
+    labels = {
+        "input": "資料輸入與準備",
+        "print": "輸出內容與輸出時機",
+        "condition": "條件判斷與分支流程",
+        "if_else": "條件分支與互斥關係",
+        "indentation": "縮排與控制範圍",
+        "calculation": "運算步驟與資料關係",
+        "loop": "迴圈控制與重複範圍",
+        "assignment": "變數設定與資料保存",
+        "sequence_error": "程式流程與區塊順序",
+        "indentation_error": "縮排與控制範圍",
+        "structure": "程式結構與執行流程",
+        "logic": "程式流程與資料關係",
+    }
+    return labels.get(str(concept or "").strip().lower(), "程式流程與資料關係")
+
+
+def _progressive_hint_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _progressive_hint_segment_values(segment: dict):
+    if not isinstance(segment, dict):
+        return None, None, ""
+
+    start = segment.get("start")
+    if start is None:
+        start = segment.get("start_sec", segment.get("start_ts"))
+
+    end = segment.get("end")
+    if end is None:
+        end = segment.get("end_sec", segment.get("end_ts"))
+
+    start_f = _progressive_hint_float(start)
+    end_f = _progressive_hint_float(end)
+    text = str(segment.get("text") or segment.get("content") or "").strip()
+
+    if start_f is None or end_f is None or end_f <= start_f:
+        return None, None, text
+
+    return start_f, end_f, text
+
+
+def _load_progressive_hint_segments(task: dict) -> list:
+    """Load and normalize SRT/compact subtitle segments for hint generation."""
+    raw_segments = []
+
+    try:
+        raw_segments = _load_task_subtitle_segments(task) or []
+    except Exception:
+        raw_segments = []
+
+    if not raw_segments:
+        try:
+            raw = str(_read_subtitle_text_for_task(task) or "").strip()
+        except Exception:
+            raw = ""
+
+        if raw:
+            if "-->" in raw:
+                try:
+                    raw_segments = parse_srt_segments(raw) or []
+                except Exception:
+                    raw_segments = []
+            else:
+                compact_segments = []
+                for line in raw.splitlines():
+                    match = _re.match(
+                        r"\s*\[(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\]\s*(.*)$",
+                        str(line or "").strip(),
+                    )
+                    if not match:
+                        continue
+                    start = _progressive_hint_float(match.group(1))
+                    end = _progressive_hint_float(match.group(2))
+                    if start is None or end is None or end <= start:
+                        continue
+                    compact_segments.append({
+                        "start": start,
+                        "end": end,
+                        "text": str(match.group(3) or "").strip(),
+                    })
+                raw_segments = compact_segments
+
+    normalized = []
+    for segment in raw_segments or []:
+        start, end, text = _progressive_hint_segment_values(segment)
+        if start is None or end is None:
+            continue
+        normalized.append({
+            "start": float(start),
+            "end": float(end),
+            "text": text,
+        })
+
+    normalized.sort(key=lambda item: (item["start"], item["end"]))
+    return normalized
+
+
+def _progressive_hint_range_from_value(value):
+    """Normalize one mapping/chapter value into a start/end range."""
+    if isinstance(value, list):
+        valid = []
+        for item in value:
+            start, end = _progressive_hint_range_from_value(item)
+            if start is not None and end is not None and end > start:
+                valid.append((start, end))
+        if valid:
+            return min(item[0] for item in valid), max(item[1] for item in valid)
+        return None, None
+
+    if not isinstance(value, dict):
+        return None, None
+
+    start = value.get("start")
+    if start is None:
+        start = value.get("start_sec", value.get("start_ts"))
+
+    end = value.get("end")
+    if end is None:
+        end = value.get("end_sec", value.get("end_ts"))
+
+    start_f = _progressive_hint_float(start)
+    end_f = _progressive_hint_float(end)
+    if start_f is None or end_f is None or end_f <= start_f:
+        return None, None
+
+    return float(start_f), float(end_f)
+
+
+def _progressive_hint_lookup_concept_range(task: dict, concept_tag: str):
+    normalized_target = normalize_concept_name(concept_tag or "")
+    if not normalized_target:
+        return None, None, ""
+
+    try:
+        slot_concept_map = _derive_slot_concept_map(task) or {}
+    except Exception:
+        slot_concept_map = {}
+
+    def _slot_key_to_index(key):
+        text = str(key or "").strip()
+        if text.isdigit():
+            return int(text)
+        match = _re.match(r"^s(\d+)$", text, flags=_re.I)
+        if match:
+            return int(match.group(1)) - 1
+        match = _re.match(r"^第\s*(\d+)\s*格$", text)
+        if match:
+            return int(match.group(1)) - 1
+        return None
+
+    def _range_from_slot_segment_map(segment_map, source):
+        if not isinstance(segment_map, dict):
+            return None, None, ""
+        valid = []
+        for key, value in segment_map.items():
+            slot_index = _slot_key_to_index(key)
+            if slot_index is None or slot_index < 0:
+                continue
+            slot_concept = normalize_concept_name(slot_concept_map.get(str(slot_index)) or "")
+            if slot_concept != normalized_target:
+                continue
+            start, end = _progressive_hint_range_from_value(value)
+            if start is not None and end is not None and end > start:
+                valid.append((start, end))
+        if not valid:
+            return None, None, ""
+        return min(item[0] for item in valid), max(item[1] for item in valid), source
+
+    start, end, source = _range_from_slot_segment_map(
+        task.get("teacher_segment_map") or {},
+        "teacher_segment_map",
+    )
+    if start is not None and end is not None:
+        return start, end, source
+
+    mappings = [
+        (task.get("teacher_concept_segment_map") or {}, "teacher_concept_segment_map"),
+        (task.get("concept_segment_map") or {}, "concept_segment_map"),
+    ]
+
+    for mapping, source in mappings:
+        if not isinstance(mapping, dict):
+            continue
+
+        direct = mapping.get(normalized_target)
+        start, end = _progressive_hint_range_from_value(direct)
+        if start is not None and end is not None:
+            return start, end, source
+
+        for key, value in mapping.items():
+            if normalize_concept_name(key) != normalized_target:
+                continue
+            start, end = _progressive_hint_range_from_value(value)
+            if start is not None and end is not None:
+                return start, end, source
+
+    for chapters, source in (
+        (task.get("teacher_concept_chapters") or [], "teacher_concept_chapters"),
+        (task.get("concept_chapters_formal") or [], "concept_chapters_formal"),
+        (task.get("concept_chapters_draft") or [], "concept_chapters_draft"),
+    ):
+        for chapter in chapters if isinstance(chapters, list) else []:
+            if not isinstance(chapter, dict):
+                continue
+            chapter_tag = normalize_concept_name(
+                chapter.get("concept_tag")
+                or chapter.get("concept")
+                or chapter.get("wrong_type")
+                or ""
+            )
+            if chapter_tag != normalized_target:
+                continue
+            start, end = _progressive_hint_range_from_value(chapter)
+            if start is not None and end is not None:
+                return start, end, source
+
+    start, end, source = _range_from_slot_segment_map(
+        task.get("ai_segment_map") or {},
+        "ai_segment_map",
+    )
+    if start is not None and end is not None:
+        return start, end, source
+
+    return None, None, ""
+
+
+def _progressive_hint_excerpt(segments: list, start: float, end: float, max_chars: int) -> str:
+    pieces = []
+    seen = set()
+
+    for segment in segments or []:
+        seg_start, seg_end, text = _progressive_hint_segment_values(segment)
+        if seg_start is None or seg_end is None:
+            continue
+        if seg_end < start or seg_start > end:
+            continue
+
+        clean = " ".join(str(text or "").split())
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        pieces.append(clean)
+
+    excerpt = " ".join(pieces).strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip("，。；;,.!?！？ ") + "…"
+    return excerpt
+
+
+def _progressive_hint_terms(concept: str, concept_tag: str) -> list:
+    terms = []
+
+    normalized_tag = normalize_concept_name(concept_tag or "")
+    if normalized_tag:
+        try:
+            terms.extend(get_query_terms_for_concept_tag(normalized_tag) or [])
+        except Exception:
+            pass
+
+    generic = {
+        "input": ["輸入", "讀取", "資料", "型別", "轉換"],
+        "print": ["輸出", "顯示", "結果", "呈現"],
+        "condition": ["條件", "判斷", "成立", "不成立", "分支"],
+        "if_else": ["條件", "分支", "互斥", "成立", "不成立"],
+        "indentation": ["縮排", "區塊", "範圍", "層級"],
+        "indentation_error": ["縮排", "區塊", "範圍", "層級"],
+        "calculation": ["運算", "計算", "資料", "結果"],
+        "loop": ["迴圈", "重複", "範圍", "次數"],
+        "sequence_error": ["流程", "順序", "先後", "步驟"],
+        "structure": ["流程", "結構", "區塊", "關係"],
+        "logic": ["流程", "資料", "關係", "條件"],
+    }
+    terms.extend(generic.get(str(concept or "").strip().lower(), []))
+
+    output = []
+    seen = set()
+    for term in terms:
+        clean = str(term or "").strip().lower()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        output.append(clean)
+    return output
+
+# 找 SRT 時間
+def _build_progressive_subtitle_scope(
+    task: dict,
+    wrong_index,
+    concept: str,
+    hint_level: int,
+) -> dict:
+    """Build broad (level 1) and narrow (level 2) SRT evidence scopes."""
+    segments = _load_progressive_hint_segments(task)
+
+    try:
+        wrong_index = int(wrong_index) if wrong_index is not None else None
+    except Exception:
+        wrong_index = None
+
+    slot_concept_map = {}
+    try:
+        slot_concept_map = _derive_slot_concept_map(task) or {}
+    except Exception:
+        slot_concept_map = {}
+
+    concept_tag = ""
+    if wrong_index is not None:
+        concept_tag = normalize_concept_name(
+            slot_concept_map.get(str(wrong_index)) or ""
+        )
+
+    if not concept_tag:
+        concept_tag = normalize_concept_name(_extract_attempt_v2_target_concept(task) or concept or "")
+
+    slot_start = None
+    slot_end = None
+    if wrong_index is not None:
+        try:
+            slot_segment = _get_slot_segment_from_maps(task, wrong_index)
+        except Exception:
+            slot_segment = None
+        slot_start, slot_end = _progressive_hint_range_from_value(slot_segment)
+
+    broad_start, broad_end, broad_source = _progressive_hint_lookup_concept_range(
+        task,
+        concept_tag,
+    )
+
+    if broad_start is None or broad_end is None:
+        if slot_start is not None and slot_end is not None:
+            broad_start = max(0.0, slot_start - 12.0)
+            broad_end = slot_end + 12.0
+            broad_source = "slot_segment_expanded"
+        else:
+            subtitle_range = task.get("subtitle_range") or {}
+            broad_start, broad_end = _progressive_hint_range_from_value(subtitle_range)
+            if broad_start is not None and broad_end is not None:
+                broad_source = "task_subtitle_range"
+
+    if segments:
+        full_start = min(segment["start"] for segment in segments)
+        full_end = max(segment["end"] for segment in segments)
+    else:
+        full_start = 0.0
+        full_end = 0.0
+
+    narrow_start = slot_start
+    narrow_end = slot_end
+    narrow_source = "slot_segment" if slot_start is not None else ""
+
+    if (narrow_start is None or narrow_end is None) and segments:
+        terms = _progressive_hint_terms(concept, concept_tag)
+        candidates = []
+        for index, segment in enumerate(segments):
+            start = segment["start"]
+            end = segment["end"]
+            if broad_start is not None and broad_end is not None:
+                if end < broad_start or start > broad_end:
+                    continue
+            low = str(segment.get("text") or "").lower()
+            score = sum(1 for term in terms if term and term in low)
+            candidates.append((score, -start, index))
+
+        if candidates:
+            candidates.sort(reverse=True)
+            _, _, best_index = candidates[0]
+            best_segment = segments[best_index]
+            narrow_start = best_segment["start"]
+            narrow_end = best_segment["end"]
+
+            left = best_index - 1
+            right = best_index + 1
+            while (narrow_end - narrow_start) < 8.0 and (left >= 0 or right < len(segments)):
+                if right < len(segments):
+                    next_segment = segments[right]
+                    if broad_end is None or next_segment["start"] <= broad_end:
+                        narrow_end = max(narrow_end, next_segment["end"])
+                    right += 1
+                if (narrow_end - narrow_start) >= 8.0:
+                    break
+                if left >= 0:
+                    previous_segment = segments[left]
+                    if broad_start is None or previous_segment["end"] >= broad_start:
+                        narrow_start = min(narrow_start, previous_segment["start"])
+                    left -= 1
+            narrow_source = "srt_keyword_match"
+
+    if (
+        (broad_start is None or broad_end is None)
+        and narrow_start is not None
+        and narrow_end is not None
+        and segments
+    ):
+        broad_start = max(full_start, float(narrow_start) - 12.0)
+        broad_end = min(full_end, float(narrow_end) + 12.0)
+        if broad_end > broad_start:
+            broad_source = f"{narrow_source or 'srt_keyword_match'}_expanded"
+        else:
+            broad_start = None
+            broad_end = None
+            broad_source = ""
+
+    if narrow_start is None or narrow_end is None:
+        if broad_start is not None and broad_end is not None:
+            center = (broad_start + broad_end) / 2.0
+            narrow_start = max(broad_start, center - 6.0)
+            narrow_end = min(broad_end, center + 6.0)
+            narrow_source = "broad_range_center"
+
+    if broad_start is not None and broad_end is not None:
+        center = (
+            ((narrow_start + narrow_end) / 2.0)
+            if narrow_start is not None and narrow_end is not None
+            else ((broad_start + broad_end) / 2.0)
+        )
+        if (broad_end - broad_start) > 45.0:
+            broad_start = max(broad_start, center - 22.5)
+            broad_end = min(broad_end, center + 22.5)
+        elif (broad_end - broad_start) < 20.0:
+            broad_start = max(0.0, broad_start - 5.0)
+            broad_end = broad_end + 5.0
+
+    if narrow_start is not None and narrow_end is not None:
+        center = (narrow_start + narrow_end) / 2.0
+        if (narrow_end - narrow_start) > 20.0:
+            narrow_start = center - 10.0
+            narrow_end = center + 10.0
+        elif (narrow_end - narrow_start) < 8.0:
+            narrow_start = max(0.0, center - 4.0)
+            narrow_end = center + 4.0
+
+    if segments:
+        if broad_start is not None and broad_end is not None:
+            broad_start = max(full_start, broad_start)
+            broad_end = min(full_end, broad_end)
+        if narrow_start is not None and narrow_end is not None:
+            narrow_start = max(full_start, narrow_start)
+            narrow_end = min(full_end, narrow_end)
+
+    broad_excerpt = ""
+    narrow_excerpt = ""
+    if broad_start is not None and broad_end is not None:
+        broad_excerpt = _progressive_hint_excerpt(
+            segments,
+            broad_start,
+            broad_end,
+            max_chars=1200,
+        )
+    if narrow_start is not None and narrow_end is not None:
+        narrow_excerpt = _progressive_hint_excerpt(
+            segments,
+            narrow_start,
+            narrow_end,
+            max_chars=700,
+        )
+
+    level = 2 if int(hint_level or 1) == 2 else 1
+    selected_start = narrow_start if level == 2 else broad_start
+    selected_end = narrow_end if level == 2 else broad_end
+    selected_excerpt = narrow_excerpt if level == 2 else broad_excerpt
+    selected_source = narrow_source if level == 2 else broad_source
+
+    return {
+        "hint_level": level,
+        "concept": str(concept or "logic"),
+        "concept_tag": concept_tag,
+        "concept_label": _progressive_hint_concept_label(concept, concept_tag),
+        "scope": "narrow" if level == 2 else "broad",
+        "start": round(float(selected_start), 2) if selected_start is not None else None,
+        "end": round(float(selected_end), 2) if selected_end is not None else None,
+        "subtitle_excerpt": selected_excerpt,
+        "source": selected_source or "no_subtitle_scope",
+        "broad_range": {
+            "start": round(float(broad_start), 2) if broad_start is not None else None,
+            "end": round(float(broad_end), 2) if broad_end is not None else None,
+            "source": broad_source or "",
+        },
+        "narrow_range": {
+            "start": round(float(narrow_start), 2) if narrow_start is not None else None,
+            "end": round(float(narrow_end), 2) if narrow_end is not None else None,
+            "source": narrow_source or "",
+        },
+    }
+
+
+def _progressive_hint_fallback(concept: str, concept_label: str, hint_level: int) -> str:
+    level = 2 if int(hint_level or 1) == 2 else 1
+    concept_key = str(concept or "logic").strip().lower()
+
+    broad = {
+        "input": "這次可先從「資料輸入與準備」的概念範圍思考，確認資料在被使用前需要完成哪些處理。",
+        "print": "這次可先從「輸出內容與輸出時機」的概念範圍思考，確認資訊應在流程的哪個階段呈現。",
+        "condition": "這次可先從「條件判斷與分支流程」思考，確認不同情況應由哪一類分支處理。",
+        "if_else": "這次可先從「條件分支與互斥關係」思考，確認成立與不成立的情況是否各有適當範圍。",
+        "indentation": "這次可先從「縮排與控制範圍」思考，確認哪些步驟應受同一個控制結構管理。",
+        "indentation_error": "這次可先從「縮排與控制範圍」思考，確認哪些步驟應受同一個控制結構管理。",
+        "calculation": "這次可先從「運算步驟與資料關係」思考，確認資料在運算前後扮演的角色。",
+        "loop": "這次可先從「迴圈控制與重複範圍」思考，確認哪些步驟需要重複、哪些只需執行一次。",
+        "sequence_error": "這次可先從「程式流程與區塊順序」思考，確認各步驟之間的先後依賴關係。",
+        "structure": "這次可先從「程式結構與執行流程」思考，確認每個區塊在整體流程中的角色。",
+        "logic": "這次可先從「程式流程與資料關係」思考，確認每個步驟產生的資料會被哪一步使用。",
+    }
+
+    narrow = {
+        "input": "再縮小到「輸入結果與後續使用的關係」：目前資料的狀態是否符合下一步操作的需求？",
+        "print": "再縮小到「輸出內容與時機的關係」：目前呈現的資訊是否完整，而且發生在合適的流程階段？",
+        "condition": "再縮小到「條件與分支範圍的關係」：目前的判斷是否讓每種情況進入適合的處理路徑？",
+        "if_else": "再縮小到「分支互斥與先後關係」：較一般的情況是否可能過早攔截其他情況？",
+        "indentation": "再縮小到「語句與控制區塊的隸屬關係」：目前的縮排是否讓某一步多執行或少執行？",
+        "indentation_error": "再縮小到「語句與控制區塊的隸屬關係」：目前的縮排是否讓某一步多執行或少執行？",
+        "calculation": "再縮小到「資料產生與運算使用的關係」：目前運算所需的資料是否已在前面準備完成？",
+        "loop": "再縮小到「迴圈本體與迴圈外操作的界線」：目前的範圍是否符合每一步應執行的次數？",
+        "sequence_error": "再縮小到「前一步產生、後一步使用」的關係：目前是否有步驟在所需資料尚未準備前就執行？",
+        "structure": "再縮小到「相鄰區塊的依賴關係」：目前這一步所需的條件或資料，是否已由前面的流程建立？",
+        "logic": "再縮小到「資料產生與使用的關係」：目前這一步所需要的條件或資料是否已先準備完成？",
+    }
+
+    if level == 2:
+        return narrow.get(concept_key, narrow["logic"])
+    return broad.get(
+        concept_key,
+        f"這次可先從「{concept_label or '程式流程與資料關係'}」的概念範圍思考，確認各步驟在整體流程中的角色。",
+    )
+
+
+def _progressive_hint_sensitive_tokens(expected_text: str) -> list:
+    expected = str(expected_text or "")
+    identifiers = _re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expected)
+    allowed = {
+        "if", "elif", "else", "for", "while", "in", "and", "or", "not",
+        "def", "return", "print", "input", "range", "int", "float", "str",
+        "list", "len", "true", "false", "none",
+    }
+
+    tokens = []
+    for identifier in identifiers:
+        low = identifier.lower()
+        if low in allowed or len(identifier) < 2:
+            continue
+        tokens.append(identifier)
+
+    for quoted in _re.findall(r"['\"]([^'\"]{2,})['\"]", expected):
+        tokens.append(quoted)
+
+    return list(dict.fromkeys(tokens))
+
+
+def _progressive_hint_has_leakage(hint: str, expected_text: str) -> bool:
+    text = str(hint or "").strip()
+    expected = str(expected_text or "").strip()
+    if not text:
+        return True
+
+    low = text.lower()
+    forbidden_phrases = [
+        "正確答案",
+        "正確寫法",
+        "應改成",
+        "請改成",
+        "放到第",
+        "移到第",
+        "排在前面",
+        "排在後面",
+    ]
+    if any(phrase in low for phrase in forbidden_phrases):
+        return True
+
+    if _re.search(r"```|`[^`]+`", text):
+        return True
+
+    if _re.search(r"\b(?:def|return|print|input|range)\s*\([^\n]{0,80}\)", text):
+        return True
+
+    if expected:
+        if expected.lower() in low:
+            return True
+        if _lexical_overlap_ratio(text, expected) >= 0.35:
+            return True
+        for token in _progressive_hint_sensitive_tokens(expected):
+            if token and token.lower() in low:
+                return True
+
+    return False
+
+# 分成 broad / narrow
+def _generate_progressive_srt_feedback(
+    *,
+    task: dict,
+    slot_label: str,
+    wrong_index,
+    expected_text: str,
+    actual_text: str,
+    error_type: str,
+    hint_level: int,
+    first_hint: str = "",
+) -> dict:
+    """Generate one SRT-grounded hint level without exposing the answer to the model."""
+    concept = _rule_based_wrong_concept(
+        expected_text,
+        actual_text,
+        error_type=error_type,
+    )
+
+    level = 2 if int(hint_level or 1) == 2 else 1
+    scope = _build_progressive_subtitle_scope(
+        task,
+        wrong_index,
+        concept,
+        level,
+    )
+    concept_label = str(scope.get("concept_label") or "程式流程與資料關係")
+    fallback_hint = _progressive_hint_fallback(concept, concept_label, level)
+
+    subtitle_excerpt = str(scope.get("subtitle_excerpt") or "").strip()
+    first_hint_text = str(first_hint or "").strip()
+
+    if not ai_enabled() or not subtitle_excerpt:
+        return {
+            "hint_text": fallback_hint,
+            "concept": concept,
+            "concept_tag": scope.get("concept_tag") or "",
+            "concept_scope": concept_label,
+            "guiding_question": fallback_hint if level == 2 else "",
+            "subtitle_scope": scope,
+            "answer_leakage_check": "fallback_safe",
+            "source": "system_fallback",
+        }
+
+    prompt = f"""
+你是 Python Parsons 題的漸進式教學提示產生器。
+
+你只能根據以下三類資料產生提示：
+1. 系統已判定的錯誤類型。
+2. 系統已選定的概念範圍。
+3. 老師影片 SRT 的概念說明。
+
+你不是答案產生器，也不負責判斷正確答案。
+
+【目前提示層級】
+level = {level}
+
+【層級規則】
+- level 1：提供較廣的概念範圍，說明學生應思考的流程角色；一句繁體中文，20～45 字。
+- level 2：在 level 1 的基礎上縮小到一個子概念或關係，並提出一個引導問題；一到兩句繁體中文，30～60 字。
+- level 2 必須比 level 1 更聚焦，但仍不可等同答案。
+
+【禁止事項】
+1. 不可輸出完整或局部正確程式碼。
+2. 不可輸出 block ID、變數名稱、數字常數或固定輸出字串。
+3. 不可說哪一行要放到哪一格，也不可說要移到前面或後面。
+4. 不可使用「正確答案是」、「正確寫法是」、「應改成」、「請改成」。
+5. 不可逐字複製 SRT；只能用自己的話概括概念。
+6. 不可創造 SRT 沒有教過的概念。
+7. 不可直接提供操作步驟，只能提供概念範圍與檢查方向。
+8. 不可輸出 Markdown、程式碼區塊或額外說明。
+
+【系統判定】
+錯誤位置：{slot_label}
+錯誤類型：{error_type}
+概念標籤：{scope.get('concept_tag') or concept}
+概念名稱：{concept_label}
+提示範圍：{scope.get('scope')}
+
+【第一層既有提示】
+{first_hint_text if level == 2 else '無'}
+
+【SRT 證據】
+開始秒數：{scope.get('start')}
+結束秒數：{scope.get('end')}
+字幕概念內容：{subtitle_excerpt}
+
+請只輸出合法 JSON：
+{{
+  "hint_text": "給學生的提示",
+  "concept_scope": "本次提示涵蓋的概念範圍",
+  "guiding_question": "level 2 的引導問題；level 1 請輸出空字串",
+  "subtitle_basis": "用一句話概括提示依據，不逐字複製字幕"
+}}
+""".strip()
+
+    try:
+        model = _model_for_feedback()
+        data = parsons_ai.call_openai_json(
+            model=model,
+            system=(
+                "你是教學鷹架提示產生器，不是解題器。"
+                "你只能依據提供的 SRT 概念證據產生由廣到窄的提示，"
+                "不得揭露程式碼、正確 block、正確排列或直接修改步驟。"
+                "只輸出合法 JSON。"
+            ),
+            user=prompt,
+        ) or {}
+
+        hint_text = str(data.get("hint_text") or "").strip()
+        if _progressive_hint_has_leakage(hint_text, expected_text):
+            hint_text = fallback_hint
+            leakage_status = "blocked_and_replaced"
+        else:
+            leakage_status = "passed"
+
+        guiding_question = str(data.get("guiding_question") or "").strip()
+        if level == 1:
+            guiding_question = ""
+        elif _progressive_hint_has_leakage(guiding_question, expected_text):
+            guiding_question = fallback_hint
+
+        return {
+            "hint_text": hint_text or fallback_hint,
+            "concept": concept,
+            "concept_tag": scope.get("concept_tag") or "",
+            "concept_scope": str(data.get("concept_scope") or concept_label).strip(),
+            "guiding_question": guiding_question,
+            "subtitle_basis": str(data.get("subtitle_basis") or "").strip(),
+            "subtitle_scope": scope,
+            "answer_leakage_check": leakage_status,
+            "source": "ai_srt_progressive",
+        }
+    except Exception:
+        return {
+            "hint_text": fallback_hint,
+            "concept": concept,
+            "concept_tag": scope.get("concept_tag") or "",
+            "concept_scope": concept_label,
+            "guiding_question": fallback_hint if level == 2 else "",
+            "subtitle_scope": scope,
+            "answer_leakage_check": "ai_error_fallback_safe",
+            "source": "system_fallback",
+        }
+
+# 保存第一次與第二次提示
+def _generate_ai_hint_payload(att, task, requested_hint_no):
+    """Generate one aggregated hint level using all current wrong slots."""
+    level = 2 if int(requested_hint_no or 1) == 2 else 1
+    aggregate_detail = _build_aggregated_hint_detail(att, task, level)
+    fallback_hint = _aggregated_hint_fallback(aggregate_detail, level)
+
+    first_hint = ""
+    if level == 2:
+        try:
+            student_id = str(att.get("student_id") or current_student_id() or "").strip()
+            task_id = str(att.get("task_id") or "").strip()
+            record = _get_hint_record(student_id, task_id) if student_id and task_id else None
+            first_hint = str((record or {}).get("ai_hint_1_text") or "").strip()
+        except Exception:
+            first_hint = ""
+
+    error_concepts = aggregate_detail.get("error_concepts") or []
+    wrong_labels = [
+        f"第{idx + 1}格"
+        for idx in _int_list(aggregate_detail.get("wrong_slots") or [])
+    ]
+    expected_for_leakage = "\n".join(
+        str(item.get("expected_text") or "")
+        for item in _collect_all_wrong_slot_contexts(att, task)
+        if isinstance(item, dict)
+    )
+
+    hint = fallback_hint
+    guiding_question = ""
+    subtitle_basis = str(aggregate_detail.get("subtitle_basis") or "").strip()
+    leakage_status = "fallback_safe"
+    source = "system_fallback"
+    quality_status = "ai_disabled_fallback"
+    second_hint_similarity = None
+    second_hint_similarity_threshold = 0.72
+
+    if ai_enabled():
+        prompt_payload = {
+            "hint_level": level,
+            "scope": "narrow" if level == 2 else "broad",
+            "aggregation_mode": "all_current_errors",
+            "wrong_slot_count": aggregate_detail.get("wrong_slot_count") or len(wrong_labels),
+            "wrong_slots": wrong_labels,
+            "error_concepts": error_concepts,
+            "first_hint": first_hint if level == 2 else "",
+        }
+        prompt = f"""
+你是 Python Parsons 題的整合式教學提示產生器。
+
+你只能根據系統提供的錯誤概念與 SRT 概念摘要產生提示。
+系統已完成正誤判斷、錯誤格位、錯誤類型與概念對應，你不可重新判斷答案。
+
+【提示層級】
+level = {level}
+
+【層級規則】
+- level 1：統整所有錯誤概念，提供較廣、較淺的概念方向；一句繁體中文，30～70 字。
+- level 2：針對同一組錯誤概念提出更聚焦的檢查方向或一個引導問題；一到兩句繁體中文，40～90 字。
+
+【禁止事項】
+1. 不可輸出完整或局部正確程式碼。
+2. 不可輸出 block ID、正確排列、正確格位或直接移動步驟。
+3. 不可說哪一行要放到哪一格，也不可說要移到前面或後面。
+4. 不可使用「正確答案是」、「正確寫法是」、「應改成」、「請改成」。
+5. 不可輸出 Markdown、程式碼區塊或額外說明。
+6. 不可創造 SRT 沒有教過的概念。
+
+【後端整理後的錯誤概念資料】
+{json.dumps(prompt_payload, ensure_ascii=False)}
+
+請只輸出合法 JSON：
+{{
+  "hint_text": "給學生的整合提示",
+  "concept_scope": "用頓號串接本次涵蓋的概念範圍",
+  "guiding_question": "level 2 的聚焦問題；level 1 請輸出空字串",
+  "subtitle_basis": "用一句話概括依據，不逐字複製字幕"
+}}
+""".strip()
+
+        try:
+            data = parsons_ai.call_openai_json(
+                model=_model_for_feedback(),
+                system=(
+                    "你是教學鷹架提示產生器，不是解題器。"
+                    "只能依據後端提供的錯誤概念與 SRT 概念摘要產生由廣到窄的提示。"
+                    "不得揭露正確程式碼、block、排列或直接修改步驟。"
+                    "只輸出合法 JSON。"
+                ),
+                user=prompt,
+            ) or {}
+            candidate = str(data.get("hint_text") or "").strip()
+
+            if not candidate:
+                hint = fallback_hint
+                leakage_status = "empty_candidate_fallback"
+                quality_status = "empty_candidate_fallback"
+                source = "system_fallback"
+
+            elif _progressive_hint_has_leakage(
+                candidate,
+                expected_for_leakage,
+            ):
+                hint = fallback_hint
+                leakage_status = "rejected_fallback_used"
+                quality_status = "answer_leakage_fallback"
+                source = "system_fallback"
+
+            elif level == 2 and first_hint:
+                second_hint_similarity = _lexical_overlap_ratio(
+                    candidate,
+                    first_hint,
+                )
+
+                if second_hint_similarity >= second_hint_similarity_threshold:
+                    hint = _aggregated_hint_fallback(
+                        aggregate_detail,
+                        hint_level=2,
+                    )
+                    leakage_status = "passed"
+                    quality_status = "second_hint_too_similar_fallback"
+                    source = "system_fallback"
+                else:
+                    hint = candidate
+                    leakage_status = "passed"
+                    quality_status = "second_hint_depth_check_passed"
+                    source = "ai_srt_aggregated"
+
+            else:
+                hint = candidate
+                leakage_status = "passed"
+                quality_status = (
+                    "first_hint_accepted"
+                    if level == 1
+                    else "second_hint_without_first_hint"
+                )
+                source = "ai_srt_aggregated"
+
+            guiding_question = str(data.get("guiding_question") or "").strip()
+            if level == 1 or _progressive_hint_has_leakage(guiding_question, expected_for_leakage):
+                guiding_question = ""
+            subtitle_basis = _compact_subtitle_basis(data.get("subtitle_basis"), subtitle_basis)
+        except Exception:
+            hint = fallback_hint
+            leakage_status = "ai_error_fallback_safe"
+            quality_status = "ai_error_fallback_safe"
+            source = "system_fallback"
+
+    concept_scope = "、".join(aggregate_detail.get("concept_scopes") or []) or "程式流程與區塊順序"
+    ai_feedback_detail = {
+        "feedback_type": "progressive_srt_aggregated_hint",
+        "hint_level": level,
+        "hint_source": source,
+        "hint_quality_status": quality_status,
+        "second_hint_similarity": (
+            round(float(second_hint_similarity), 4)
+            if second_hint_similarity is not None
+            else None
+        ),
+        "second_hint_similarity_threshold": second_hint_similarity_threshold,
+        "concept": (aggregate_detail.get("concept_tags") or ["unknown"])[0],
+        "concept_tag": (aggregate_detail.get("concept_tags") or ["unknown"])[0],
+        "concept_scope": concept_scope,
+        "concept_explanation": concept_scope,
+        "concept_hint": concept_scope,
+        "possible_causes": [],
+        "impact": "請先依照目前的概念範圍修正，再重新送出讓系統判斷。",
+        "guiding_question": guiding_question,
+        "reflection_questions": [guiding_question] if guiding_question else [],
+        "first_hint": hint if level == 1 else first_hint,
+        "second_hint": hint if level == 2 else "",
+        "subtitle_basis": subtitle_basis,
+        "answer_leakage_check": leakage_status,
+        **aggregate_detail,
+    }
+    ai_diagnosis_summary = (
+        f"整合錯誤概念：{concept_scope}；"
+        f"錯誤格數：{aggregate_detail.get('wrong_slot_count') or 0}"
+    )
+
+    hint_meta = _build_ai_hint_meta_for_attempt(
+        att,
+        task,
+        level,
+        detail=ai_feedback_detail,
+    )
+
+    return {
+        "hint": str(hint or "").strip(),
+        "ai_feedback_detail": ai_feedback_detail,
+        "ai_diagnosis_summary": ai_diagnosis_summary,
+        "hint_meta": hint_meta,
+        "source": str(ai_feedback_detail.get("hint_source") or "system_fallback"),
+    }
+
+def _prepare_ai_hint_record(att, task, *, requested_hint_no=1, force=False, count_view=True, explicit_attempt_v2_id=None):
+    attempt_v2_for_context = _resolve_attempt_v2_for_hint(att, explicit_attempt_v2_id)
+    if attempt_v2_for_context:
+        att = _merge_attempt_v2_hint_context(att, attempt_v2_for_context)
+
+    student_id = str(att.get("student_id") or current_student_id() or "").strip()
+    task_id = str(att.get("task_id") or "").strip()
+    if not student_id or not task_id:
+        return None, {"hint": "", "source": "system"}
+
+    user = db.users.find_one({"student_id": student_id}, {"group_type": 1}) or {}
+    try:
+        task_attempt_session = max(1, int(att.get("task_attempt_session") or 1))
+    except Exception:
+        task_attempt_session = 1
+    wrong_slots = _attempt_wrong_positions_for_hint(att)
+    error_types = _hint_error_types(attempt_doc=att, primary_error_type=att.get("primary_error_type"))
+    record = _ensure_first_hint_record(
+        student_id,
+        task_id,
+        group_type=_clean_string(user.get("group_type")),
+        wrong_slots=wrong_slots,
+        error_types=error_types,
+        task_attempt_session=task_attempt_session,
+    )
+
+    # 舊 Prompt 產生的快取可能過度接近答案，或缺少 SRT metadata。
+    # 版本不一致時清空本場次 AI 快取，讓新版漸進式 Prompt 重新生成。
+    if record and str(record.get("hint_prompt_version") or "legacy") != _PARSONS_HINT_PROMPT_VERSION:
+        record = _set_hint_record(
+            student_id,
+            task_id,
+            set_fields={
+                "task_attempt_session": task_attempt_session,
+                "hint_prompt_version": _PARSONS_HINT_PROMPT_VERSION,
+                "ai_hint_1_text": None,
+                "ai_hint_1_meta": {},
+                "ai_hint_2_text": None,
+                "ai_hint_2_meta": {},
+                "hint_generation_count": 0,
+                "ai_hint_generation_count": 0,
+                "hint_view_count": 0,
+                "ai_hint_view_count": 0,
+                "latest_ai_hint_no": 0,
+                "last_ai_feedback_detail": {},
+                "last_ai_diagnosis_summary": "",
+            },
+        )
+
+    try:
+        requested_hint_no = 2 if int(requested_hint_no or 1) == 2 else 1
+    except Exception:
+        requested_hint_no = 1
+    field = "ai_hint_2_text" if requested_hint_no == 2 else "ai_hint_1_text"
+    meta_field = "ai_hint_2_meta" if requested_hint_no == 2 else "ai_hint_1_meta"
+    existing_hint = str((record or {}).get(field) or "").strip()
+    existing_meta = (record or {}).get(meta_field) if isinstance((record or {}).get(meta_field), dict) else {}
+    stored_generation_count = int(
+        (record or {}).get("hint_generation_count")
+        or (record or {}).get("ai_hint_generation_count")
+        or 0
+    )
+    actual_generation_count = (
+        1 if str((record or {}).get("ai_hint_1_text") or "").strip() else 0
+    ) + (
+        1 if str((record or {}).get("ai_hint_2_text") or "").strip() else 0
+    )
+    first_existing_hint = str((record or {}).get("ai_hint_1_text") or "").strip()
+    if requested_hint_no == 2 and existing_hint and first_existing_hint and existing_hint == first_existing_hint:
+        # Older cached records could accidentally store the first AI hint in the
+        # second slot. Treat that as missing so the second hint can be regenerated.
+        existing_hint = ""
+        existing_meta = {}
+        actual_generation_count = 1
+    current_view_count = int(
+        (record or {}).get("hint_view_count")
+        or (record or {}).get("ai_hint_view_count")
+        or 0
+    )
+    payload = {
+        "hint": existing_hint,
+        "ai_feedback_detail": (att.get("ai_feedback_detail") if isinstance(att.get("ai_feedback_detail"), dict) else {}),
+        "ai_diagnosis_summary": str(att.get("ai_diagnosis_summary") or ""),
+        "hint_meta": existing_meta,
+        "source": "cache" if existing_hint else "system",
+    }
+
+    generated = False
+    if force or not existing_hint:
+        if actual_generation_count < 2:
+            payload = _generate_ai_hint_payload(att, task, requested_hint_no)
+            existing_hint = payload.get("hint") or existing_hint
+            generated = bool(existing_hint)
+            if requested_hint_no == 2 and first_existing_hint and existing_hint.strip() == first_existing_hint.strip():
+                detail = (
+                    payload.get("ai_feedback_detail")
+                    if isinstance(payload.get("ai_feedback_detail"), dict)
+                    else _build_aggregated_hint_detail(att, task, requested_hint_no)
+                )
+                existing_hint = _aggregated_hint_fallback(detail, hint_level=2)
+                payload["hint"] = existing_hint
+                payload["source"] = "system_fallback_second_hint_deduped"
+
+    hint_meta = payload.get("hint_meta") if isinstance(payload.get("hint_meta"), dict) else {}
+    if not hint_meta:
+        hint_meta = existing_meta or _build_ai_hint_meta_for_attempt(
+            att,
+            task,
+            requested_hint_no,
+            detail=payload.get("ai_feedback_detail") if isinstance(payload.get("ai_feedback_detail"), dict) else {},
+        )
+    payload["hint_meta"] = hint_meta
+
+    final_generation_count = min(
+        2,
+        max(
+            stored_generation_count,
+            actual_generation_count + (1 if generated and existing_hint else 0),
+        ),
+    )
+    set_fields = {
+        "task_attempt_session": task_attempt_session,
+        "hint_prompt_version": _PARSONS_HINT_PROMPT_VERSION,
+        "latest_ai_hint_no": requested_hint_no,
+        "second_error_positions": wrong_slots,
+        "second_error_types": error_types,
+        field: existing_hint or None,
+        meta_field: hint_meta or {},
+        "hint_generation_count": final_generation_count,
+        "ai_hint_generation_count": final_generation_count,
+        "last_attempt_id": str(att.get("_id") or ""),
+        "latest_attempt_v2_id": str(att.get("attempt_v2_id") or "") or None,
+        "last_ai_feedback_detail": payload.get("ai_feedback_detail") or {},
+        "last_ai_diagnosis_summary": payload.get("ai_diagnosis_summary") or "",
+    }
+    inc_fields = {}
+    if count_view:
+        inc_fields["hint_view_count"] = 1
+        inc_fields["ai_hint_view_count"] = 1
+    record = _set_hint_record(
+        student_id,
+        task_id,
+        set_fields=set_fields,
+        inc_fields=inc_fields or None,
+    )
+
+    try:
+        update_fields = {
+            "ai_feedback_pending": False,
+            "ai_feedback_generated_at": now_utc(),
+            "ai_hint_requested_no": requested_hint_no,
+            "hint_id": (record or {}).get("hint_id"),
+        }
+        if requested_hint_no == 1:
+            update_fields["hint"] = existing_hint
+            update_fields["ai_hint_1_text"] = existing_hint
+            update_fields["ai_hint_1_meta"] = hint_meta or {}
+        else:
+            update_fields["ai_hint_2_text"] = existing_hint
+            update_fields["ai_hint_2_meta"] = hint_meta or {}
+        if payload.get("ai_feedback_detail"):
+            update_fields["ai_feedback_detail"] = payload.get("ai_feedback_detail")
+        if payload.get("ai_diagnosis_summary"):
+            update_fields["ai_diagnosis_summary"] = payload.get("ai_diagnosis_summary")
+        db.parsons_attempts.update_one({"_id": att.get("_id")}, {"$set": update_fields})
+    except Exception:
+        pass
+
+    payload["hint"] = existing_hint
+    payload["hint_meta"] = hint_meta or {}
+    payload["generated"] = bool(generated)
+    return record, payload
+
+# 重新整理或重新進入題目時，還原已產生的兩次提示與 metadata
+@parsons_bp.route("/hint_state", methods=["GET", "OPTIONS"])
+def get_parsons_hint_state():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    student_id = current_student_id()
+    task_id = str(request.args.get("task_id") or "").strip()
+    if not student_id:
+        return jsonify({"ok": False, "message": "missing student_id"}), 401
+    if not task_id:
+        return jsonify({"ok": False, "message": "missing task_id"}), 400
+
+    latest = _latest_attempt_v2_doc(student_id, task_id, "practice", None)
+    if latest:
+        try:
+            latest_session = max(1, int(latest.get("task_attempt_session") or 1))
+        except Exception:
+            latest_session = 1
+        # 已答對後再次進入同題時，不得還原上一輪提示。
+        if bool(latest.get("is_correct")):
+            return jsonify({
+                "ok": True,
+                "task_attempt_session": latest_session + 1,
+                "hint_record": None,
+                "completed_previous_session": True,
+            })
+        current_session = latest_session
+    else:
+        current_session = 1
+
+    record = _get_hint_record(student_id, task_id)
+
+    return jsonify({
+        "ok": True,
+        "task_attempt_session": current_session,
+        "hint_record": _hint_record_public(record),
+        "completed_previous_session": False,
+    })
+
+# 產生或取得指定的第一次／第二次 AI 提示
 @parsons_bp.route("/hint", methods=["POST", "OPTIONS"])
 def generate_parsons_hint():
     if request.method == "OPTIONS":
@@ -7575,6 +10385,10 @@ def generate_parsons_hint():
     data = request.get_json(silent=True) or {}
     attempt_id = str(data.get("attempt_id") or "").strip()
     force = bool(data.get("force"))
+    try:
+        requested_hint_no = 2 if int(data.get("requested_hint_no") or 1) == 2 else 1
+    except Exception:
+        requested_hint_no = 1
 
     if not attempt_id:
         return jsonify({"ok": False, "message": "missing attempt_id"}), 400
@@ -7594,128 +10408,210 @@ def generate_parsons_hint():
             "message": "不得存取其他學生的作答提示。",
         }), 403
 
-    cached_feedback = att.get("ai_feedback_detail")
-    if isinstance(cached_feedback, dict) and cached_feedback and not force:
-        hint = (
-            cached_feedback.get("first_hint")
-            or cached_feedback.get("concept_explanation")
-            or cached_feedback.get("guiding_question")
-            or att.get("hint")
-            or ""
-        )
-        return jsonify({
-            "ok": True,
-            "attempt_id": attempt_id,
-            "source": "cache",
-            "hint": hint,
-            "ai_feedback_detail": cached_feedback,
-            "ai_diagnosis_summary": att.get("ai_diagnosis_summary", ""),
-        })
-
-    if att.get("is_correct") is True:
-        feedback = _build_correct_feedback()
-        return jsonify({
-            "ok": True,
-            "attempt_id": attempt_id,
-            "source": "system",
-            "hint": "",
-            "ai_feedback_detail": feedback,
-            "ai_diagnosis_summary": "作答正確",
-        })
-
-    task_id = str(att.get("task_id") or "").strip()
-    if not task_id:
+    task_id_for_record = str(att.get("task_id") or "").strip()
+    if not task_id_for_record:
         return jsonify({"ok": False, "message": "attempt missing task_id"}), 400
-
     try:
-        task = db.parsons_tasks.find_one({"_id": ObjectId(task_id)})
+        task_for_record = db.parsons_tasks.find_one({"_id": ObjectId(task_id_for_record)})
     except Exception:
-        task = None
-    if not task:
+        task_for_record = None
+    if not task_for_record:
         return jsonify({"ok": False, "message": "task not found"}), 404
 
-    wrong_index = att.get("wrong_index")
     try:
-        wrong_index = int(wrong_index) if wrong_index is not None else None
-    except Exception:
-        wrong_index = None
-
-    slot_label = str(att.get("slot_label") or "").strip()
-    if not slot_label and wrong_index is not None:
-        slot_label = f"第{wrong_index + 1}格"
-    if not slot_label:
-        slot_label = "第1格"
-
-    expected_text = str(att.get("expected_text") or "").strip()
-    actual_text = str(att.get("actual_text") or "").strip()
-
-    if (not expected_text or not actual_text) and wrong_index is not None:
-        try:
-            parsed = t5doc_to_parsons_task(task)
-            pool = {str(b.get("id")): b for b in (parsed.get("pool") or [])}
-            expected_ids = [str(s.get("expected_id")) for s in (parsed.get("template_slots") or [])]
-            answer_ids = list(att.get("answer_ids") or [])
-            if not expected_text and 0 <= wrong_index < len(expected_ids):
-                expected_text = str(pool.get(str(expected_ids[wrong_index]), {}).get("text") or "").strip()
-            if not actual_text and 0 <= wrong_index < len(answer_ids):
-                actual_text = str(pool.get(str(answer_ids[wrong_index]), {}).get("text") or "").strip()
-        except Exception:
-            pass
-
-    primary_error_type = str(att.get("primary_error_type") or att.get("error_type") or "logic").strip().lower()
-    if primary_error_type == "condition" and (
-        str(actual_text).strip().lower().startswith("else")
-        or str(expected_text).strip().lower().startswith("else")
-    ):
-        feedback_error_type = "if_else"
-    elif primary_error_type in {"indentation", "calculation", "structure"}:
-        feedback_error_type = primary_error_type
-    else:
-        feedback_error_type = "logic"
-
-    ai_diag = _build_short_reflective_feedback(
-        task=task,
-        slot_label=slot_label,
-        expected_text=expected_text,
-        actual_text=actual_text,
-        error_type=feedback_error_type,
-    )
-    ai_feedback_detail = (ai_diag.get("feedback") or {}) if isinstance(ai_diag, dict) else {}
-    ai_diagnosis_summary = ai_diag.get("diagnosis_summary", "") if isinstance(ai_diag, dict) else ""
-
-    hint = (
-        ai_feedback_detail.get("first_hint")
-        or ai_feedback_detail.get("concept_explanation")
-        or ai_feedback_detail.get("guiding_question")
-        or "請先確認這一格在程式流程中的角色與位置。"
-    )
-
-    try:
-        db.parsons_attempts.update_one(
-            {"_id": ObjectId(attempt_id)},
-            {"$set": {
-                "hint": hint,
-                "ai_feedback_detail": ai_feedback_detail,
-                "ai_diagnosis_summary": ai_diagnosis_summary,
-                "ai_feedback_pending": False,
-                "ai_feedback_generated_at": now_utc(),
-            }}
+        record, payload = _prepare_ai_hint_record(
+            att,
+            task_for_record,
+            requested_hint_no=requested_hint_no,
+            force=force,
+            count_view=True,
+            explicit_attempt_v2_id=data.get("attempt_v2_id"),
         )
-    except Exception:
-        pass
+    except Exception as hint_prepare_error:
+        # AI、SRT 檢索或提示資料寫入失敗時，不能讓學生看到 HTTP 500。
+        # 改用依全部目前錯誤概念建立的安全 fallback，並把錯誤留在後端主控台。
+        import traceback
+        print("\n========== PARSONS HINT PREPARE ERROR ==========")
+        print("error =", repr(hint_prepare_error))
+        traceback.print_exc()
+        print("================================================\n")
 
+        aggregate_detail = _build_aggregated_hint_detail(
+            att,
+            task_for_record,
+            requested_hint_no,
+        )
+        fallback_hint = _aggregated_hint_fallback(
+            aggregate_detail,
+            hint_level=requested_hint_no,
+        )
+        fallback_detail = {
+            **aggregate_detail,
+            "feedback_type": "progressive_srt_aggregated_hint",
+            "hint_level": requested_hint_no,
+            "hint_source": "system_fallback",
+            "hint_quality_status": "hint_prepare_exception_fallback",
+            "answer_leakage_check": "fallback_safe",
+        }
+        fallback_meta = _build_ai_hint_meta_for_attempt(
+            att,
+            task_for_record,
+            requested_hint_no,
+            detail=fallback_detail,
+        )
+        fallback_student_id = str(
+            att.get("student_id")
+            or current_student_id()
+            or ""
+        ).strip()
+        existing_fallback_record = _get_hint_record(
+            fallback_student_id,
+            task_id_for_record,
+        )
+        fallback_text_field = (
+            "ai_hint_2_text"
+            if requested_hint_no == 2
+            else "ai_hint_1_text"
+        )
+        fallback_meta_field = (
+            "ai_hint_2_meta"
+            if requested_hint_no == 2
+            else "ai_hint_1_meta"
+        )
+        existing_hint_count = (
+            1
+            if str(
+                (existing_fallback_record or {}).get("ai_hint_1_text")
+                or ""
+            ).strip()
+            else 0
+        ) + (
+            1
+            if str(
+                (existing_fallback_record or {}).get("ai_hint_2_text")
+                or ""
+            ).strip()
+            else 0
+        )
+        fallback_generation_count = min(
+            2,
+            max(
+                existing_hint_count,
+                requested_hint_no,
+            ),
+        )
+        try:
+            record = _set_hint_record(
+                fallback_student_id,
+                task_id_for_record,
+                set_fields={
+                    "task_attempt_session": int(
+                        att.get("task_attempt_session")
+                        or (existing_fallback_record or {}).get(
+                            "task_attempt_session"
+                        )
+                        or 1
+                    ),
+                    "hint_prompt_version": _PARSONS_HINT_PROMPT_VERSION,
+                    "latest_ai_hint_no": requested_hint_no,
+                    fallback_text_field: fallback_hint,
+                    fallback_meta_field: fallback_meta,
+                    "hint_generation_count": fallback_generation_count,
+                    "ai_hint_generation_count": fallback_generation_count,
+                    "last_attempt_id": str(att.get("_id") or ""),
+                    "latest_attempt_v2_id": str(
+                        data.get("attempt_v2_id")
+                        or att.get("attempt_v2_id")
+                        or ""
+                    ) or None,
+                    "last_ai_feedback_detail": fallback_detail,
+                    "last_ai_diagnosis_summary": (
+                        "提示生成發生例外，已改用安全概念提示。"
+                    ),
+                },
+                inc_fields={
+                    "hint_view_count": 1,
+                    "ai_hint_view_count": 1,
+                },
+            )
+        except Exception as fallback_save_error:
+            print(
+                "[parsons hint] fallback save failed:",
+                repr(fallback_save_error),
+            )
+            record = existing_fallback_record
+
+        payload = {
+            "hint": fallback_hint,
+            "hint_meta": fallback_meta,
+            "ai_feedback_detail": fallback_detail,
+            "ai_diagnosis_summary": "提示生成發生例外，已改用安全概念提示。",
+            "source": "system_fallback",
+            "generated": True,
+            "fallback_reason": "hint_prepare_exception",
+        }
+
+    try:
+        updated_attempt_v2_id = _update_attempt_v2_ai_hint_event(
+            att,
+            record,
+            requested_hint_no=requested_hint_no,
+            explicit_attempt_v2_id=data.get("attempt_v2_id"),
+            hint_text_override=payload.get("hint") or "",
+            hint_meta_override=payload.get("hint_meta") or {},
+            event_type="ai_hint_api_view",
+            generated=bool(payload.get("generated")),
+            trigger_method=data.get("trigger_method") or ("generate_second_ai_hint" if requested_hint_no == 2 else "view_ai_hint"),
+            button_name=data.get("button_name") or ("產生第二次 AI 提示" if requested_hint_no == 2 else "查看 AI 提示"),
+        )
+    except Exception as hint_event_error:
+        print("[parsons hint] attempt v2 hint event update failed:", repr(hint_event_error))
+        updated_attempt_v2_id = data.get("attempt_v2_id") or att.get("attempt_v2_id")
+
+    write_learning_log_safely({
+        "session_id": data.get("session_id"),
+        "student_id": current_student_id(),
+        "event_type": "ai_hint_view",
+        "page": data.get("page") or "parsons",
+        "activity_type": data.get("activity_type") or "practice",
+        "test_role": data.get("test_role"),
+        "task_id": task_id_for_record,
+        "attempt_id": data.get("attempt_v2_id") or data.get("learning_attempt_id"),
+        "attempt_no": data.get("attempt_no"),
+        "target_concept": data.get("target_concept"),
+        "metadata": _hint_log_metadata(
+            record,
+            requested_hint_no=requested_hint_no,
+            error_types=_hint_error_types(attempt_doc=att),
+            wrong_slots=_attempt_wrong_positions_for_hint(att),
+            repeated_error=True,
+            extra={
+                "task_attempt_session": int((record or {}).get("task_attempt_session") or att.get("task_attempt_session") or 1),
+                "attempt_v2_id": updated_attempt_v2_id or data.get("attempt_v2_id"),
+                "trigger_method": data.get("trigger_method") or ("generate_second_ai_hint" if requested_hint_no == 2 else "view_ai_hint"),
+                "button_name": data.get("button_name") or ("產生第二次 AI 提示" if requested_hint_no == 2 else "查看 AI 提示"),
+            },
+        ),
+    })
     return jsonify({
         "ok": True,
         "attempt_id": attempt_id,
-        "source": "ai" if ai_enabled() else "system_fallback",
-        "hint": hint,
-        "ai_feedback_detail": ai_feedback_detail,
-        "ai_diagnosis_summary": ai_diagnosis_summary,
+        "attempt_v2_id": updated_attempt_v2_id or data.get("attempt_v2_id"),
+        "task_attempt_session": int((record or {}).get("task_attempt_session") or att.get("task_attempt_session") or 1),
+        "hint_prompt_version": (record or {}).get("hint_prompt_version") or _PARSONS_HINT_PROMPT_VERSION,
+        "requested_hint_no": requested_hint_no,
+        "source": payload.get("source"),
+        "hint": payload.get("hint") or "",
+        "hint_meta": payload.get("hint_meta") or {},
+        "ai_feedback_detail": payload.get("ai_feedback_detail") or {},
+        "ai_diagnosis_summary": payload.get("ai_diagnosis_summary") or "",
+        "hint_record": _hint_record_public(record),
     })
 
 
+
 # =========================
-# (C) POST /review_choice  記錄學生是否選擇回看（yes/no）
+# (C) POST /review_choice  記錄學生查看第一次、第二次提示，以及切換提示的行為
 # =========================
 @parsons_bp.route("/review_choice", methods=["POST", "OPTIONS"], endpoint="parsons_review_choice_v17")
 def review_choice():
@@ -7847,6 +10743,25 @@ def review_choice():
                 "ai_diagnosis_summary": data.get("ai_diagnosis_summary"),
             },
         })
+
+        hint_record = _get_hint_record(student_id, str(data.get("task_id") or task_id_f or "").strip())
+        hint_meta = data.get("hint_meta") if isinstance(data.get("hint_meta"), dict) else {}
+        if not hint_meta:
+            hint_meta = data.get("ai_hint_2_meta") if int(hint_no or 1) == 2 else data.get("ai_hint_1_meta")
+        if not isinstance(hint_meta, dict):
+            hint_meta = {}
+        _update_attempt_v2_ai_hint_event(
+            att,
+            hint_record,
+            requested_hint_no=hint_no,
+            explicit_attempt_v2_id=data.get("attempt_v2_id"),
+            hint_text_override=hint_content,
+            hint_meta_override=hint_meta,
+            event_type="review_choice_hint_click",
+            generated=False,
+            trigger_method=trigger_method,
+            button_name=button_name,
+        )
 
     return jsonify({"ok": True, "student_id": student_id})
 
@@ -8344,58 +11259,65 @@ def _rule_based_wrong_concept(expected_text: str, actual_text: str, error_type: 
     return "logic"
 
 
-def _ai_classify_wrong_concept(task: dict, expected_text: str, actual_text: str, error_type: str = "") -> Tuple[str, str, str]:
-    concept = _rule_based_wrong_concept(expected_text, actual_text, error_type)
-    hint = ""
-    guiding_question = ""
+def _ai_classify_wrong_concept(
+    task: dict,
+    expected_text: str,
+    actual_text: str,
+    error_type: str = "",
+) -> Tuple[str, str, str]:
+    """
+    Classify the main error concept only.
+
+    This function intentionally does not generate student-facing hints. The
+    expected/actual code may be used internally for classification, but the
+    progressive hint prompt never receives the correct answer.
+    """
+    concept = _rule_based_wrong_concept(
+        expected_text,
+        actual_text,
+        error_type,
+    )
 
     if not ai_enabled():
-        return concept, hint, guiding_question
+        return concept, "", ""
 
     try:
         model = _model_for_feedback()
         question_text = str(task.get("question_text") or "")
         prompt = f"""
-    你是 Python Parsons 題診斷分類器。
-    只做一件事：根據題目與錯誤行，輸出「第一個主要錯誤概念分類」。
+你是 Python Parsons 題錯誤概念分類器。
+你的工作只有分類，不得產生提示、答案、修改步驟或程式碼。
 
-限制：
-1) 不要輸出任何時間戳或秒數。
-    2) 只回傳第一個錯誤，不要列出後續衍生錯誤。
-    3) 若存在 indentation，優先回傳 indentation。
-    4) 只能從以下概念中選一個：input, print, condition, if_else, indentation, calculation。
-3) 回傳純 JSON。
+規則：
+1. 只分類第一個主要錯誤概念。
+2. 若存在縮排錯誤，優先分類為 indentation。
+3. 只能從以下概念選一個：
+   input, print, condition, if_else, indentation,
+   calculation, loop, assignment, logic。
+4. 只輸出合法 JSON，不要輸出其他文字。
 
 題目：{question_text}
 預期程式：{expected_text}
 學生程式：{actual_text}
-已知錯誤型別（若有）：{error_type}
+已知錯誤型別：{error_type}
 
 輸出：
-{{
-    "wrong_slots": [0],
-    "concept": "condition",
-    "hint": "給學生一句簡短提示（繁體中文）",
-    "guiding_question": "給學生一句反思問題（繁體中文問句）"
-}}
+{{"concept": "condition"}}
 """.strip()
 
         data = parsons_ai.call_openai_json(
             model=model,
-            system="你是程式學習錯誤分類器，只輸出 JSON，不得輸出時間。",
+            system="你是程式學習錯誤分類器，只分類概念並輸出 JSON。",
             user=prompt,
         ) or {}
 
-        c = str(data.get("concept") or "").strip().lower()
-        if c in _concept_keywords_map():
-            concept = c
-        hint = str(data.get("hint") or "").strip()
-        guiding_question = str(data.get("guiding_question") or "").strip()
+        candidate = str(data.get("concept") or "").strip().lower()
+        if candidate in _concept_keywords_map():
+            concept = candidate
     except Exception:
         pass
 
-    return concept, hint, guiding_question
-
+    return concept, "", ""
 
 def _short_code_snippet(s: str, max_len: int = 28) -> str:
     t = str(s or "").replace("\n", " ").strip()
@@ -8417,74 +11339,72 @@ def _build_short_reflective_feedback(
     expected_text: str,
     actual_text: str,
     error_type: str = "",
+    hint_level: int = 1,
+    wrong_index=None,
+    first_hint: str = "",
 ) -> dict:
-    """Generate concise, reflective feedback tied to the backend-selected wrong slot."""
-    concept, ai_hint, ai_guiding_question = _ai_classify_wrong_concept(task, expected_text, actual_text, error_type=error_type)
+    """
+    Build one progressive SRT-grounded hint.
 
-    exp = _short_code_snippet(expected_text)
-    act = _short_code_snippet(actual_text) if str(actual_text or "").strip() else "（空白）"
-
-    default_explain_map = {
-        "indentation": f"{slot_label}的縮排層級與預期不一致。",
-        "if_else": f"{slot_label}的分支語句放置不符合 if/else 流程。",
-        "condition": f"{slot_label}的條件判斷與題目預期不一致。",
-        "calculation": f"{slot_label}的運算語句與預期邏輯不一致。",
-        "print": f"{slot_label}的輸出語句放置與時機不一致。",
-        "input": f"{slot_label}的輸入/變數設定與預期不一致。",
-        "loop": f"{slot_label}的迴圈結構位置與流程不一致。",
-        "logic": f"{slot_label}的程式流程角色與預期不一致。",
-    }
-    concept_explanation = default_explain_map.get(concept, default_explain_map["logic"])
-
-    if ai_hint:
-        concept_explanation = _short_text(ai_hint, max_len=44)
-
-    guiding_question_map = {
-        "indentation": "這行應該縮排到哪一層，才只在正確區塊執行？",
-        "if_else": "條件不成立時，這行應該在 else 區塊嗎？",
-        "condition": "這個判斷條件成立時，是否才該執行這行？",
-        "calculation": "這一步是先計算還是先輸出，順序有沒有顛倒？",
-        "print": "這行輸出應該放在判斷前還是判斷後？",
-        "input": "這個變數是不是應該先讀入再使用？",
-        "loop": "這行應該在迴圈內還是迴圈外？",
-        "logic": "這行在流程中應該更早還是更晚出現？",
-    }
-    guiding_question = guiding_question_map.get(concept, guiding_question_map["logic"])
-    if ai_guiding_question:
-        guiding_question = ai_guiding_question
-
-    # 不直接揭露 expected/actual 完整字串，改為差異方向提示。
-    possible_cause = "這一格目前的語句角色與題目預期不一致，請先確認這行是輸入、判斷、計算還是輸出。"
-
-    first_hint_seed = ai_hint or concept_explanation or guiding_question
-    first_hint = _sanitize_hint_text(
-        _short_text(first_hint_seed, max_len=44),
+    The correct answer is used only for internal concept classification and the
+    final leakage check. It is never inserted into the student-facing AI prompt.
+    """
+    level = 2 if int(hint_level or 1) == 2 else 1
+    result = _generate_progressive_srt_feedback(
+        task=task,
+        slot_label=slot_label,
+        wrong_index=wrong_index,
         expected_text=expected_text,
         actual_text=actual_text,
+        error_type=error_type,
+        hint_level=level,
+        first_hint=first_hint,
     )
 
-    second_hint = _safe_second_hint(
-        ai_second_hint="",  # 此路徑沒有 second_hint 原始欄位，交由 AI-safe 流程生成更具體提示。
-        expected_text=expected_text,
-        actual_text=actual_text,
-        concept_hint=concept_explanation,
-        possible_causes=[possible_cause],
-    )
+    hint_text = str(result.get("hint_text") or "").strip()
+    concept_scope = str(
+        result.get("concept_scope")
+        or _progressive_hint_concept_label(
+            result.get("concept") or "logic",
+            result.get("concept_tag") or "",
+        )
+    ).strip()
+    guiding_question = str(result.get("guiding_question") or "").strip()
+    subtitle_scope = result.get("subtitle_scope") or {}
+
+    first_hint_text = hint_text if level == 1 else str(first_hint or "").strip()
+    second_hint_text = hint_text if level == 2 else ""
 
     return {
-        "diagnosis_summary": f"主錯誤：{slot_label}",
+        "diagnosis_summary": f"主錯誤：{slot_label}；概念範圍：{concept_scope}",
         "feedback": {
-            "concept_explanation": concept_explanation,
-            "concept_hint": concept_explanation,
-            "possible_causes": [possible_cause],
-            "impact": "先修正這格，再檢查後續是否連動正確。",
-            "guiding_question": _short_text(guiding_question, max_len=44),
-            "reflection_questions": [_short_text(guiding_question, max_len=44)],
-            "first_hint": first_hint,
-            "second_hint": second_hint,
+            "feedback_type": "progressive_srt_hint",
+            "hint_level": level,
+            "hint_source": result.get("source") or "system_fallback",
+            "concept": result.get("concept") or "logic",
+            "concept_tag": result.get("concept_tag") or "",
+            "concept_scope": concept_scope,
+            "concept_explanation": concept_scope,
+            "concept_hint": concept_scope,
+            "possible_causes": [],
+            "impact": "請先依照目前的概念範圍修正，再重新送出讓系統判斷。",
+            "guiding_question": guiding_question,
+            "reflection_questions": [guiding_question] if guiding_question else [],
+            "first_hint": first_hint_text,
+            "second_hint": second_hint_text,
+            "subtitle_range": {
+                "start": subtitle_scope.get("start"),
+                "end": subtitle_scope.get("end"),
+                "scope": subtitle_scope.get("scope"),
+                "source": subtitle_scope.get("source"),
+            },
+            "subtitle_broad_range": subtitle_scope.get("broad_range") or {},
+            "subtitle_narrow_range": subtitle_scope.get("narrow_range") or {},
+            "subtitle_basis": result.get("subtitle_basis") or "",
+            "subtitle_excerpt": subtitle_scope.get("subtitle_excerpt") or "",
+            "answer_leakage_check": result.get("answer_leakage_check") or "unknown",
         },
     }
-
 
 def _load_task_subtitle_segments(task: dict) -> list:
     segs = []
@@ -9995,6 +12915,7 @@ def _safe_second_hint(ai_second_hint: str, expected_text: str, actual_text: str,
 
 
 def _call_ai_for_generic_diagnosis(task_doc: dict, compare_result: dict) -> dict:
+    """Safe generic diagnosis that reuses the SRT-grounded progressive hint path."""
     if compare_result.get("is_correct"):
         return {
             "is_correct": True,
@@ -10002,223 +12923,101 @@ def _call_ai_for_generic_diagnosis(task_doc: dict, compare_result: dict) -> dict
             "wrong_slots": [],
             "diagnosis_summary": "作答正確",
             "feedback": _build_correct_feedback(),
-            "recommended_review": {"start": None, "end": None, "reason": ""},
-        }
-
-    question_text = str(task_doc.get("question_text", "") or "")
-    unit = str(task_doc.get("unit", "") or "")
-    expected_ids = compare_result.get("expected_ids", []) or []
-    aligned_student_ids = compare_result.get("aligned_student_ids", []) or []
-    wrong_slots = compare_result.get("wrong_slots", []) or []
-
-    expected_blocks = _get_blocks_by_ids(task_doc, expected_ids)
-    student_blocks = _get_blocks_by_ids(task_doc, [x for x in aligned_student_ids if x is not None])
-
-    subtitle_ctx = _get_subtitle_context_for_ai(task_doc)
-    subtitle_text_used = subtitle_ctx.get("subtitle_text_used", "")
-    subtitle_range = subtitle_ctx.get("subtitle_range", {}) or {}
-    ai_segment_map = subtitle_ctx.get("ai_segment_map", {}) or {}
-    ai_slot_hints = subtitle_ctx.get("ai_slot_hints", {}) or {}
-    ai_segments_compact = subtitle_ctx.get("ai_segments_compact", "") or {}
-
-    expected_text_raw = str(compare_result.get("expected_text", "") or "")
-    actual_text_raw = str(compare_result.get("actual_text", "") or "")
-    error_type = str(compare_result.get("error_type", "") or compare_result.get("error_code", "") or "logic")
-    error_detail = str(compare_result.get("feedback", "") or compare_result.get("diagnosis_summary", "") or "")
-
-    prompt = f"""
-你是一位 Python Parsons 題診斷助教。
-請根據固定題內容、正解區塊、學生作答順序、字幕教學內容，
-判斷學生主要錯在哪幾格，並給出概念導向且不直接洩漏答案的診斷式回饋。
-
-【重要規則】
-1. 不可直接給完整正解。
-2. 不可逐字要求學生把哪一行放到哪一格。
-3. 要用繁體中文。
-4. 要用教學方式解釋，不要像編譯器。
-5. 若 wrong_slots 已提供，優先以這些格數為主分析。
-6. 若字幕內容可協助判斷，請納入解釋。
-7. 回傳純 JSON，不要多餘文字。
-8. reflection_questions 必須剛好 3 題，每題一句。
-9. 必須產生兩層提示：first_hint 較抽象；second_hint 比 first_hint 更具體。
-10. second_hint 不可直接輸出完整正確程式碼，不可逐字重現 expected_text。
-11. 若錯誤屬於輸出內容問題，只能描述少了固定文字、只輸出變數、或輸出不完整，不可直接寫出完整正解。
-12. second_hint 必須保留錯誤類型線索，不能只說泛泛的「先修正再檢查」。
-
-【題目資訊】
-unit: {unit}
-question_text: {question_text}
-
-【正解 blocks】
-{json.dumps(expected_blocks, ensure_ascii=False, indent=2)}
-
-【學生作答 blocks】
-{json.dumps(student_blocks, ensure_ascii=False, indent=2)}
-
-【系統初步比對】
-wrong_slots: {json.dumps(wrong_slots, ensure_ascii=False)}
-error_type: {error_type}
-actual_text: {actual_text_raw}
-expected_text: {expected_text_raw}
-error_detail: {error_detail}
-
-【字幕摘要】
-subtitle_text_used:
-{subtitle_text_used}
-
-subtitle_range:
-{json.dumps(subtitle_range, ensure_ascii=False)}
-
-ai_segment_map:
-{json.dumps(ai_segment_map, ensure_ascii=False)}
-
-ai_slot_hints:
-{json.dumps(ai_slot_hints, ensure_ascii=False)}
-
-ai_segments_compact:
-{ai_segments_compact}
-
-請輸出以下 JSON：
-{{
-  "is_correct": false,
-  "wrong_slots": [0],
-  "error_concept": "用一句話描述錯誤概念",
-  "diagnosis_summary": "用一句話摘要學生主要問題",
-  "concept_hint": "給學生的概念提示（1~2句）",
-  "possible_causes": ["原因1", "原因2"],
-  "impact": "這類錯誤可能造成什麼影響",
-  "guiding_question": "引導學生反思的問題",
-  "reflection_questions": ["反思問題1", "反思問題2", "反思問題3"],
-  "first_hint": "較抽象的第一層提示",
-  "second_hint": "更具體但不直接洩漏答案的第二層提示",
-  "recommended_review": {{
-    "start": null,
-    "end": null,
-    "reason": "若能從字幕判斷，請說明為何建議回看該片段"
-  }}
-}}
-""".strip()
-
-    try:
-        if not ai_enabled():
-            raise RuntimeError("AI not enabled")
-
-        model = _model_for_feedback()
-        ai_data = parsons_ai.call_openai_json(
-            model=model,
-            system="你是一位 Python Parsons 題診斷助教。",
-            user=prompt
-        ) or {}
-
-        ai_wrong_slots = ai_data.get("wrong_slots")
-        if not isinstance(ai_wrong_slots, list) or len(ai_wrong_slots) == 0:
-            ai_wrong_slots = wrong_slots
-
-        ai_reflections = ai_data.get("reflection_questions") if isinstance(ai_data.get("reflection_questions"), list) else []
-        ai_reflections = [str(x or "").strip() for x in ai_reflections if str(x or "").strip()]
-        if len(ai_reflections) < 3:
-            gq = str(ai_data.get("guiding_question", "") or "").strip()
-            causes = ai_data.get("possible_causes") if isinstance(ai_data.get("possible_causes"), list) else []
-            c1 = str(causes[0]).strip() if len(causes) >= 1 else ""
-            c2 = str(causes[1]).strip() if len(causes) >= 2 else ""
-            fallback_qs = [
-                gq or "這一格的目的，是接收輸入，還是設定初始值？",
-                (f"你覺得這次是否出現這個狀況：{c1}？" if c1 else "這個值在後面會如何被使用？"),
-                (f"如果改掉「{c2}」，目前流程會更接近正確解法嗎？" if c2 else "用目前的寫法，能順利完成運算嗎？"),
-            ]
-            for q in fallback_qs:
-                if len(ai_reflections) >= 3:
-                    break
-                if q and q not in ai_reflections:
-                    ai_reflections.append(q)
-        ai_reflections = ai_reflections[:3]
-
-        recommended_review = ai_data.get("recommended_review") or {}
-        start = recommended_review.get("start")
-        end = recommended_review.get("end")
-        try:
-            start = float(start) if start is not None else None
-        except Exception:
-            start = None
-        try:
-            end = float(end) if end is not None else None
-        except Exception:
-            end = None
-
-        concept_hint_raw = str(ai_data.get("concept_hint", "") or ai_data.get("error_concept", "") or "").strip()
-        possible_causes_raw = ai_data.get("possible_causes", []) if isinstance(ai_data.get("possible_causes"), list) else []
-        first_hint = _sanitize_hint_text(
-            str(ai_data.get("first_hint", "") or "").strip() or concept_hint_raw or "請先檢查這一行的內容是否符合題目要求。",
-            expected_text=expected_text_raw,
-            actual_text=actual_text_raw,
-        )
-        second_hint = _safe_second_hint(
-            ai_second_hint=str(ai_data.get("second_hint", "") or "").strip(),
-            expected_text=expected_text_raw,
-            actual_text=actual_text_raw,
-            concept_hint=concept_hint_raw,
-            possible_causes=possible_causes_raw,
-        )
-
-        return {
-            "is_correct": False,
-            "error_code": "GENERIC_AI_DIAGNOSIS",
-            "wrong_slots": ai_wrong_slots,
-            "diagnosis_summary": str(ai_data.get("diagnosis_summary", "") or "學生作答與預期程式流程不一致"),
-            "feedback": {
-                "feedback_type": "generic_ai_diagnostic",
-                "concept_explanation": str(ai_data.get("error_concept", "") or "這次的問題主要和程式區塊的排列邏輯有關。"),
-                "concept_hint": concept_hint_raw or "請先確認該格在程式流程中的角色與資料型態。",
-                "possible_causes": possible_causes_raw,
-                "impact": str(ai_data.get("impact", "") or ""),
-                "guiding_question": str(ai_data.get("guiding_question", "") or ""),
-                "reflection_questions": ai_reflections,
-                "first_hint": first_hint,
-                "second_hint": second_hint,
-            },
-            "recommended_review": {
-                "start": start,
-                "end": end,
-                "reason": str(recommended_review.get("reason", "") or "")
-            }
-        }
-
-    except Exception as e:
-        import traceback
-        print("========== AI GENERIC DIAGNOSIS ERROR ==========")
-        print("error =", repr(e))
-        traceback.print_exc()
-        print("===============================================")
-
-        fallback = _build_generic_fallback_feedback(task_doc, compare_result)
-        fallback_first_hint = str(
-            fallback.get("first_hint")
-            or fallback.get("concept_hint")
-            or "請先檢查這一行的內容是否符合題目要求。"
-        ).strip()
-        fallback_second_hint = _safe_second_hint(
-            ai_second_hint=str(fallback.get("second_hint") or "").strip(),
-            expected_text=expected_text_raw,
-            actual_text=actual_text_raw,
-            concept_hint=str(fallback.get("concept_hint") or "").strip(),
-            possible_causes=fallback.get("possible_causes", []),
-        )
-        fallback["first_hint"] = fallback_first_hint
-        fallback["second_hint"] = fallback_second_hint
-
-        return {
-            "is_correct": False,
-            "error_code": "GENERIC_AI_FALLBACK",
-            "wrong_slots": wrong_slots,
-            "diagnosis_summary": "AI 診斷暫時無法使用，已改用系統提示。",
-            "feedback": fallback,
             "recommended_review": {
                 "start": None,
                 "end": None,
-                "reason": ""
-            }
+                "reason": "",
+            },
         }
 
+    wrong_slots = _int_list(compare_result.get("wrong_slots") or [])
+    wrong_index = wrong_slots[0] if wrong_slots else None
+    slot_label = (
+        f"第 {wrong_index + 1} 格"
+        if wrong_index is not None
+        else "錯誤位置"
+    )
+
+    expected_text = str(compare_result.get("expected_text") or "").strip()
+    actual_text = str(compare_result.get("actual_text") or "").strip()
+    error_type = str(
+        compare_result.get("error_type")
+        or compare_result.get("first_error_type")
+        or compare_result.get("error_code")
+        or "logic"
+    ).strip()
+
+    if wrong_index is not None and (not expected_text or not actual_text):
+        try:
+            expected_ids = compare_result.get("expected_ids") or []
+            student_ids = compare_result.get("aligned_student_ids") or []
+            parsed = t5doc_to_parsons_task(task_doc)
+            pool = {
+                str(block.get("id")): block
+                for block in (parsed.get("pool") or [])
+                if isinstance(block, dict)
+            }
+            if not expected_text and wrong_index < len(expected_ids):
+                expected_text = str(
+                    pool.get(str(expected_ids[wrong_index]), {}).get("text") or ""
+                ).strip()
+            if not actual_text and wrong_index < len(student_ids):
+                actual_text = str(
+                    pool.get(str(student_ids[wrong_index]), {}).get("text") or ""
+                ).strip()
+        except Exception:
+            pass
+
+    first_result = _build_short_reflective_feedback(
+        task=task_doc,
+        slot_label=slot_label,
+        expected_text=expected_text,
+        actual_text=actual_text,
+        error_type=error_type,
+        hint_level=1,
+        wrong_index=wrong_index,
+        first_hint="",
+    )
+    first_feedback = first_result.get("feedback") or {}
+    first_hint = str(first_feedback.get("first_hint") or "").strip()
+
+    second_result = _build_short_reflective_feedback(
+        task=task_doc,
+        slot_label=slot_label,
+        expected_text=expected_text,
+        actual_text=actual_text,
+        error_type=error_type,
+        hint_level=2,
+        wrong_index=wrong_index,
+        first_hint=first_hint,
+    )
+    second_feedback = second_result.get("feedback") or {}
+
+    merged_feedback = {
+        **first_feedback,
+        **second_feedback,
+        "first_hint": first_hint,
+        "second_hint": str(second_feedback.get("second_hint") or "").strip(),
+    }
+
+    subtitle_range = second_feedback.get("subtitle_range") or first_feedback.get("subtitle_range") or {}
+
+    return {
+        "is_correct": False,
+        "error_code": "PROGRESSIVE_SRT_DIAGNOSIS",
+        "wrong_slots": wrong_slots,
+        "diagnosis_summary": str(
+            second_result.get("diagnosis_summary")
+            or first_result.get("diagnosis_summary")
+            or "學生作答與預期程式流程不一致"
+        ),
+        "feedback": merged_feedback,
+        "recommended_review": {
+            "start": subtitle_range.get("start"),
+            "end": subtitle_range.get("end"),
+            "reason": "依錯誤概念對應的 SRT 範圍提供由廣到窄的提示。",
+        },
+    }
 
 def diagnose_fixed_task_attempt(task_id: str, student_order: list):
     def _build_pool_map(task):

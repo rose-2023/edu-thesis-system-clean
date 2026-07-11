@@ -1,3 +1,4 @@
+# 學生作答紀錄分析頁面.py檔
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
@@ -54,22 +55,19 @@ def _apply_group_filter(query, class_name, group_filter, student_id=None):
         query["class_name"] = class_name
 
     if group_filter == TEST_DATA_GROUP_FILTER:
-        query["$or"] = [
-            {"is_test_data": True},
-            {"student_id": TEST_STUDENT_ID},
-            {"group_type": None},
-            {"group_type": ""},
-        ]
+        query["is_test_data"] = True
         if selected_student:
             query["student_id"] = selected_student
         return query
 
+    query["is_test_data"] = {"$ne": True}
     if selected_student:
         query["student_id"] = selected_student
 
     if group_filter in FORMAL_GROUP_TYPES:
-        query["is_test_data"] = {"$ne": True}
         query["group_type"] = group_filter
+    else:
+        query["group_type"] = {"$in": list(FORMAL_GROUP_TYPES)}
     return query
 
 
@@ -90,121 +88,53 @@ def _student_user_query(class_name=None, group_filter=None, student_id=None):
         ]
         return query
 
+    query["is_test_data"] = {"$ne": True}
     if group_filter in FORMAL_GROUP_TYPES:
-        query["is_test_data"] = {"$ne": True}
         query["group_type"] = group_filter
+    else:
+        query["group_type"] = {"$in": list(FORMAL_GROUP_TYPES)}
     return query
 
 
-def _profile_matches_filter(profile, class_name=None, group_filter=None, student_id=None):
-    sid = str(profile.get("student_id") or "").strip()
-    selected_student = _optional_string(student_id)
-    if not sid:
-        return False
-    if selected_student and sid != selected_student:
-        return False
-    if class_name and profile.get("class_name") != class_name:
-        return False
+def _user_group_overview(class_name=None):
+    base = {"role": "student"}
+    if class_name:
+        base["class_name"] = class_name
 
-    is_test_data = profile.get("is_test_data") is True
-    group_type = profile.get("group_type")
-    if group_filter == TEST_DATA_GROUP_FILTER:
-        return is_test_data
-    if group_filter in FORMAL_GROUP_TYPES:
-        return group_type == group_filter and not is_test_data
-    return True
-
-
-def _combined_student_profiles(class_name=None, group_filter=None, student_id=None):
-    profiles = {}
-
-    def ensure_profile(sid):
-        sid = str(sid or "").strip()
-        if not sid:
-            return None
-        return profiles.setdefault(sid, {
-            "student_id": sid,
-            "name": None,
-            "class_name": None,
-            "group_type": None,
-            "is_test_data": False,
-            "_explicit_test_data": False,
-            "_user_missing_group_type": False,
-        })
-
-    def apply_source(doc, source):
-        sid = str(doc.get("student_id") or "").strip()
-        profile = ensure_profile(sid)
-        if not profile:
-            return
-        if source == "users":
-            profile["name"] = doc.get("name") or profile.get("name")
-            profile["_explicit_test_data"] = doc.get("is_test_data") is True
-            profile["_user_missing_group_type"] = _optional_string(doc.get("group_type")) is None
-        if not profile.get("class_name") and doc.get("class_name"):
-            profile["class_name"] = doc.get("class_name")
-        if not profile.get("group_type") and doc.get("group_type"):
-            profile["group_type"] = doc.get("group_type")
-        if doc.get("is_test_data") is True:
-            profile["_explicit_test_data"] = True
-
-    user_projection = {
-        "_id": 0,
-        "student_id": 1,
-        "name": 1,
-        "class_name": 1,
-        "group_type": 1,
-        "is_test_data": 1,
-        "role": 1,
-    }
-    for user in db.users.find({"role": "student"}, user_projection):
-        apply_source(user, "users")
-
-    shared_projection = {
-        "_id": 0,
-        "student_id": 1,
-        "class_name": 1,
-        "group_type": 1,
-        "is_test_data": 1,
-    }
-    for attempt in db.parsons_attempts_v2.find({}, shared_projection):
-        apply_source(attempt, "attempts")
-    for log in db.learning_logs.find({}, shared_projection):
-        apply_source(log, "logs")
-
-    rows = []
-    for profile in profiles.values():
-        group_type = profile.get("group_type")
-        profile["is_test_data"] = (
-            profile.get("_explicit_test_data") is True
-            or profile.get("_user_missing_group_type") is True
-            or profile.get("student_id") == TEST_STUDENT_ID
-            or group_type not in FORMAL_GROUP_TYPES
-        )
-        row = {key: value for key, value in profile.items() if not key.startswith("_")}
-        if _profile_matches_filter(row, class_name, group_filter, student_id):
-            rows.append(row)
-    return sorted(rows, key=lambda row: str(row.get("student_id") or ""))
-
-
-def _user_group_overview(class_name=None, group_filter=None):
-    profiles = _combined_student_profiles(class_name, group_filter)
-    control_count = sum(
-        1 for profile in profiles
-        if profile.get("group_type") == "control" and profile.get("is_test_data") is not True
+    control_count = db.users.count_documents({
+        **base,
+        "is_test_data": {"$ne": True},
+        "group_type": "control",
+    })
+    experimental_count = db.users.count_documents({
+        **base,
+        "is_test_data": {"$ne": True},
+        "group_type": "experimental",
+    })
+    test_ids = set()
+    cursor = db.users.find(
+        {
+            **base,
+            "$or": [
+                {"is_test_data": True},
+                {"student_id": TEST_STUDENT_ID},
+                {"group_type": None},
+                {"group_type": ""},
+            ],
+        },
+        {"_id": 0, "student_id": 1},
     )
-    experimental_count = sum(
-        1 for profile in profiles
-        if profile.get("group_type") == "experimental" and profile.get("is_test_data") is not True
-    )
-    test_count = sum(1 for profile in profiles if profile.get("is_test_data") is True)
+    for user in cursor:
+        sid = str(user.get("student_id") or "").strip()
+        if sid:
+            test_ids.add(sid)
 
     return {
         "experimental_count": experimental_count,
         "control_count": control_count,
-        "test_account_count": test_count,
+        "test_account_count": len(test_ids),
         "formal_student_count": experimental_count + control_count,
-        "total_student_count": experimental_count + control_count + test_count,
+        "total_student_count": experimental_count + control_count + len(test_ids),
     }
 
 
@@ -242,6 +172,20 @@ def _student_test_task_counts(test_role, student_ids):
         return {}
 
     counts = defaultdict(set)
+    v2_cursor = db.parsons_attempts_v2.find(
+        {
+            "student_id": {"$in": ids},
+            "activity_type": "test",
+            "test_role": test_role,
+        },
+        {"_id": 0, "student_id": 1, "task_id": 1},
+    )
+    for attempt in v2_cursor:
+        sid = str(attempt.get("student_id") or "").strip()
+        task_id = str(attempt.get("task_id") or "").strip()
+        if sid and task_id:
+            counts[sid].add(task_id)
+
     legacy_role = _legacy_test_role(test_role)
     legacy_cursor = db.parsons_test_attempts.find(
         {"student_id": {"$in": ids}, "test_role": legacy_role},
@@ -250,8 +194,8 @@ def _student_test_task_counts(test_role, student_ids):
     for attempt in legacy_cursor:
         sid = str(attempt.get("student_id") or "").strip()
         task_id = str(
-            attempt.get("task_id")
-            or attempt.get("test_task_id")
+            attempt.get("test_task_id")
+            or attempt.get("task_id")
             or attempt.get("source_task_id")
             or ""
         ).strip()
@@ -265,7 +209,10 @@ def _test_completion_overview(test_role, class_name, group_filter, student_id=No
     if test_role not in VALID_TEST_ROLES:
         return None
 
-    students = _combined_student_profiles(class_name, group_filter, student_id)
+    students = list(db.users.find(
+        _student_user_query(class_name, group_filter, student_id),
+        {"_id": 0, "student_id": 1, "group_type": 1, "is_test_data": 1},
+    ))
     student_ids = {
         str(row.get("student_id") or "").strip()
         for row in students
@@ -305,114 +252,9 @@ def _test_completion_overview(test_role, class_name, group_filter, student_id=No
         "completed_students": completed,
         "pending_students": max(total - completed, 0),
         "completion_rate": _safe_rate(completed, total),
-        "data_sources": ["parsons_test_attempts"],
+        "data_sources": ["parsons_attempts_v2", "parsons_test_attempts"],
         "groups": groups,
     }
-
-
-def _student_practice_task_counts(student_ids):
-    ids = sorted({str(sid) for sid in student_ids if sid})
-    if not ids:
-        return {}
-    counts = defaultdict(set)
-    cursor = db.parsons_attempts_v2.find(
-        {
-            "student_id": {"$in": ids},
-            "activity_type": "practice",
-            "test_role": None,
-        },
-        {"_id": 0, "student_id": 1, "task_id": 1},
-    )
-    for attempt in cursor:
-        sid = str(attempt.get("student_id") or "").strip()
-        task_id = str(attempt.get("task_id") or "").strip()
-        if sid and task_id:
-            counts[sid].add(task_id)
-    return {sid: len(tasks) for sid, tasks in counts.items()}
-
-
-def _student_last_activity_at(student_ids):
-    ids = sorted({str(sid) for sid in student_ids if sid})
-    if not ids:
-        return {}
-    latest = {}
-
-    def touch(sid, value):
-        sid = str(sid or "").strip()
-        if not sid or not isinstance(value, datetime):
-            return
-        current = latest.get(sid)
-        if current is None or value > current:
-            latest[sid] = value
-
-    for log in db.learning_logs.find(
-        {"student_id": {"$in": ids}},
-        {"_id": 0, "student_id": 1, "event_at": 1, "created_at": 1},
-    ):
-        touch(log.get("student_id"), log.get("event_at") or log.get("created_at"))
-
-    for attempt in db.parsons_attempts_v2.find(
-        {"student_id": {"$in": ids}},
-        {"_id": 0, "student_id": 1, "submitted_at": 1, "created_at": 1},
-    ):
-        touch(attempt.get("student_id"), attempt.get("submitted_at") or attempt.get("created_at"))
-
-    for attempt in db.parsons_test_attempts.find(
-        {"student_id": {"$in": ids}},
-        {"_id": 0, "student_id": 1, "submitted_at": 1, "created_at": 1},
-    ):
-        touch(attempt.get("student_id"), attempt.get("submitted_at") or attempt.get("created_at"))
-
-    return latest
-
-
-def _progress_status(count, required_count=None):
-    count = int(count or 0)
-    if required_count is None:
-        return "in_progress" if count > 0 else "not_started"
-    required = max(int(required_count or 0), 1)
-    if count >= required:
-        return "completed"
-    if count > 0:
-        return "in_progress"
-    return "not_started"
-
-
-def _student_progress_rows(class_name, group_filter, student_id=None):
-    students = _combined_student_profiles(class_name, group_filter, student_id)
-    student_ids = [row.get("student_id") for row in students if row.get("student_id")]
-    pre_expected = _test_question_count("pretest")
-    post_expected = _test_question_count("posttest")
-    pre_counts = _student_test_task_counts("pretest", student_ids)
-    post_counts = _student_test_task_counts("posttest", student_ids)
-    practice_counts = _student_practice_task_counts(student_ids)
-    latest = _student_last_activity_at(student_ids)
-
-    rows = []
-    for student in students:
-        sid = str(student.get("student_id") or "").strip()
-        if not sid:
-            continue
-        pre_count = pre_counts.get(sid, 0)
-        post_count = post_counts.get(sid, 0)
-        practice_count = practice_counts.get(sid, 0)
-        rows.append(_json_safe({
-            "student_id": sid,
-            "name": student.get("name"),
-            "class_name": student.get("class_name"),
-            "group_type": student.get("group_type"),
-            "is_test_data": student.get("is_test_data") is True,
-            "pretest_status": _progress_status(pre_count, pre_expected),
-            "pretest_completed_tasks": pre_count,
-            "pretest_total_tasks": pre_expected,
-            "learning_status": _progress_status(practice_count),
-            "learning_task_count": practice_count,
-            "posttest_status": _progress_status(post_count, post_expected),
-            "posttest_completed_tasks": post_count,
-            "posttest_total_tasks": post_expected,
-            "last_activity_at": latest.get(sid),
-        }))
-    return rows
 
 
 def _safe_float(value):
@@ -494,7 +336,6 @@ def _load_user_profiles(student_ids):
     for user in cursor:
         sid = str(user.get("student_id") or "").strip()
         if sid:
-            user["_user_missing_group_type"] = _optional_string(user.get("group_type")) is None
             profiles[sid] = user
     return profiles
 
@@ -572,9 +413,11 @@ def _student_option_matches(row, class_name, group_filter):
     is_test_data = row.get("is_test_data") is True
     if group_filter == TEST_DATA_GROUP_FILTER:
         return is_test_data
+    if is_test_data:
+        return False
     if group_filter in FORMAL_GROUP_TYPES:
-        return row.get("group_type") == group_filter and not is_test_data
-    return True
+        return row.get("group_type") == group_filter
+    return row.get("group_type") in FORMAL_GROUP_TYPES
 
 
 def _apply_source_profile(options, source_doc, source_name):
@@ -589,16 +432,12 @@ def _apply_source_profile(options, source_doc, source_name):
         "has_attempts": False,
         "has_logs": False,
         "_profile_source": None,
-        "_user_missing_group_type": False,
     })
 
     if source_name == "attempts":
         option["has_attempts"] = True
     if source_name == "logs":
         option["has_logs"] = True
-
-    if source_name == "users":
-        option["_user_missing_group_type"] = _optional_string(source_doc.get("group_type")) is None
 
     if option.get("_profile_source") is not None:
         return
@@ -647,13 +486,6 @@ def build_student_options(class_name=None, group_filter=None):
     rows = []
     for option in options.values():
         row = {k: v for k, v in option.items() if not k.startswith("_")}
-        group_type = row.get("group_type")
-        row["is_test_data"] = (
-            row.get("is_test_data") is True
-            or option.get("_user_missing_group_type") is True
-            or row.get("student_id") == TEST_STUDENT_ID
-            or group_type not in FORMAL_GROUP_TYPES
-        )
         if _student_option_matches(row, class_name, group_filter):
             rows.append(row)
     return sorted(rows, key=lambda row: str(row.get("student_id") or ""))
@@ -671,93 +503,10 @@ def _attempt_query(activity_type, test_role, class_name, group_filter, student_i
 
 
 def _read_attempts(activity_type, test_role, class_name, group_filter, student_id):
-    if activity_type == "test":
-        students = _combined_student_profiles(class_name, group_filter, student_id)
-        student_ids = sorted(
-            {
-                str(row.get("student_id") or "").strip()
-                for row in students
-                if str(row.get("student_id") or "").strip()
-            }
-        )
-        if not student_ids:
-            return []
-
-        query = {
-            "student_id": {"$in": student_ids},
-            "test_role": _legacy_test_role(test_role),
-        }
-        cursor = db.parsons_test_attempts.find(
-            query,
-            {
-                "student_id": 1,
-                "test_role": 1,
-                "test_cycle_id": 1,
-                "test_task_id": 1,
-                "source_task_id": 1,
-                "task_id": 1,
-                "task_title": 1,
-                "target_concept": 1,
-                "attempt_no": 1,
-                "is_correct": 1,
-                "score": 1,
-                "duration_sec": 1,
-                "duration_seconds": 1,
-                "submitted_at": 1,
-                "submitted_at_utc": 1,
-                "created_at": 1,
-                "error_types": 1,
-                "wrong_slots": 1,
-                "wrong_indices": 1,
-                "indent_errors": 1,
-                "repeated_error": 1,
-            },
-        ).sort([("student_id", 1), ("task_id", 1), ("submitted_at", 1)])
-
-        attempts = []
-        for attempt in cursor:
-            task_id = str(
-                attempt.get("task_id")
-                or attempt.get("test_task_id")
-                or attempt.get("source_task_id")
-                or ""
-            ).strip()
-            wrong_slots = attempt.get("wrong_slots")
-            if not isinstance(wrong_slots, list):
-                wrong_slots = attempt.get("wrong_indices") if isinstance(attempt.get("wrong_indices"), list) else []
-            error_types = attempt.get("error_types")
-            if not isinstance(error_types, list):
-                error_types = []
-                if wrong_slots:
-                    error_types.append("sequence_error")
-                if isinstance(attempt.get("indent_errors"), list) and attempt.get("indent_errors"):
-                    error_types.append("indentation_error")
-            attempts.append({
-                "_id": attempt.get("_id"),
-                "student_id": str(attempt.get("student_id") or "").strip(),
-                "activity_type": "test",
-                "test_role": test_role,
-                "test_cycle_id": attempt.get("test_cycle_id"),
-                "task_id": task_id,
-                "task_title": attempt.get("task_title") or "",
-                "target_concept": attempt.get("target_concept") or "unknown",
-                "attempt_no": attempt.get("attempt_no") or 1,
-                "is_correct": attempt.get("is_correct"),
-                "score": attempt.get("score"),
-                "duration_sec": attempt.get("duration_seconds") if attempt.get("duration_seconds") is not None else attempt.get("duration_sec"),
-                "submitted_at": attempt.get("submitted_at_utc") or attempt.get("submitted_at"),
-                "created_at": attempt.get("created_at"),
-                "error_types": error_types,
-                "wrong_slots": wrong_slots or [],
-                "repeated_error": attempt.get("repeated_error") is True,
-            })
-        return attempts
-
     projection = {
         "student_id": 1,
         "class_name": 1,
         "group_type": 1,
-        "is_test_data": 1,
         "activity_type": 1,
         "test_role": 1,
         "task_id": 1,
@@ -772,6 +521,11 @@ def _read_attempts(activity_type, test_role, class_name, group_filter, student_i
         "error_types": 1,
         "wrong_slots": 1,
         "repeated_error": 1,
+        "error_details": 1,
+        "repeated_error_types": 1,
+        "repeated_error_count": 1,
+        "repeated_error_basis": 1,
+        "repeated_error_rule_version": 1,
     }
     return list(
         db.parsons_attempts_v2.find(
@@ -809,13 +563,6 @@ def _enrich_attempts(attempts):
         row["group_type"] = (
             _optional_string(user.get("group_type"))
             or _optional_string(row.get("group_type"))
-        )
-        row["is_test_data"] = (
-            user.get("is_test_data") is True
-            or user.get("_user_missing_group_type") is True
-            or sid == TEST_STUDENT_ID
-            or row.get("is_test_data") is True
-            or row.get("group_type") not in FORMAL_GROUP_TYPES
         )
         row["task_title"] = (
             _optional_string(row.get("task_title"))
@@ -892,7 +639,6 @@ def _build_student_overview(attempts):
             "student_id": sid,
             "class_name": first.get("class_name"),
             "group_type": first.get("group_type"),
-            "is_test_data": first.get("is_test_data") is True,
             "task_count": task_count,
             "total_attempts": len(student_attempts),
             "correct_task_count": sum(1 for a in final_attempts if a.get("is_correct") is True),
@@ -976,31 +722,9 @@ def _read_student_logs(student_id, activity_type, test_role, limit, class_name, 
         "event_type": 1,
         "page": 1,
         "task_id": 1,
-        "question_id": 1,
-        "unit_id": 1,
-        "question_type": 1,
-        "user_id": 1,
-        "from_video_id": 1,
-        "from_video_title": 1,
-        "watch_session_id": 1,
-        "to_task_id": 1,
-        "to_question_type": 1,
         "attempt_id": 1,
         "attempt_no": 1,
         "target_concept": 1,
-        "review_type": 1,
-        "hint_type": 1,
-        "hint_no": 1,
-        "max_hint_count": 1,
-        "hint_content": 1,
-        "hint_text": 1,
-        "hint_click_no": 1,
-        "trigger_method": 1,
-        "button_name": 1,
-        "close_method": 1,
-        "return_method": 1,
-        "error_type": 1,
-        "wrong_slots": 1,
         "metadata": 1,
     }
     cursor = (
@@ -1009,70 +733,7 @@ def _read_student_logs(student_id, activity_type, test_role, limit, class_name, 
         .limit(max(1, min(int(limit or 100), 500)))
     )
     rows = list(cursor)
-
-    if activity_type == "practice":
-        video_query = {}
-        _apply_group_filter(video_query, class_name, group_filter, sid)
-        video_projection = {
-            "_id": 0,
-            "event_at": 1,
-            "event_type": 1,
-            "student_id": 1,
-            "class_name": 1,
-            "group_type": 1,
-            "is_test_data": 1,
-            "video_id": 1,
-            "video_title": 1,
-            "unit_id": 1,
-            "unit": 1,
-            "watch_session_id": 1,
-            "watch_seconds": 1,
-            "watch_delta_sec": 1,
-            "current_time_sec": 1,
-            "video_duration_sec": 1,
-            "reached_end": 1,
-            "page": 1,
-            "created_at": 1,
-        }
-        for log in db.video_rewatch_logs.find(
-            video_query,
-            video_projection,
-        ).sort([("event_at", -1), ("created_at", -1)]).limit(max(1, min(int(limit or 100), 500))):
-            rows.append({
-                "event_at": log.get("event_at") or log.get("created_at"),
-                "event_type": log.get("event_type"),
-                "page": log.get("page") or "student_learning",
-                "task_id": None,
-                "unit_id": log.get("unit_id") or log.get("unit"),
-                "question_type": "video",
-                "from_video_id": log.get("video_id"),
-                "from_video_title": log.get("video_title"),
-                "watch_session_id": log.get("watch_session_id"),
-                "metadata": {
-                    "video_id": log.get("video_id"),
-                    "video_title": log.get("video_title"),
-                    "unit_id": log.get("unit_id") or log.get("unit"),
-                    "watch_session_id": log.get("watch_session_id"),
-                    "watch_seconds": log.get("watch_seconds"),
-                    "watch_delta_sec": log.get("watch_delta_sec"),
-                    "current_time_sec": log.get("current_time_sec"),
-                    "video_duration_sec": log.get("video_duration_sec"),
-                    "reached_end": log.get("reached_end"),
-                },
-            })
-
-    def _student_log_sort_key(row):
-        value = row.get("event_at") or row.get("created_at")
-        if isinstance(value, datetime):
-            if value.tzinfo is None:
-                return value.replace(tzinfo=timezone.utc)
-            return value.astimezone(timezone.utc)
-        return _utc_min()
-
-    rows = sorted(rows, key=_student_log_sort_key)
-    max_rows = max(1, min(int(limit or 100), 500))
-    if len(rows) > max_rows:
-        rows = rows[-max_rows:]
+    rows.reverse()
     return [_json_safe(row) for row in rows]
 
 
@@ -1095,7 +756,13 @@ def _student_attempt_rows(attempts, student_id):
             "score": attempt.get("score"),
             "error_types": attempt.get("error_types") or [],
             "wrong_slots": attempt.get("wrong_slots") or [],
+            "error_details": attempt.get("error_details") or [],
             "duration_sec": attempt.get("duration_sec"),
+            "repeated_error": attempt.get("repeated_error"),
+            "repeated_error_types": attempt.get("repeated_error_types") or [],
+            "repeated_error_count": attempt.get("repeated_error_count") or 0,
+            "repeated_error_basis": attempt.get("repeated_error_basis"),
+            "repeated_error_rule_version": attempt.get("repeated_error_rule_version"),
         }))
     return rows
 
@@ -1114,10 +781,6 @@ def _build_analysis_payload(forced_activity_type=None, forced_test_role=None):
     attempts = _enrich_attempts(
         _read_attempts(activity_type, test_role, class_name, group_filter, student_id)
     )
-    attempts = [
-        attempt for attempt in attempts
-        if _profile_matches_filter(attempt, class_name, group_filter, student_id)
-    ]
     logs = _read_student_logs(
         student_id,
         activity_type,
@@ -1134,18 +797,10 @@ def _build_analysis_payload(forced_activity_type=None, forced_test_role=None):
             "class_name": class_name,
             "group_type": group_filter,
             "student_id": student_id,
-            "exclude_test_data": group_filter in FORMAL_GROUP_TYPES,
+            "exclude_test_data": group_filter != TEST_DATA_GROUP_FILTER,
         },
         "kpis": _build_kpis(attempts),
         "student_options": _read_student_options(class_name, group_filter),
-        "user_group_overview": _user_group_overview(class_name, group_filter),
-        "test_completion_overview": _test_completion_overview(
-            test_role,
-            class_name,
-            group_filter,
-            student_id,
-        ) if activity_type == "test" else None,
-        "student_progress_rows": _student_progress_rows(class_name, group_filter, student_id),
         "student_overview": _build_student_overview(attempts),
         "task_error_analysis": _build_task_analysis(attempts),
         "concept_error_analysis": _build_concept_analysis(attempts),

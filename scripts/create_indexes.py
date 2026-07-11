@@ -85,6 +85,17 @@ INDEX_SPECS = {
             "unique": True,
         },
     ],
+    "parsons_hint_records": [
+        {
+            "keys": [("student_id", ASCENDING), ("task_id", ASCENDING)],
+            "name": "student_task_unique",
+            "unique": True,
+        },
+        {"keys": [("student_id", ASCENDING)], "name": "student_id_1"},
+        {"keys": [("task_id", ASCENDING)], "name": "task_id_1"},
+        {"keys": [("hint_id", ASCENDING)], "name": "hint_id_1"},
+        {"keys": [("updated_at", DESCENDING)], "name": "updated_at_-1"},
+    ],
     "learning_logs": [
         {"keys": [("student_id", ASCENDING)], "name": "student_id_1"},
         {"keys": [("session_id", ASCENDING)], "name": "session_id_1"},

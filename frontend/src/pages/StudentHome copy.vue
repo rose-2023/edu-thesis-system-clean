@@ -5,8 +5,8 @@
       <div class="leftProfile">
         <div class="avatar">
           <img
-            v-if="avatarSrc"
-            :src="avatarSrc"
+            v-if="avatarUrl"
+            :src="avatarUrl"
             alt="avatar"
             class="avatarImg"
           />
@@ -15,7 +15,6 @@
 
         <div class="profileText">
           <div class="hello">你好，{{ studentName }}</div>
-          <div class="level">等級：{{ level }}</div>
         </div>
       </div>
 

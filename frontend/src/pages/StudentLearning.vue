@@ -77,15 +77,32 @@
           </button>
         </div>
 
-        <video
-          ref="player"
-          v-if="selectedVideo"
-          :key="selectedVideoId"
-          class="player"
-          controls
-          :src="selectedVideo.videoUrl"
-        ></video>
+        <div v-if="selectedVideo" class="playerShell">
+          <video
+            ref="player"
+            :key="selectedVideoId"
+            class="player"
+            controls
+            :src="selectedVideo.videoUrl"
+          >
+            <track
+              v-if="subtitleTrackUrl"
+              kind="subtitles"
+              srclang="zh-Hant"
+              label="中文字幕"
+              :src="subtitleTrackUrl"
+            />
+          </video>
+          <div v-if="activeSubtitleText" class="subtitleOverlay">
+            {{ activeSubtitleText }}
+          </div>
+        </div>
         <div v-else class="empty">請從左側選擇影片</div>
+
+        <div v-if="subtitleLoading" class="subtitleStatus">字幕載入中...</div>
+        <div v-else-if="subtitleError" class="subtitleStatus subtitleStatusError">
+          {{ subtitleError }}
+        </div>
 
         <div class="actions">
           <button class="btn" @click="goParsons" :disabled="!selectedVideoId">
@@ -161,6 +178,21 @@ function _bindPlayerWatchEvents() {
   if (_watchBound) return;
   _watchBound = true;
 
+  el.addEventListener("loadedmetadata", () => {
+    updateActiveSubtitle(el.currentTime || 0);
+    syncNativeSubtitleMode();
+  });
+
+  el.addEventListener("webkitbeginfullscreen", () => {
+    isNativeSubtitleFullscreen.value = true;
+    syncNativeSubtitleMode(true);
+  });
+
+  el.addEventListener("webkitendfullscreen", () => {
+    isNativeSubtitleFullscreen.value = false;
+    syncNativeSubtitleMode(false);
+  });
+
   el.addEventListener("play", () => {
     if (!watchStartAt.value) watchStartAt.value = new Date().toISOString();
     // 以目前播放位置作為起點
@@ -190,10 +222,12 @@ function _bindPlayerWatchEvents() {
   // 使用者拖曳進度條（seek）時，不計入「連續觀看」秒數，直接重設起點
   el.addEventListener("seeking", () => {
     _lastVideoTime = el.currentTime;
+    updateActiveSubtitle(el.currentTime || 0);
   });
 
   el.addEventListener("ended", () => {
     reachedEnd.value = true;
+    activeSubtitleText.value = "";
     _lastVideoTime = null;
     if (autoSaveTimer) {
       clearInterval(autoSaveTimer);
@@ -204,6 +238,7 @@ function _bindPlayerWatchEvents() {
   });
 
   el.addEventListener("timeupdate", () => {
+    updateActiveSubtitle(el.currentTime || 0);
     // 1) 累積觀看秒數：以 currentTime 差值為準（更貼近「實際看了幾秒」）
     if (!el.paused) {
       if (_lastVideoTime == null) {
@@ -243,6 +278,12 @@ const selectedVideoId = ref(null);
 
 const currentUnit = ref("");
 const currentTitle = ref("");
+const subtitleCues = ref([]);
+const activeSubtitleText = ref("");
+const subtitleLoading = ref(false);
+const subtitleError = ref("");
+const subtitleTrackUrl = ref("");
+const isNativeSubtitleFullscreen = ref(false);
 
 const player = ref(null);
 
@@ -347,6 +388,152 @@ function groupByUnit(videos) {
   );
 }
 
+function parseSubtitleTime(raw) {
+  const text = String(raw || "").trim().replace(",", ".");
+  const m = text.match(/(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  const sec = Number(m[3]);
+  const ms = Number((m[4] || "0").padEnd(3, "0").slice(0, 3));
+  if (![h, min, sec, ms].every(Number.isFinite)) return null;
+  return h * 3600 + min * 60 + sec + ms / 1000;
+}
+
+function parseSubtitleText(rawText) {
+  const text = String(rawText || "").replace(/\r/g, "").trim();
+  if (!text) return [];
+  return text
+    .split(/\n{2,}/)
+    .map((block) => {
+      const lines = block
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const timeIndex = lines.findIndex((line) => line.includes("-->"));
+      if (timeIndex < 0) return null;
+      const [startRaw, endRaw] = lines[timeIndex].split("-->").map((part) => part.trim());
+      const start = parseSubtitleTime(startRaw);
+      const end = parseSubtitleTime(endRaw);
+      const subtitleText = lines.slice(timeIndex + 1).join("\n").trim();
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !subtitleText) return null;
+      return { start, end, text: subtitleText };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.start - b.start);
+}
+
+function formatVttTime(seconds) {
+  const totalMs = Math.max(0, Math.round(Number(seconds || 0) * 1000));
+  const ms = totalMs % 1000;
+  const totalSec = Math.floor(totalMs / 1000);
+  const sec = totalSec % 60;
+  const totalMin = Math.floor(totalSec / 60);
+  const min = totalMin % 60;
+  const hour = Math.floor(totalMin / 60);
+  const pad = (value, width = 2) => String(value).padStart(width, "0");
+  return `${pad(hour)}:${pad(min)}:${pad(sec)}.${pad(ms, 3)}`;
+}
+
+function buildVttFromCues(cues) {
+  const rows = ["WEBVTT", ""];
+  cues.forEach((cue, index) => {
+    const text = String(cue.text || "").replace(/-->/g, "->").trim();
+    if (!text) return;
+    rows.push(String(index + 1));
+    rows.push(`${formatVttTime(cue.start)} --> ${formatVttTime(cue.end)}`);
+    rows.push(text);
+    rows.push("");
+  });
+  return rows.join("\n");
+}
+
+function clearSubtitleTrackUrl() {
+  if (!subtitleTrackUrl.value) return;
+  try {
+    URL.revokeObjectURL(subtitleTrackUrl.value);
+  } catch (_) {}
+  subtitleTrackUrl.value = "";
+}
+
+function setSubtitleTrack(cues) {
+  clearSubtitleTrackUrl();
+  if (!Array.isArray(cues) || !cues.length) return;
+  const blob = new Blob([buildVttFromCues(cues)], { type: "text/vtt;charset=utf-8" });
+  subtitleTrackUrl.value = URL.createObjectURL(blob);
+  nextTick(() => syncNativeSubtitleMode());
+}
+
+function updateActiveSubtitle(currentTime) {
+  const t = Number(currentTime);
+  if (!Number.isFinite(t) || !subtitleCues.value.length) {
+    activeSubtitleText.value = "";
+    return;
+  }
+  const cue = subtitleCues.value.find((item) => t >= item.start && t <= item.end);
+  activeSubtitleText.value = cue?.text || "";
+}
+
+function isPlayerFullscreen() {
+  const el = player.value;
+  if (!el) return false;
+  return document.fullscreenElement === el
+    || document.webkitFullscreenElement === el
+    || document.mozFullScreenElement === el
+    || document.msFullscreenElement === el;
+}
+
+function syncNativeSubtitleMode(forceVisible = null) {
+  const el = player.value;
+  if (!el?.textTracks?.length) return;
+  const visible = forceVisible === null ? isNativeSubtitleFullscreen.value : Boolean(forceVisible);
+  for (const track of Array.from(el.textTracks)) {
+    track.mode = visible ? "showing" : "hidden";
+  }
+}
+
+function handleFullscreenChange() {
+  isNativeSubtitleFullscreen.value = isPlayerFullscreen();
+  syncNativeSubtitleMode();
+}
+
+async function loadSubtitleForVideo(video) {
+  subtitleCues.value = [];
+  activeSubtitleText.value = "";
+  subtitleError.value = "";
+  isNativeSubtitleFullscreen.value = false;
+  clearSubtitleTrackUrl();
+
+  const vid = videoKey(video);
+  if (!vid) return;
+
+  subtitleLoading.value = true;
+  try {
+    const token = String(localStorage.getItem("token") || "").trim();
+    const headers = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const qs = new URLSearchParams({ video_id: vid });
+    const response = await fetch(`${API_BASE}/api/admin_upload/subtitle/content?${qs.toString()}`, {
+      headers,
+    });
+    if (response.status === 404) return;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const cues = parseSubtitleText(data?.text || "");
+    subtitleCues.value = cues;
+    setSubtitleTrack(cues);
+    if (!cues.length && data?.text) {
+      subtitleError.value = "字幕格式無法顯示，請確認 SRT 時間軸格式。";
+    }
+    updateActiveSubtitle(player.value?.currentTime || 0);
+  } catch (err) {
+    subtitleError.value = "字幕載入失敗，請確認字幕檔已上傳。";
+    console.warn("subtitle load failed", err);
+  } finally {
+    subtitleLoading.value = false;
+  }
+}
+
 function selectVideo(u, v) {
   if (selectedVideoId.value) {
     sendWatchLog("video_leave");
@@ -356,6 +543,7 @@ function selectVideo(u, v) {
   currentUnit.value = u.unit;
   currentTitle.value = v.title;
   resetWatchSession();
+  loadSubtitleForVideo(v);
   sendWatchLog("video_click");
 
   // ✅ 每次切換影片都重新綁定一次監聽（新的 <video> 會重新渲染）
@@ -383,6 +571,20 @@ function relatedTaskIdsForVideo(video = selectedVideo.value) {
 
 function firstRelatedTaskId(video = selectedVideo.value) {
   return relatedTaskIdsForVideo(video)[0] || null;
+}
+
+function videoUnitKey(video) {
+  return _normalizeUnitKey(_normalizeRawUnit(video?.unit || ""));
+}
+
+function routeUnitKey() {
+  const raw = route.params.unit || route.query.unit || route.query.unit_id || "";
+  return _normalizeUnitKey(_normalizeRawUnit(raw));
+}
+
+function filterVideosByUnit(videos, unitKey) {
+  if (!unitKey) return videos;
+  return videos.filter((video) => videoUnitKey(video) === unitKey);
 }
 
 async function logLearningTransition(eventType, extra = {}) {
@@ -564,6 +766,8 @@ async function fetchAllActiveVideos() {
 
 onMounted(async () => {
   await nextTick();
+  document.addEventListener("fullscreenchange", handleFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
   await loadCompletedVideoIds();
 
   // ✅ 注意：影片 <video> 會在選到影片後才出現，所以監聽會在 selectVideo() 裡 nextTick 後綁定
@@ -602,7 +806,7 @@ onMounted(async () => {
     return `${API_BASE}/${s}`;
   }
 
-  const normalized = filtered.map((v) => ({
+  let normalized = filtered.map((v) => ({
     ...v,
     _id: v._id?.$oid || v._id || v.id,
     videoUrl: resolveFileUrl(v.path || v.videoUrl || v.video_path),
@@ -611,6 +815,11 @@ onMounted(async () => {
       "thumbnail"
     ),
   }));
+
+  const initialUnitKey = routeUnitKey();
+  if (initialUnitKey) {
+    normalized = filterVideosByUnit(normalized, initialUnitKey);
+  }
 
   units.value = groupByUnit(normalized);
   // 保險重抓一次完成清單，避免首次請求與列表載入時序造成漏顯示。
@@ -635,6 +844,17 @@ onMounted(async () => {
     }
 
     if (foundU && foundV) {
+      if (!initialUnitKey) {
+        const selectedUnitKey = videoUnitKey(foundV);
+        const sameUnitVideos = filterVideosByUnit(normalized, selectedUnitKey);
+        const narrowedUnits = groupByUnit(sameUnitVideos);
+        if (narrowedUnits.length) {
+          units.value = narrowedUnits;
+          foundU = narrowedUnits[0];
+          foundV = foundU.videos.find((x) => String(x._id) === routeVid) || foundV;
+          openIndex.value = 0;
+        }
+      }
       selectVideo(foundU, foundV);
       await seekToSegment(start, end);
       return;
@@ -707,6 +927,7 @@ async function sendWatchLog(eventType = "video_progress") {
       body: JSON.stringify(payload),
       keepalive: true,
     });
+    if (response.status === 401) return;
     if (response.ok) {
       _lastSentWatchSeconds = watchTotal;
     } else {
@@ -719,6 +940,9 @@ async function sendWatchLog(eventType = "video_progress") {
 }
 
 onBeforeUnmount(() => {
+  document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+  clearSubtitleTrackUrl();
   if (autoSaveTimer) {
     clearInterval(autoSaveTimer);
     autoSaveTimer = null;
@@ -915,6 +1139,7 @@ async function sendWatchToServer() {
   gap: 16px;
   margin-top: 16px;
   align-items: start;
+  min-width: 0;
 }
 
 .unitNav,
@@ -925,6 +1150,11 @@ async function sendWatchToServer() {
   padding: 14px;
   background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 12px 28px rgba(46, 72, 98, 0.08);
+}
+
+.videoArea,
+.unitNav {
+  min-width: 0;
 }
 
 .unitNav {
@@ -1095,12 +1325,61 @@ async function sendWatchToServer() {
   word-break: break-word;
 }
 
+.playerShell {
+  position: relative;
+  width: 100%;
+  background: #000;
+  border-radius: 18px;
+  overflow: hidden;
+}
+
 .player {
   width: 100%;
+  height: auto;
   max-height: 64vh;
   background: #000;
   border-radius: 18px;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  display: block;
+}
+
+.subtitleOverlay {
+  position: absolute;
+  left: 50%;
+  bottom: 58px;
+  transform: translateX(-50%);
+  max-width: min(88%, 860px);
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: clamp(16px, 2.4vw, 25px);
+  font-weight: 800;
+  line-height: 1.55;
+  text-align: center;
+  white-space: pre-line;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  pointer-events: none;
+}
+
+.player::cue {
+  color: #fff;
+  font-size: 35px;
+  font-weight: 800;
+  line-height: 1.5;
+  background: rgba(0, 0, 0, 0.72);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+}
+
+.subtitleStatus {
+  margin-top: 8px;
+  color: #607080;
+  font-size: 13px;
+  text-align: center;
+}
+
+.subtitleStatusError {
+  color: #b45309;
 }
 
 .actions {
@@ -1178,34 +1457,160 @@ async function sendWatchToServer() {
   .unitNav {
     max-height: none;
   }
+
+  .topbar {
+    align-items: flex-start;
+  }
+
+  .topbar-actions {
+    align-self: flex-end;
+  }
 }
 
 @media (max-width: 720px) {
   .page {
-    padding: 12px;
+    padding: 10px;
   }
 
   .topbar {
     flex-direction: column;
     align-items: stretch;
+    gap: 12px;
+    padding: 12px;
   }
 
   .topbar-actions {
     width: 100%;
-    justify-content: flex-end;
+    justify-content: stretch;
+  }
+
+  .topbar-actions .header-btn {
+    flex: 1 1 0;
   }
 
   .title {
     font-size: 18px;
   }
 
+  .subtitle {
+    white-space: normal;
+  }
+
+  .grid {
+    margin-top: 12px;
+    gap: 12px;
+  }
+
+  .unitNav,
+  .videoArea {
+    padding: 12px;
+    border-radius: 16px;
+  }
+
+  .sideHeader {
+    margin-bottom: 10px;
+  }
+
+  .sideTitle {
+    font-size: 16px;
+  }
+
+  .unit-header {
+    padding: 11px 12px;
+  }
+
+  .videoItem {
+    align-items: flex-start;
+  }
+
+  .thumb {
+    width: 64px;
+    height: 40px;
+  }
+
+  .videoHeader {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
   .videoTitleText {
     font-size: 18px;
+  }
+
+  .playerShell {
+    aspect-ratio: 4 / 3;
+  }
+
+  .player {
+    height: 100%;
+    max-height: 56vh;
+    object-fit: contain;
+  }
+
+  .subtitleOverlay {
+    left: 12px;
+    right: 12px;
+    transform: none;
+    max-width: none;
+    font-size: 15px;
+    padding: 7px 10px;
+  }
+
+  .actions {
+    margin-top: 14px;
+  }
+
+  .btn {
+    width: 100%;
   }
 
   .returnBar {
     flex-direction: column;
     align-items: stretch;
+    padding: 11px 12px;
+  }
+
+  .returnText {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 420px) {
+  .topbar-actions {
+    flex-direction: column;
+  }
+
+  .topbar-actions .header-btn {
+    width: 100%;
+  }
+
+  .unit-header,
+  .videoItem,
+  .btn,
+  .returnBtn {
+    border-radius: 12px;
+  }
+
+  .videoTitleText {
+    font-size: 17px;
+  }
+
+  .subtitleOverlay {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 920px) and (orientation: landscape) {
+  .subtitleOverlay {
+    bottom: 10px;
+    font-size: 12px;
+    padding: 6px 9px;
+    max-width: min(92%, 960px);
+  }
+
+  .player::cue {
+    font-size: 22px;
   }
 }
 </style>

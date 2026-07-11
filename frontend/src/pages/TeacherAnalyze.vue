@@ -911,6 +911,15 @@ const timelineEvents = computed(() => {
     "hide_hint",
     "review_open",
     "review_close",
+    "first_error_hint_shown",
+    "ai_hint_modal_open",
+    "review_code_from_hint",
+    "ai_hint_modal_close",
+    "return_to_fix_from_hint",
+    "ai_hint_reopen",
+    "ai_hint_view",
+    "submit_after_hint",
+    "ai_hint_second_request",
     "return_to_task",
   ]);
   return studentLogs.value
@@ -1095,6 +1104,18 @@ const eventTypeLabels = {
   heartbeat: "活躍確認",
 };
 
+Object.assign(eventTypeLabels, {
+  first_error_hint_shown: "首次系統提示",
+  ai_hint_modal_open: "開啟 AI 提示",
+  review_code_from_hint: "回看第一次提示",
+  ai_hint_modal_close: "關閉 AI 提示",
+  return_to_fix_from_hint: "返回題目修正",
+  ai_hint_reopen: "重開 AI 提示",
+  ai_hint_view: "查看 AI 提示",
+  submit_after_hint: "提示後提交",
+  ai_hint_second_request: "查看第二次 AI 提示",
+});
+
 const metadataValueLabels = {
   ai_hint: "AI 提示",
   click_ai_hint: "點擊 AI 提示",
@@ -1203,6 +1224,43 @@ function formatMetadataSummary(row) {
     if (Array.isArray(metadata.error_types)) {
       parts.push(`錯誤類型：${metadata.error_types.length ? metadata.error_types.join("、") : "無"}`);
     }
+  } else if ([
+    "first_error_hint_shown",
+    "ai_hint_modal_open",
+    "review_code_from_hint",
+    "ai_hint_modal_close",
+    "return_to_fix_from_hint",
+    "ai_hint_reopen",
+    "ai_hint_view",
+    "submit_after_hint",
+    "ai_hint_second_request",
+  ].includes(row.event_type)) {
+    const hintId = metadata.hint_id || row.hint_id;
+    const hintNo = metadata.requested_hint_no ?? metadata.hint_no ?? row.requested_hint_no ?? row.hint_no;
+    if (hintId) parts.push(`hint_id：${hintId}`);
+    if (hintNo) parts.push(`第 ${hintNo} 則提示`);
+    const generationCount = metadata.hint_generation_count ?? metadata.ai_hint_generation_count;
+    const viewCount = metadata.hint_view_count ?? metadata.ai_hint_view_count;
+    if (generationCount !== null && generationCount !== undefined) {
+      parts.push(`AI生成：${generationCount} 次`);
+    }
+    if (viewCount !== null && viewCount !== undefined) {
+      parts.push(`查看：${viewCount} 次`);
+    }
+    if (Array.isArray(metadata.error_types) && metadata.error_types.length) {
+      parts.push(`錯誤類型：${metadata.error_types.join("、")}`);
+    }
+    if (Array.isArray(metadata.wrong_slots) && metadata.wrong_slots.length) {
+      parts.push(`錯誤位置：${metadata.wrong_slots.join(", ")}`);
+    }
+    const hintText = compactMetadataText(
+      metadata.hint_content
+      || metadata.hint_text
+      || metadata.ai_hint_2_text
+      || metadata.ai_hint_1_text
+      || metadata.first_system_hint_text
+    );
+    if (hintText) parts.push(`提示：${hintText}`);
   } else if (row.event_type === "view_hint" || row.event_type === "review_open") {
     const hintNo = metadata.hint_click_no ?? metadata.hint_no ?? row.hint_click_no;
     if (hintNo !== null && hintNo !== undefined) {

@@ -89,14 +89,127 @@
       </div>
     </template>
 
+    <div v-if="firstHintPanel.visible" class="first-hint-panel">
+      <div class="first-hint-title">❌ {{ firstHintPanel.headline }}</div>
+      <div class="first-hint-meta">
+        <span>錯誤格數：{{ firstHintPanel.wrongCount }} 格</span>
+        <span>錯誤位置：{{ firstHintPanel.wrongPositionText }}</span>
+        <span>錯誤類型：{{ firstHintPanel.errorTypeText }}</span>
+      </div>
+      <div class="first-hint-text">{{ firstHintPanel.text }}</div>
+    </div>
+
+    <button
+      v-if="showFloatingAiHintButton"
+      class="floating-ai-hint"
+      @click="reopenAiHintFromFloating"
+      type="button"
+    >
+      查看 AI 提示
+    </button>
+
     <!-- 錯誤回饋 Modal（練習模式） -->
     <div
       v-if="feedbackModal.open"
       class="fb-modal-backdrop"
-      @click.self="dismissFeedbackModal"
     >
       <div class="fb-modal" role="dialog" aria-modal="true" aria-label="作答回饋">
-        <template v-if="feedbackModal.stage === 'choice'">
+        <template v-if="feedbackModal.mode === 'ai_hint_flow'">
+          <button
+            class="ai-hint-close-icon"
+            type="button"
+            aria-label="關閉 AI 提示"
+            @click="closeAiHintModal"
+          >
+            ×
+          </button>
+          <div class="fb-title ai-hint-title">💡 AI 提示</div>
+
+          <div class="ai-hint-meta-card">
+            <div v-if="activeAiHintConceptScope" class="ai-hint-meta-row">
+              <span class="ai-hint-meta-label">概念範圍：</span>
+              <span class="ai-hint-meta-value">{{ activeAiHintConceptScope }}</span>
+            </div>
+            <div class="ai-hint-meta-row">
+              <span class="ai-hint-meta-label">提示層級：</span>
+              <span class="ai-hint-meta-value">{{ activeAiHintScopeLabel }}</span>
+            </div>
+          </div>
+
+          <div class="fb-section">
+            <div class="fb-label">AI 提示</div>
+            <div class="fb-text ai-hint-content">
+              {{ activeAiHintText || feedbackModal.hintError || "AI 提示載入中..." }}
+            </div>
+            <div class="fb-note">
+              提示次數：{{ activeAiHintDisplayNo }} / 2
+            </div>
+            <div v-if="feedbackModal.hintError" class="ai-hint-error">
+              {{ feedbackModal.hintError }}
+            </div>
+          </div>
+
+          <div class="fb-actions">
+            <button
+              class="btn ghost"
+              :disabled="feedbackModal.hintLoading || feedbackModal.secondHintLoading"
+              @click="handleAiHintAction"
+            >
+              {{ aiHintActionLabel }}
+            </button>
+            <button class="btn submit" @click="returnToFixFromHint">返回題目修正</button>
+          </div>
+        </template>
+
+        <template v-else-if="feedbackModal.mode === 'first_system_hint'">
+          <div class="fb-title first-error-title">❌ {{ firstHintPanel.headline }}</div>
+
+          <div class="fb-section first-error-section">
+            <div class="fb-label">第一次錯誤提示</div>
+            <div class="first-hint-meta in-modal">
+              <span>錯誤格數：{{ firstHintPanel.wrongCount }} 格</span>
+              <span>錯誤位置：{{ firstHintPanel.wrongPositionText }}</span>
+              <span>錯誤事項：{{ firstHintPanel.errorTypeText }}</span>
+            </div>
+            <div class="fb-text first-error-text">
+              {{ firstHintPanel.text }}
+            </div>
+            <div class="fb-note first-error-note">
+              請先依照紅色標記的位置修正。
+            </div>
+          </div>
+
+          <div class="fb-actions">
+            <button class="btn submit" @click="returnToFixFromFirstHint">返回題目修正</button>
+          </div>
+        </template>
+
+        <template v-else-if="feedbackModal.mode === 'system_recheck'">
+          <div class="fb-title first-error-title">❌ {{ firstHintPanel.headline }}</div>
+
+          <div class="fb-section first-error-section">
+            <div class="fb-label">錯誤提示</div>
+            <div class="first-hint-meta in-modal">
+              <span>錯誤格數：{{ firstHintPanel.wrongCount }} 格</span>
+              <span>錯誤位置：{{ firstHintPanel.wrongPositionText }}</span>
+              <span>錯誤事項：{{ firstHintPanel.errorTypeText }}</span>
+            </div>
+            <div class="fb-text first-error-text">
+              {{ firstHintPanel.text }}
+            </div>
+            <div class="fb-note first-error-note">
+              請先依照紅色標記的位置修正。
+            </div>
+          </div>
+
+          <div class="fb-actions">
+            <button class="btn submit" @click="returnToFixFromSystemRecheck">
+              返回題目修正
+            </button>
+          </div>
+        </template>
+
+        <template v-else-if="feedbackModal.stage === 'choice'">
           <div class="fb-title">❌ 作答有誤</div>
 
           <div class="fb-section">
@@ -187,7 +300,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import { useRoute, useRouter, onBeforeRouteLeave } from "vue-router";
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
 const showReviewVideoFeature = false;
 
@@ -264,11 +377,16 @@ function currentTargetConcept() {
   return tags.length && String(tags[0] || "").trim() ? String(tags[0]).trim() : null;
 }
 
+function authHeaders(base = {}) {
+  const headers = { ...base };
+  const token = String(localStorage.getItem("token") || "").trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 async function logLearningEvent(eventType, extra = {}) {
   if (!studentId.value) return null;
-  const token = String(localStorage.getItem("token") || "").trim();
-  const headers = { "Content-Type": "application/json" };
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const headers = authHeaders({ "Content-Type": "application/json" });
   const body = {
     session_id: learningSessionId,
     student_id: String(studentId.value),
@@ -435,6 +553,11 @@ function indentBoxPx(slotKey, deltaPx) {
   if (next === cur) return false;
 
   slotIndentLevel[k] = next;
+  // 保存最新縮排
+  savePracticeState({
+    task_status: "editing",
+    save_reason: "indent_change",
+  });
   return true;
 }
 
@@ -493,6 +616,7 @@ const state = reactive({
 
 const feedbackModal = reactive({
   open: false,
+  mode: "legacy",
   stage: "choice",
   headline: "",
   locationText: "",
@@ -531,6 +655,15 @@ const feedbackModal = reactive({
   videoClicked: false,
   source: "default",
   aiDiagnosisSummary: "",
+  hintRecord: null,
+  hintId: "",
+  firstSystemHintText: "",
+  aiHint1Text: "",
+  aiHint1Meta: {},
+  aiHint2Text: "",
+  aiHint2Meta: {},
+  activeAiHintNo: 1,
+  secondHintLoading: false,
   firstHint: "",
   secondHint: "",
   possibleCauses: [],
@@ -539,13 +672,118 @@ const feedbackModal = reactive({
   debugText: "",
 });
 
+const firstHintPanel = reactive({
+  visible: false,
+  headline: "",
+  text: "",
+  wrongCount: 0,
+  wrongPositionText: "紅色標記的位置",
+  errorTypeText: "待檢查",
+  hintRecord: null,
+});
+
+const showFloatingAiHintButton = computed(() => {
+  return Boolean(!feedbackModal.open && feedbackModal.hintRecord && feedbackModal.aiHint1Text);
+});
+
+const generatedAiHintCount = computed(() => {
+  const stored = Number(
+    feedbackModal.hintRecord?.hint_generation_count
+    ?? feedbackModal.hintRecord?.ai_hint_generation_count
+    ?? 0
+  );
+  const inferred = (feedbackModal.aiHint1Text ? 1 : 0) + (feedbackModal.aiHint2Text ? 1 : 0);
+  return Math.min(2, inferred || stored);
+});
+
+const activeAiHintText = computed(() => {
+  return feedbackModal.activeAiHintNo === 2
+    ? feedbackModal.aiHint2Text
+    : feedbackModal.aiHint1Text;
+});
+
+function sanitizeHintMeta(meta) {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return {};
+  return { ...meta };
+}
+
+function firstNonEmptyHintMeta(...candidates) {
+  for (const candidate of candidates) {
+    const meta = sanitizeHintMeta(candidate);
+    if (Object.keys(meta).length) return meta;
+  }
+  return {};
+}
+
+const activeAiHintMeta = computed(() => {
+  return feedbackModal.activeAiHintNo === 2
+    ? firstNonEmptyHintMeta(
+        feedbackModal.aiHint2Meta,
+        feedbackModal.hintRecord?.ai_hint_2_meta
+      )
+    : firstNonEmptyHintMeta(
+        feedbackModal.aiHint1Meta,
+        feedbackModal.hintRecord?.ai_hint_1_meta
+      );
+});
+
+const activeAiHintConceptScope = computed(() => {
+  const meta = activeAiHintMeta.value || {};
+  const scopes = Array.isArray(meta.concept_scopes)
+    ? meta.concept_scopes
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    : [];
+  if (scopes.length) {
+    return Array.from(new Set(scopes)).join("、");
+  }
+  return String(meta.concept_scope || meta.concept_label || "").trim();
+});
+
+const activeAiHintScopeLabel = computed(() => {
+  const meta = activeAiHintMeta.value || {};
+  const level = Number(meta.hint_level);
+  const scope = String(meta.scope || "").trim().toLowerCase();
+  if (level === 2 || scope === "narrow") return "聚焦概念提示";
+  return "廣泛概念提示";
+});
+
+function hasHintSubtitleRange(meta) {
+  const range = meta?.subtitle_range && typeof meta.subtitle_range === "object"
+    ? meta.subtitle_range
+    : meta;
+  const start = Number(range?.start);
+  const end = Number(range?.end);
+  return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start;
+}
+
+const activeAiHintDisplayNo = computed(() => {
+  return feedbackModal.activeAiHintNo === 2 ? 2 : 1;
+});
+
+const aiHintActionLabel = computed(() => {
+  if (feedbackModal.secondHintLoading) return "提示產生中...";
+  if (generatedAiHintCount.value < 2 || !feedbackModal.aiHint2Text) return "產生第二次 AI 提示";
+  return feedbackModal.activeAiHintNo === 2
+    ? "查看第一次 AI 提示"
+    : "查看第二次 AI 提示";
+});
+
 const maxHintRetry = 1;
 const maxHintCount = 2;
 const hintRetryUsed = ref(0);
 const isRegeneratingHint = ref(false);
-const hintRemaining = computed(() => Math.max(0, maxHintRetry - hintRetryUsed.value));
+const hintRemaining = computed(() =>
+  Math.max(
+    0,
+    maxHintRetry - hintRetryUsed.value
+  )
+);
 
 function currentHintNo() {
+  if (feedbackModal.mode === "ai_hint_flow") {
+    return feedbackModal.activeAiHintNo === 2 ? 2 : 1;
+  }
   return Math.min(maxHintCount, Math.max(1, Number(hintRetryUsed.value || 0) + 1));
 }
 
@@ -557,9 +795,137 @@ const successModal = reactive({
 });
 
 // ========= localStorage 暫存 =========
-const PRACTICE_STATE_KEY = "parsons_practice_state_v1";
+// 每位學生、每一道題都使用不同 key。
+// 舊版只用一個全域 key，切換到其他題的空白畫面時，會把前一題未完成狀態刪除或覆蓋。
+const PRACTICE_STATE_KEY_PREFIX = "parsons_practice_state_v2";
+const LEGACY_PRACTICE_STATE_KEY = "parsons_practice_state_v1";
 const RESTORE_ONCE_KEY = "parsons_restore_once_v1";
 const RESTORE_MSG_KEY = "parsons_restore_msg_v1";
+
+function practiceStateStorageKey(taskIdValue, studentIdValue = studentId.value) {
+  const taskKey = encodeURIComponent(
+    String(taskIdValue || "").trim()
+  );
+
+  const studentKey = encodeURIComponent(
+    String(studentIdValue || "anonymous").trim() ||
+    "anonymous"
+  );
+
+  if (!taskKey) return "";
+
+  return `${PRACTICE_STATE_KEY_PREFIX}:${studentKey}:${taskKey}`;
+}
+
+function parsePracticeState(raw) {
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object"
+      ? parsed
+      : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readPracticeStateForTask(taskIdValue) {
+  const taskIdText = String(taskIdValue || "").trim();
+  if (!taskIdText) return null;
+
+  const storageKey =
+    practiceStateStorageKey(taskIdText);
+
+  if (!storageKey) return null;
+
+  const currentState = parsePracticeState(
+    localStorage.getItem(storageKey)
+  );
+
+  if (currentState) {
+    return currentState;
+  }
+
+  // 相容舊版：若舊全域資料剛好屬於目前這一題，
+  // 搬移到新的 per-task key，避免使用者更新程式後遺失未完成作答。
+  const legacyState = parsePracticeState(
+    localStorage.getItem(
+      LEGACY_PRACTICE_STATE_KEY
+    )
+  );
+
+  if (!legacyState) return null;
+
+  const legacyTaskId = String(
+    legacyState?.task_id || ""
+  ).trim();
+
+  const legacyStudentId = String(
+    legacyState?.student_id || ""
+  ).trim();
+
+  const currentStudentId = String(
+    studentId.value || ""
+  ).trim();
+
+  const sameTask =
+    legacyTaskId === taskIdText;
+
+  const sameStudent =
+    !legacyStudentId ||
+    !currentStudentId ||
+    legacyStudentId === currentStudentId;
+
+  if (!sameTask || !sameStudent) {
+    return null;
+  }
+
+  localStorage.setItem(
+    storageKey,
+    JSON.stringify(legacyState)
+  );
+
+  localStorage.removeItem(
+    LEGACY_PRACTICE_STATE_KEY
+  );
+
+  return legacyState;
+}
+
+// 每題作答狀態保存
+function clearPracticeStateForTask(taskIdValue) {
+  const taskIdText = String(taskIdValue || "").trim();
+  if (!taskIdText) return;
+
+  const storageKey =
+    practiceStateStorageKey(taskIdText);
+
+  if (storageKey) {
+    localStorage.removeItem(storageKey);
+  }
+
+  // 只清除此題可能殘留的舊版全域資料，
+  // 不可清除其他題的未完成狀態。
+  const legacyState = parsePracticeState(
+    localStorage.getItem(
+      LEGACY_PRACTICE_STATE_KEY
+    )
+  );
+
+  if (
+    legacyState &&
+    String(legacyState?.task_id || "").trim()
+      === taskIdText
+  ) {
+    localStorage.removeItem(
+      LEGACY_PRACTICE_STATE_KEY
+    );
+  }
+
+  localStorage.removeItem(RESTORE_ONCE_KEY);
+  localStorage.removeItem(RESTORE_MSG_KEY);
+}
 
 function resetFilled() {
   for (const k of Object.keys(filled)) delete filled[k];
@@ -567,6 +933,8 @@ function resetFilled() {
   primaryWrongIndex.value = null;
   result.value = null;
   state.err = "";
+  feedbackModal.aiHint1Meta = {};
+  feedbackModal.aiHint2Meta = {};
 
   for (const k of Object.keys(slotIndentLevel)) delete slotIndentLevel[k];
   activeSlotKey.value = null;
@@ -643,23 +1011,46 @@ function onDrop(slotKey) {
     delete filled[payload.fromSlotKey];
   }
 
-  filled[slotKey] = normalizeFilledBlock(payload.block);
+  filled[String(slotKey)] = normalizeFilledBlock(payload.block);
+
   setActiveSlotKey(slotKey);
   dragging.value = null;
+
+  // 拖曳完成後保存目前排列，未送出就離開也能恢復。
+  savePracticeState({
+    task_status: "editing",
+    save_reason: "drop",
+  });
 }
 
 function removeFromSlot(slotKey) {
   if (slotKey == null) return;
+
   delete filled[String(slotKey)];
 
-  const idx = templateSlots.value.findIndex(s => String(s.slot) === String(slotKey));
+  const idx = templateSlots.value.findIndex(
+    (slot) => String(slot.slot) === String(slotKey)
+  );
+
   if (idx >= 0) {
-    wrongIndices.value = (wrongIndices.value || []).filter(i => i !== idx);
+    wrongIndices.value = (wrongIndices.value || []).filter(
+      (wrongIndex) => Number(wrongIndex) !== Number(idx)
+    );
   }
 
   delete slotIndentLevel[String(slotKey)];
-  if (String(activeSlotKey.value || "") === String(slotKey)) activeSlotKey.value = null;
+
+  if (String(activeSlotKey.value || "") === String(slotKey)) {
+    activeSlotKey.value = null;
+  }
+
   applyIndentStylesToDOM();
+
+  // 移除片段後也更新暫存，避免回來又出現已刪除的舊片段。
+  savePracticeState({
+    task_status: "editing",
+    save_reason: "remove_block",
+  });
 }
 
 const answer_ids = computed(() => {
@@ -1252,6 +1643,7 @@ function openFeedbackModal(r, taskId) {
   const parts = buildWrongFeedbackParts(r || {});
   primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
   feedbackModal.open = true;
+  feedbackModal.mode = "legacy";
   feedbackModal.stage = "detail";
   feedbackModal.headline = buildFeedbackHeadline(parts);
   feedbackModal.locationText = buildFeedbackLocation(parts);
@@ -1265,6 +1657,15 @@ function openFeedbackModal(r, taskId) {
   feedbackModal.source = String(parts.source || "default");
   feedbackModal.firstHint = String(parts.firstHint || "");
   feedbackModal.secondHint = String(parts.secondHint || "");
+  feedbackModal.hintRecord = null;
+  feedbackModal.hintId = "";
+  feedbackModal.firstSystemHintText = "";
+  // 第一次、第二次提示切換
+  feedbackModal.aiHint1Text = "";  // 第一次提示文字
+  feedbackModal.aiHint1Meta = {};
+  feedbackModal.aiHint2Text = "";  // 第二次提示文字
+  feedbackModal.aiHint2Meta = {};
+  feedbackModal.secondHintLoading = false;
   feedbackModal.possibleCauses = Array.isArray(parts.possibleCauses) ? parts.possibleCauses : [];
   feedbackModal.actualText = String(parts.actualText || "");
   feedbackModal.expectedText = String(parts.expectedText || "");
@@ -1328,6 +1729,517 @@ function openFeedbackModal(r, taskId) {
   });
 }
 
+function applyHintRecordToFeedbackModal(record = {}, extra = {}) {
+  const hintRecord = (record && typeof record === "object") ? record : {};
+  const requestedHintNo = Number(extra.requested_hint_no || 1) === 2 ? 2 : 1;
+  feedbackModal.hintRecord = hintRecord;
+  feedbackModal.hintId = String(hintRecord.hint_id || "");
+  feedbackModal.attemptId = String(hintRecord.last_attempt_id || feedbackModal.attemptId || "");
+  feedbackModal.taskId = String(hintRecord.task_id || feedbackModal.taskId || currentTaskId() || "");
+  feedbackModal.firstSystemHintText = String(
+    hintRecord.first_system_hint_text
+    || extra.first_system_hint_text
+    || ""
+  );
+  feedbackModal.aiHint1Text = String(
+    hintRecord.ai_hint_1_text
+    || extra.ai_hint_1_text
+    || (requestedHintNo === 1 ? extra.hint : "")
+    || ""
+  );
+  feedbackModal.aiHint2Text = String(
+    hintRecord.ai_hint_2_text
+    || extra.ai_hint_2_text
+    || (requestedHintNo === 2 ? extra.hint : "")
+    || ""
+  );
+  const nextHint1Meta = firstNonEmptyHintMeta(
+    hintRecord.ai_hint_1_meta
+    , extra.ai_hint_1_meta
+    , requestedHintNo === 1 ? extra.hint_meta : null
+  );
+  const nextHint2Meta = firstNonEmptyHintMeta(
+    hintRecord.ai_hint_2_meta
+    , extra.ai_hint_2_meta
+    , requestedHintNo === 2 ? extra.hint_meta : null
+  );
+  feedbackModal.aiHint1Meta = Object.keys(nextHint1Meta).length
+    ? nextHint1Meta
+    : sanitizeHintMeta(feedbackModal.aiHint1Meta);
+  feedbackModal.aiHint2Meta = Object.keys(nextHint2Meta).length
+    ? nextHint2Meta
+    : sanitizeHintMeta(feedbackModal.aiHint2Meta);
+  feedbackModal.source = String(extra.source || feedbackModal.source || "default");
+  feedbackModal.hintQuestion = activeAiHintText.value || feedbackModal.aiHint1Text || String(extra.hint || "");
+  feedbackModal.hintLoaded = Boolean(feedbackModal.aiHint1Text);
+  feedbackModal.hintLoading = false;
+  feedbackModal.hintError = "";
+}
+
+function normalizeWrongPositions(list) {
+  if (!Array.isArray(list)) return [];
+
+  return Array.from(
+    new Set(
+      list
+        .map((item) => Number(item))
+        .filter(
+          (number) =>
+            Number.isFinite(number)
+            && number >= 0
+        )
+    )
+  ).sort((a, b) => a - b);
+}
+
+function firstNonEmptyWrongPositions(...candidates) {
+  for (const candidate of candidates) {
+    const positions = normalizeWrongPositions(candidate);
+
+    if (positions.length > 0) {
+      return positions;
+    }
+  }
+
+  return [];
+}
+
+// 第一次系統提示使用第一次送出的錯誤快照
+function collectFirstWrongPositions(
+  r = {},
+  flow = {},
+  record = {}
+) {
+  return firstNonEmptyWrongPositions(
+    flow.first_error_positions,
+    record.first_error_positions,
+    r.incorrect_slots,
+    r.wrong_slots,
+    r.wrong_indices_all,
+    r.wrong_indices,
+    r.indent_errors,
+    r.wrong_index != null
+      ? [r.wrong_index]
+      : []
+  );
+}
+
+// 第二次 AI 提示使用第二次當下的錯誤位置
+function collectSecondWrongPositions(
+  r = {},
+  flow = {},
+  record = {}
+) {
+  return firstNonEmptyWrongPositions(
+    flow.second_error_positions,
+    record.second_error_positions,
+    r.incorrect_slots,
+    r.wrong_slots,
+    r.wrong_indices_all,
+    r.wrong_indices,
+    r.indent_errors,
+    r.wrong_index != null
+      ? [r.wrong_index]
+      : []
+  );
+}
+
+// 每一次送出後，畫面紅色標記使用本次最新結果
+function collectCurrentWrongPositions(r = {}) {
+  return firstNonEmptyWrongPositions(
+    r.incorrect_slots,
+    r.wrong_slots,
+    r.wrong_indices_all,
+    r.wrong_indices,
+    r.indent_errors,
+    r.wrong_index != null
+      ? [r.wrong_index]
+      : []
+  );
+}
+function formatWrongPositionText(positions = []) {
+  if (!Array.isArray(positions) || !positions.length) return "紅色標記的位置";
+  return positions.map((idx) => `第 ${Number(idx) + 1} 格`).join("、");
+}
+
+function formatErrorTypeText(types = [], fallback = "") {
+  const labels = {
+    sequence_error: "結構順序錯誤",
+    indentation_error: "縮排錯誤",
+    structure_error: "結構順序錯誤",
+    branch_error: "if-else 結構錯誤",
+    logic_error: "邏輯錯誤",
+  };
+  const list = Array.isArray(types) ? types : [];
+  const mapped = list
+    .map((item) => labels[String(item || "").trim()] || String(item || "").trim())
+    .filter(Boolean);
+  if (mapped.length) return Array.from(new Set(mapped)).join("、");
+  return fallback || "待檢查";
+}
+
+function showFirstSystemHint(r, taskId) {
+  openFeedbackModal(r, taskId);
+  const parts = buildWrongFeedbackParts(r || {});
+  const flow = (r?.hint_flow && typeof r.hint_flow === "object") ? r.hint_flow : {};
+  const record = (flow.hint_record && typeof flow.hint_record === "object") ? flow.hint_record : {};
+  const positions = collectFirstWrongPositions(
+  r || {},
+  flow,
+  record
+);
+  if (positions.length) {
+    wrongIndices.value = positions;
+  }
+  primaryWrongIndex.value = parts.focusIndex != null
+    ? Number(parts.focusIndex)
+    : (positions.length ? positions[0] : null);
+  const errorTypes = Array.isArray(flow.first_error_types)
+    ? flow.first_error_types
+    : (Array.isArray(record.first_error_types) ? record.first_error_types : []);
+  const text = String(
+    flow.first_system_hint_text
+    || record.first_system_hint_text
+    || "請先檢查紅色標記的位置，重新確認程式區塊的順序或結構。"
+  );
+  feedbackModal.mode = "first_system_hint";
+  feedbackModal.open = true;
+  feedbackModal.stage = "detail";
+  feedbackModal.hintOpen = false;
+  firstHintPanel.visible = false;
+  firstHintPanel.text = text;
+  firstHintPanel.wrongCount = positions.length || Number(r?.error_count || 0) || wrongIndices.value.length || 0;
+  firstHintPanel.headline = `第一次作答結果：共有 ${firstHintPanel.wrongCount} 格錯誤`;
+  firstHintPanel.wrongPositionText = formatWrongPositionText(positions.length ? positions : wrongIndices.value);
+  firstHintPanel.errorTypeText = formatErrorTypeText(errorTypes, parts.diagnosis);
+  firstHintPanel.hintRecord = record;
+  feedbackModal.hintRecord = record;
+  feedbackModal.hintId = String(record.hint_id || "");
+  feedbackModal.taskId = String(taskId || "");
+  feedbackModal.attemptId = String(r?.attempt_id || "");
+  feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
+  feedbackModal.attemptNo = Number.isFinite(Number(r?.attempt_no)) ? Number(r.attempt_no) : null;
+  feedbackModal.targetConcept = String(r?.target_concept || currentTargetConcept() || "");
+}
+
+
+function showSystemRecheck(r, taskId) {
+  openFeedbackModal(r, taskId);
+
+  const flow =
+    r?.hint_flow && typeof r.hint_flow === "object"
+      ? r.hint_flow
+      : {};
+
+  const record =
+    flow.hint_record && typeof flow.hint_record === "object"
+      ? flow.hint_record
+      : {};
+
+  const positions = firstNonEmptyWrongPositions(
+    flow.current_error_positions,
+    r?.incorrect_slots,
+    r?.wrong_slots,
+    r?.wrong_indices_all,
+    r?.wrong_indices,
+    r?.indent_errors,
+    r?.wrong_index != null ? [r.wrong_index] : []
+  );
+
+  wrongIndices.value = positions;
+  primaryWrongIndex.value =
+    positions.length > 0
+      ? positions[0]
+      : null;
+
+  const errorTypes = Array.isArray(flow.current_error_types)
+    ? flow.current_error_types
+    : (Array.isArray(r?.error_types) ? r.error_types : []);
+
+  const attemptNo = Number(r?.attempt_no || 0);
+  const wrongCount = Number(
+    flow.current_error_count
+    ?? r?.error_count
+    ?? positions.length
+  );
+
+  firstHintPanel.visible = false;
+  firstHintPanel.wrongCount =
+    Number.isFinite(wrongCount)
+      ? wrongCount
+      : positions.length;
+  firstHintPanel.headline =
+    `作答結果：共有 ${firstHintPanel.wrongCount} 格錯誤`;
+  firstHintPanel.wrongPositionText =
+    formatWrongPositionText(positions);
+  firstHintPanel.errorTypeText =
+    formatErrorTypeText(errorTypes, "待調整");
+  firstHintPanel.text = String(
+    flow.current_system_feedback_text
+    || "請先檢查紅色標記的位置，重新確認程式區塊的順序或結構。"
+  );
+  firstHintPanel.hintRecord = record;
+
+  feedbackModal.mode = "system_recheck";
+  feedbackModal.open = true;
+  feedbackModal.stage = "detail";
+  feedbackModal.hintOpen = false;
+  feedbackModal.taskId = String(taskId || "");
+  feedbackModal.attemptId = String(r?.attempt_id || "");
+  feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
+  feedbackModal.attemptNo = Number.isFinite(attemptNo)
+    ? attemptNo
+    : null;
+  feedbackModal.targetConcept = String(
+    r?.target_concept
+    || currentTargetConcept()
+    || ""
+  );
+
+  applyHintRecordToFeedbackModal(record, {});
+  feedbackModal.mode = "system_recheck";
+  feedbackModal.open = true;
+  feedbackModal.hintOpen = false;
+}
+
+function openAiHintModalFromFlow(r, taskId) {
+  openFeedbackModal(r, taskId);
+
+  const flow =
+    r?.hint_flow && typeof r.hint_flow === "object"
+      ? r.hint_flow
+      : {};
+
+  const record =
+    flow.hint_record && typeof flow.hint_record === "object"
+      ? flow.hint_record
+      : {};
+
+  // 第二次 AI 提示只使用第二次作答的錯誤位置，
+  // 不可以再合併第一次錯誤位置。
+  const positions = collectSecondWrongPositions(
+    r || {},
+    flow,
+    record
+  );
+
+  wrongIndices.value = positions;
+  primaryWrongIndex.value =
+    positions.length > 0
+      ? positions[0]
+      : null;
+
+  feedbackModal.mode = "ai_hint_flow";
+  feedbackModal.open = true;
+  feedbackModal.stage = "detail";
+  feedbackModal.hintOpen = true;
+  feedbackModal.hintLoaded = true;
+  feedbackModal.source = String(
+    flow.source || "parsons_hint_records"
+  );
+
+  feedbackModal.aiDiagnosisSummary = String(
+    flow.ai_diagnosis_summary
+    || feedbackModal.diagnosis
+    || ""
+  );
+
+  applyHintRecordToFeedbackModal(record, {
+    hint: flow.hint,
+    hint_meta: flow.hint_meta,
+    requested_hint_no: 1,
+    ai_feedback_detail: flow.ai_feedback_detail,
+    ai_diagnosis_summary: flow.ai_diagnosis_summary,
+    source: flow.source,
+  });
+
+  if (
+    flow.ai_feedback_detail
+    && typeof flow.ai_feedback_detail === "object"
+  ) {
+    applyAiHintToFeedbackModal({
+      source: flow.source || "parsons_hint_records",
+      hint: flow.hint,
+      ai_feedback_detail: flow.ai_feedback_detail,
+      ai_diagnosis_summary: flow.ai_diagnosis_summary,
+    });
+
+    applyHintRecordToFeedbackModal(record, {
+      hint: flow.hint,
+      hint_meta: flow.hint_meta,
+      requested_hint_no: 1,
+      source: flow.source,
+    });
+  }
+
+  firstHintPanel.visible = false;
+  // 目前顯示哪一組，由activeAiHintNo控制
+  feedbackModal.activeAiHintNo = 1;
+
+  if (feedbackModal.attemptId) {
+    feedbackModal.hintLoading = true;
+    feedbackModal.hintError = "";
+
+    fetchHintRecord(1, {
+      trigger_method: "auto_second_wrong",
+      button_name: "AI 提示",
+    })
+      .catch((err) => {
+        feedbackModal.hintError =
+          err?.message || "AI 提示載入失敗";
+      })
+      .finally(() => {
+        feedbackModal.hintLoading = false;
+      });
+  }
+}
+
+async function fetchHintRecord(requestedHintNo, extra = {}) {
+  if (!feedbackModal.attemptId) return null;
+  const normalizedHintNo = Number(requestedHintNo) === 2 ? 2 : 1;
+  const res = await fetch(`${API_BASE}/api/parsons/hint`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      session_id: learningSessionId,
+      page: "parsons",
+      activity_type: isTestMode.value ? "test" : "practice",
+      test_role: isTestMode.value ? String(testRole.value || "") : null,
+      attempt_id: feedbackModal.attemptId,
+      attempt_v2_id: feedbackModal.attemptV2Id || null,
+      attempt_no: feedbackModal.attemptNo,
+      task_id: feedbackModal.taskId || currentTaskId(),
+      target_concept: feedbackModal.targetConcept || currentTargetConcept(),
+      requested_hint_no: normalizedHintNo,
+      ...extra,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    if (data?.hint_record) applyHintRecordToFeedbackModal(data.hint_record);
+    throw new Error(data?.message || "AI 提示載入失敗");
+  }
+  feedbackModal.activeAiHintNo = normalizedHintNo;
+  applyHintRecordToFeedbackModal(data.hint_record, {
+    hint: data.hint,
+    hint_meta: data.hint_meta,
+    requested_hint_no: normalizedHintNo,
+    ai_feedback_detail: data.ai_feedback_detail,
+    ai_diagnosis_summary: data.ai_diagnosis_summary,
+    source: data.source,
+  });
+  if (normalizedHintNo === 2 && !feedbackModal.aiHint2Text) {
+    throw new Error("第二次 AI 提示產生失敗，請稍後再試。");
+  }
+  return data;
+}
+
+// 「產生第二次 AI 提示」與已保存提示切換
+async function handleAiHintAction() {
+  if (feedbackModal.hintLoading || feedbackModal.secondHintLoading) return;
+  if (generatedAiHintCount.value < 2 || !feedbackModal.aiHint2Text) {
+    try {
+      feedbackModal.secondHintLoading = true;
+      await fetchHintRecord(2, {
+        trigger_method: "generate_second_ai_hint",
+        button_name: "產生第二次 AI 提示",
+      });
+      feedbackModal.activeAiHintNo = 2;
+    } catch (err) {
+      feedbackModal.hintError = err?.message || "第二次 AI 提示產生失敗";
+    } finally {
+      feedbackModal.secondHintLoading = false;
+    }
+    return;
+  }
+  feedbackModal.activeAiHintNo = feedbackModal.activeAiHintNo === 2 ? 1 : 2;
+}
+
+async function reviewFirstHintFromModal() {
+  firstHintPanel.visible = true;
+  firstHintPanel.headline = feedbackModal.headline || "第一次系統提示";
+  firstHintPanel.text = feedbackModal.firstSystemHintText || "請先檢查紅色標記的位置，重新確認程式區塊的順序或結構。";
+  await logLearningEvent("review_code_from_hint", feedbackLearningContext(currentHintMetadata({
+    trigger_method: "click_review_first_hint",
+    button_name: "回看第一次提示",
+  })));
+}
+
+async function closeAiHintModal() {
+  await logLearningEvent("ai_hint_modal_close", feedbackLearningContext(currentHintMetadata({
+    close_method: "click_x_icon",
+    button_name: "X",
+  })));
+  feedbackModal.open = false;
+}
+
+async function returnToFixFromHint() {
+  await logLearningEvent("return_to_fix_from_hint", feedbackLearningContext(currentHintMetadata({
+    return_method: "click_return_to_fix",
+    button_name: "返回題目修正",
+  })));
+  feedbackModal.open = false;
+}
+
+async function returnToFixFromFirstHint() {
+  await logLearningEvent("return_to_task", {
+    task_id: feedbackModal.taskId || currentTaskId(),
+    attempt_id: feedbackModal.attemptV2Id || null,
+    attempt_no: feedbackModal.attemptNo,
+    target_concept: feedbackModal.targetConcept || currentTargetConcept(),
+    metadata: {
+      return_method: "first_error_hint_modal",
+      wrong_slots: Array.isArray(wrongIndices.value)
+        ? wrongIndices.value.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+        : [],
+      error_type: feedbackModal.errorClass || null,
+      error_text: firstHintPanel.errorTypeText,
+    },
+  });
+  feedbackModal.open = false;
+  feedbackModal.mode = "legacy";
+}
+
+async function returnToFixFromSystemRecheck() {
+  await logLearningEvent("return_to_task", {
+    task_id: feedbackModal.taskId || currentTaskId(),
+    attempt_id: feedbackModal.attemptV2Id || null,
+    attempt_no: feedbackModal.attemptNo,
+    target_concept: feedbackModal.targetConcept || currentTargetConcept(),
+    metadata: {
+      return_method: "system_recheck_modal",
+      wrong_slots: Array.isArray(wrongIndices.value)
+        ? wrongIndices.value
+            .map((value) => Number(value))
+            .filter((value) => Number.isFinite(value))
+        : [],
+      error_text: firstHintPanel.errorTypeText,
+    },
+  });
+  feedbackModal.open = false;
+  feedbackModal.mode = "legacy";
+}
+
+async function reopenAiHintFromFloating() {
+  if (feedbackModal.attemptId) {
+    try {
+      // 提示 API 會自動判斷要回傳第一次或第二次提示，這裡不需要指定 requested_hint_no
+      await fetchHintRecord(1, {
+        trigger_method: "click_floating_ai_hint",
+        button_name: "查看 AI 提示",
+      });
+    } catch (err) {
+      feedbackModal.hintError = err?.message || "AI 提示載入失敗";
+    }
+  }
+  feedbackModal.mode = "ai_hint_flow";
+  feedbackModal.open = true;
+  feedbackModal.stage = "detail";
+  feedbackModal.hintOpen = true;
+  feedbackModal.activeAiHintNo = 1;
+  firstHintPanel.visible = false;
+}
+
 function applyAiHintToFeedbackModal(data = {}) {
   const detail = (data?.ai_feedback_detail && typeof data.ai_feedback_detail === "object")
     ? data.ai_feedback_detail
@@ -1344,6 +2256,15 @@ function applyAiHintToFeedbackModal(data = {}) {
   feedbackModal.conceptHint = String(detail?.concept_hint || detail?.concept_explanation || feedbackModal.conceptHint || "");
   feedbackModal.firstHint = String(detail?.first_hint || data?.hint || feedbackModal.firstHint || "");
   feedbackModal.secondHint = String(detail?.second_hint || feedbackModal.secondHint || "");
+  const requestedHintNo = Number(data?.requested_hint_no || feedbackModal.activeAiHintNo || 1) === 2 ? 2 : 1;
+  const nextMeta = sanitizeHintMeta(data?.hint_meta);
+  if (Object.keys(nextMeta).length) {
+    if (requestedHintNo === 2) {
+      feedbackModal.aiHint2Meta = nextMeta;
+    } else {
+      feedbackModal.aiHint1Meta = nextMeta;
+    }
+  }
   feedbackModal.possibleCauses = Array.isArray(detail?.possible_causes) ? detail.possible_causes : feedbackModal.possibleCauses;
   feedbackModal.reflectionQuestions = Array.isArray(detail?.reflection_questions) ? detail.reflection_questions : feedbackModal.reflectionQuestions;
   feedbackModal.impactHint = String(detail?.impact || feedbackModal.impactHint || "");
@@ -1378,7 +2299,7 @@ async function loadAiHintForModal() {
   try {
     const res = await fetch(`${API_BASE}/api/parsons/hint`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         attempt_id: feedbackModal.attemptId,
         task_id: feedbackModal.taskId,
@@ -1419,11 +2340,22 @@ function currentHintMetadata(extra = {}) {
   const detail = (aiFeedbackDetail.value && typeof aiFeedbackDetail.value === "object")
     ? aiFeedbackDetail.value
     : {};
+  const safeAiFeedbackDetail = { ...detail };
+  delete safeAiFeedbackDetail.subtitle_excerpt;
+  delete safeAiFeedbackDetail.subtitle_scope;
   const hintNo = Number.isFinite(Number(extra.hint_no))
     ? Number(extra.hint_no)
     : currentHintNo();
+  const hintMeta = activeAiHintMeta.value || {};
+  const subtitleRange = hintMeta.subtitle_range && typeof hintMeta.subtitle_range === "object"
+    ? hintMeta.subtitle_range
+    : {};
   return {
     review_type: "ai_hint",
+    hint_id: feedbackModal.hintId || feedbackModal.hintRecord?.hint_id || null,
+    requested_hint_no: Number.isFinite(Number(extra.requested_hint_no))
+      ? Number(extra.requested_hint_no)
+      : hintNo,
     hint_no: hintNo,
     hint_click_no: hintNo,
     max_hint_count: maxHintCount,
@@ -1431,17 +2363,40 @@ function currentHintMetadata(extra = {}) {
     unit_id: currentUnitId(),
     question_type: "parsons",
     hint_type: "ai_hint",
-    hint_text: String(feedbackModal.hintQuestion || "").trim(),
-    hint_content: String(feedbackModal.hintQuestion || "").trim(),
-    hint_source: feedbackModal.source || "unknown",
+    hint_generation_count: Number(feedbackModal.hintRecord?.hint_generation_count ?? feedbackModal.hintRecord?.ai_hint_generation_count ?? 0),
+    hint_view_count: Number(feedbackModal.hintRecord?.hint_view_count ?? feedbackModal.hintRecord?.ai_hint_view_count ?? 0),
+    ai_hint_generation_count: Number(feedbackModal.hintRecord?.ai_hint_generation_count ?? feedbackModal.hintRecord?.hint_generation_count ?? 0),
+    ai_hint_view_count: Number(feedbackModal.hintRecord?.ai_hint_view_count ?? feedbackModal.hintRecord?.hint_view_count ?? 0),
+    first_system_hint_text: feedbackModal.firstSystemHintText || feedbackModal.hintRecord?.first_system_hint_text || "",
+    ai_hint_1_text: feedbackModal.aiHint1Text || feedbackModal.hintRecord?.ai_hint_1_text || "",
+    ai_hint_2_text: feedbackModal.aiHint2Text || feedbackModal.hintRecord?.ai_hint_2_text || "",
+    ai_hint_1_meta: sanitizeHintMeta(feedbackModal.aiHint1Meta || feedbackModal.hintRecord?.ai_hint_1_meta),
+    ai_hint_2_meta: sanitizeHintMeta(feedbackModal.aiHint2Meta || feedbackModal.hintRecord?.ai_hint_2_meta),
+    hint_text: String(activeAiHintText.value || feedbackModal.hintQuestion || "").trim(),
+    hint_content: String(activeAiHintText.value || feedbackModal.hintQuestion || "").trim(),
+    hint_level: hintMeta.hint_level ?? null,
+    scope: hintMeta.scope || "",
+    concept_tag: hintMeta.concept_tag || "",
+    concept_scope: hintMeta.concept_scope || "",
+    wrong_index: hintMeta.wrong_index ?? null,
+    subtitle_range: subtitleRange,
+    subtitle_range_available: hasHintSubtitleRange(hintMeta),
+    answer_leakage_check: hintMeta.answer_leakage_check || "",
+    hint_source: hintMeta.hint_source || feedbackModal.source || "unknown",
     hint_loaded: Boolean(feedbackModal.hintLoaded),
     hint_error: feedbackModal.hintError || "",
     hint_retry_count: hintRetryUsed.value,
     error_type: feedbackModal.errorClass || null,
+    error_types: Array.isArray(extra.error_types)
+      ? extra.error_types
+      : (Array.isArray(result.value?.error_types) ? result.value.error_types : []),
+    repeated_error: typeof extra.repeated_error === "boolean"
+      ? extra.repeated_error
+      : Boolean(result.value?.repeated_error),
     wrong_slots: Array.isArray(wrongIndices.value)
       ? wrongIndices.value.map((v) => Number(v)).filter((v) => Number.isFinite(v))
       : [],
-    ai_feedback_detail: detail,
+    ai_feedback_detail: safeAiFeedbackDetail,
     ai_diagnosis_summary: feedbackModal.aiDiagnosisSummary || feedbackModal.diagnosis || "",
     concept_hint: feedbackModal.conceptHint || "",
     first_hint: feedbackModal.firstHint || "",
@@ -1501,6 +2456,13 @@ async function closeHintAndReturnToTask(closeMethod) {
 }
 
 async function dismissFeedbackModal() {
+  if (feedbackModal.mode === "ai_hint_flow") {
+    await logLearningEvent("ai_hint_modal_close", feedbackLearningContext(currentHintMetadata({
+      close_method: "click_blank_area",
+    })));
+    feedbackModal.open = false;
+    return;
+  }
   const hadOpenHint = feedbackModal.hintOpen;
   const learningContext = feedbackLearningContext(currentHintMetadata({
     close_method: "click_blank_area",
@@ -1513,6 +2475,7 @@ async function dismissFeedbackModal() {
     await sendChoice(feedbackModal.attemptId, "no");
   }
   feedbackModal.open = false;
+  feedbackModal.mode = "legacy";
   feedbackModal.stage = "choice";
   feedbackModal.hintOpen = false;
   feedbackModal.hintLoading = false;
@@ -1529,6 +2492,14 @@ async function dismissFeedbackModal() {
   feedbackModal.debugText = "";
   feedbackModal.source = "default";
   feedbackModal.aiDiagnosisSummary = "";
+  feedbackModal.hintRecord = null;
+  feedbackModal.hintId = "";
+  feedbackModal.firstSystemHintText = "";
+  feedbackModal.aiHint1Text = "";
+  feedbackModal.aiHint1Meta = {};
+  feedbackModal.aiHint2Text = "";
+  feedbackModal.aiHint2Meta = {};
+  feedbackModal.secondHintLoading = false;
   feedbackModal.errorClass = "";
   feedbackModal.reviewMode = "subtitle_alignment";
   feedbackModal.subtitleHealth = null;
@@ -1670,25 +2641,166 @@ async function sendChoice(attempt_id, choice, extra = {}) {
   } catch (_) {}
 }
 
+// 每題作答狀態保存
 function savePracticeState(extra = {}) {
   try {
+    // 前測、後測不使用本機作答恢復
+    if (isTestMode.value) return;
+
+    const taskId =
+      task.value?.task_id ||
+      task.value?._id ||
+      "";
+
+    if (!taskId) return;
+    if (!(templateSlots.value || []).length) return;
+
+    const storageKey =
+      practiceStateStorageKey(taskId);
+
+    if (!storageKey) return;
+
+    const {
+      force = false,
+      ...safeExtra
+    } = extra || {};
+
+    // 先讀取「目前這一題」自己的狀態。
+    // 不再讀取其他題共用的全域 key。
+    const previousState =
+      readPracticeStateForTask(taskId) || {};
+
+    // 保存每個格子目前放入的 block id。
+    const filledMap = (templateSlots.value || []).map(
+      (slot) =>
+        filled[String(slot.slot)]?.id ||
+        null
+    );
+
+    const filledBySlot = {};
+    const filledBlockSnapshots = {};
+
+    for (const slot of (templateSlots.value || [])) {
+      const slotKey = String(slot?.slot ?? "");
+      if (!slotKey) continue;
+
+      const block = filled[slotKey];
+      if (!block?.id) continue;
+
+      filledBySlot[slotKey] = String(block.id);
+      filledBlockSnapshots[slotKey] = JSON.parse(
+        JSON.stringify(block)
+      );
+    }
+
+    const indentMap = JSON.parse(
+      JSON.stringify(slotIndentLevel || {})
+    );
+
+    const currentWrongIndices =
+      Array.isArray(wrongIndices.value)
+        ? wrongIndices.value
+            .map((value) => Number(value))
+            .filter((value) => Number.isFinite(value))
+        : [];
+
+    const hasCurrentProgress =
+      filledMap.some(Boolean) ||
+      Object.keys(indentMap).length > 0 ||
+      currentWrongIndices.length > 0 ||
+      force === true;
+
+    const hadSavedState =
+      String(previousState?.task_id || "")
+        === String(taskId);
+
+    // 新題第一次進入、完全沒有操作時，不建立空白狀態。
+    // 但也絕對不能刪除其他題或本題先前的未完成狀態。
+    if (!hasCurrentProgress && !hadSavedState) {
+      return;
+    }
+
     const stateObj = {
-      videoId: String(videoId.value || ""),
-      level: String(route.query.level || "L1"),
-      task_id: task.value?.task_id || task.value?._id || "",
-      filled_map: (templateSlots.value || []).map((s) => filled[String(s.slot)]?.id || null),
-      slot_indent_map: JSON.parse(JSON.stringify(slotIndentLevel || {})),
-      wrong_indices: Array.isArray(wrongIndices.value)
-        ? wrongIndices.value.map((v) => Number(v)).filter((v) => Number.isFinite(v))
-        : [],
-      primary_wrong_index: Number.isFinite(Number(primaryWrongIndex.value))
-        ? Number(primaryWrongIndex.value)
-        : null,
+      ...previousState,
+
+      student_id: String(studentId.value || ""),
+
+      videoId: String(
+        task.value?.video_id
+        || previousState.videoId
+        || videoId.value
+        || ""
+      ),
+
+      level: String(
+        task.value?.level
+        || previousState.level
+        || route.query.level
+        || "L1"
+      ),
+
+      task_id: String(taskId),
+
+      // 只有答對時才會透過 clearPracticeStateForTask() 刪除此題。
+      is_passed: false,
+
+      task_status:
+        safeExtra.task_status ||
+        previousState.task_status ||
+        "editing",
+
+      filled_map: filledMap,
+      filled_by_slot: filledBySlot,
+      filled_block_snapshots: filledBlockSnapshots,
+
+      slot_indent_map: indentMap,
+      wrong_indices: currentWrongIndices,
+
+      primary_wrong_index:
+        Number.isFinite(
+          Number(primaryWrongIndex.value)
+        )
+          ? Number(primaryWrongIndex.value)
+          : null,
+
       saved_at: Date.now(),
-      ...extra,
+
+      ...safeExtra,
     };
-    localStorage.setItem(PRACTICE_STATE_KEY, JSON.stringify(stateObj));
-  } catch (_) {}
+
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify(stateObj)
+    );
+  } catch (error) {
+    console.warn(
+      "savePracticeState failed:",
+      error
+    );
+  }
+}
+
+
+function saveCurrentPracticeBeforeLeave() {
+  // 前測、後測不使用本機恢復，避免影響正式測驗。
+  if (isTestMode.value) return;
+
+  // 已答對的題目不再保存，避免重新進入後恢復舊答案。
+  if (result.value?.is_correct === true) return;
+
+  const hasCurrentProgress =
+    Object.values(filled).some((block) => Boolean(block?.id)) ||
+    Object.keys(slotIndentLevel).length > 0 ||
+    (Array.isArray(wrongIndices.value) && wrongIndices.value.length > 0);
+
+  savePracticeState({
+    task_status:
+      Array.isArray(wrongIndices.value) && wrongIndices.value.length > 0
+        ? "revising"
+        : "editing",
+    save_reason: "leave_page",
+    force: hasCurrentProgress,
+  });
 }
 
 function buildAnswerLines() {
@@ -1714,26 +2826,129 @@ function buildAnswerLines() {
 
 function restorePracticeStateIfMatch(loadedTask) {
   try {
-    const raw = localStorage.getItem(PRACTICE_STATE_KEY);
-    if (!raw) return false;
-    const st = JSON.parse(raw);
+    const loadedTaskId =
+      loadedTask?.task_id ||
+      loadedTask?._id ||
+      "";
 
-    const loadedTaskId = loadedTask?.task_id || loadedTask?._id || "";
     if (!loadedTaskId) return false;
-    if (String(st.videoId) !== String(videoId.value)) return false;
-    if (String(st.task_id) !== String(loadedTaskId)) return false;
 
-    const byId = new Map((poolBlocks.value || []).map(b => [String(b.id), b]));
+    // 只讀取「目前這一道題」自己的 localStorage key。
+    const st =
+      readPracticeStateForTask(loadedTaskId);
 
-    for (const k of Object.keys(filled)) delete filled[k];
+    if (!st) return false;
+
+    // 已通過的題目不得恢復舊答案。
+    // 正常情況答對時已經會直接刪除此題狀態。
+    if (st?.is_passed === true) {
+      clearPracticeStateForTask(loadedTaskId);
+      return false;
+    }
+
+    // 避免同一台電腦切換帳號後，讀到其他學生的答案
+    const savedStudentId =
+      String(st?.student_id || "").trim();
+
+    const currentStudentId =
+      String(studentId.value || "").trim();
+
+    if (
+      savedStudentId &&
+      currentStudentId &&
+      savedStudentId !== currentStudentId
+    ) {
+      return false;
+    }
+
+    // task_id 已足以唯一確認同一題。
+    // 不再用 route 的 videoId 作嚴格拒絕條件，避免返回上一頁後
+    // route 已更新而把原本可恢復的排列判定為不相符。
+    if (String(st.task_id) !== String(loadedTaskId)) {
+      return false;
+    }
+
+    const byId = new Map(
+      (poolBlocks.value || []).map(
+        (block) => [String(block.id), block]
+      )
+    );
+
+    for (const key of Object.keys(filled)) {
+      delete filled[key];
+    }
 
     const slots = templateSlots.value || [];
-    (st.filled_map || []).forEach((bid, i) => {
-      if (!bid) return;
-      const b = byId.get(String(bid));
-      const slotKey = slots[i]?.slot;
-      if (b && slotKey != null) filled[String(slotKey)] = normalizeFilledBlock(b);
-    });
+    let restoredCount = 0;
+
+    // 新版：直接依 slot key 還原排列。
+    const filledBySlot =
+      st?.filled_by_slot &&
+      typeof st.filled_by_slot === "object"
+        ? st.filled_by_slot
+        : {};
+
+    const snapshots =
+      st?.filled_block_snapshots &&
+      typeof st.filled_block_snapshots === "object"
+        ? st.filled_block_snapshots
+        : {};
+
+    for (const slot of slots) {
+      const slotKey = String(slot?.slot ?? "");
+      if (!slotKey) continue;
+
+      const blockId = filledBySlot[slotKey];
+      if (!blockId) continue;
+
+      const poolBlock = byId.get(String(blockId));
+      const snapshot = snapshots[slotKey];
+
+      const restoredBlock =
+        poolBlock ||
+        (
+          snapshot &&
+          String(snapshot?.id || "") === String(blockId)
+            ? snapshot
+            : null
+        );
+
+      if (!restoredBlock) continue;
+
+      filled[slotKey] =
+        normalizeFilledBlock(restoredBlock);
+
+      restoredCount += 1;
+    }
+
+    // 相容舊版 localStorage：若沒有 filled_by_slot，
+    // 再使用原本的 index-based filled_map。
+    if (
+      restoredCount === 0 &&
+      Array.isArray(st.filled_map)
+    ) {
+      st.filled_map.forEach((blockId, index) => {
+        if (!blockId) return;
+
+        const slotKey = slots[index]?.slot;
+        if (slotKey == null) return;
+
+        const poolBlock =
+          byId.get(String(blockId));
+
+        if (!poolBlock) return;
+
+        filled[String(slotKey)] =
+          normalizeFilledBlock(poolBlock);
+
+        restoredCount += 1;
+      });
+    }
+
+    // localStorage 有資料但一格都無法還原時，不假裝成功。
+    if (restoredCount === 0) {
+      return false;
+    }
 
     // 回到同題時保留上次錯誤標記，直到學生修正正確為止。
     const restoredWrong = Array.isArray(st.wrong_indices)
@@ -1751,8 +2966,14 @@ function restorePracticeStateIfMatch(loadedTask) {
     try {
       const m = st.slot_indent_map || {};
       for (const k of Object.keys(slotIndentLevel)) delete slotIndentLevel[k];
-      for (const k of Object.keys(m)) slotIndentLevel[String(k)] = Number(m[k] || 0);
-      applyIndentStylesToDOM();
+      for (const k of Object.keys(m)) {
+        slotIndentLevel[String(k)] =
+          Number(m[k] || 0);
+      }
+
+      nextTick(() => {
+        applyIndentStylesToDOM();
+      });
     } catch (_) {}
 
     localStorage.setItem(RESTORE_ONCE_KEY, "1");
@@ -1775,6 +2996,14 @@ function clearAiFeedback() {
 }
 
 // ====== 送出作答 ======
+
+// 收集 block IDs
+// 組合含縮排的 answer_lines
+// 呼叫 /api/parsons/submit
+// 更新紅色位置
+// 保存未完成狀態
+// 依 hint_flow 顯示不同 Modal
+
 async function submit() {
   if (state.submitting || state.noTask) return;
   state.submitting = true;
@@ -1782,6 +3011,8 @@ async function submit() {
   result.value = null;
   wrongIndices.value = [];
   primaryWrongIndex.value = null;
+  firstHintPanel.visible = false;
+  feedbackModal.open = false;
 
   // 每次送出前先清空 AI 回饋
   aiFeedbackDetail.value = null;
@@ -1924,7 +3155,7 @@ async function submit() {
 
     const res = await fetch(`${API_BASE}/api/parsons/submit`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(body),
     });
 
@@ -1961,24 +3192,82 @@ async function submit() {
 
     result.value = r;
 
-    wrongIndices.value = Array.isArray(r?.wrong_indices)
-      ? r.wrong_indices
-      : (r?.wrong_index != null ? [r.wrong_index] : []);
+    // 每次送出後，以本次作答的系統判定結果更新紅色標記。
+    // 優先使用 incorrect_slots，包含順序錯誤與縮排錯誤。
+    wrongIndices.value = collectCurrentWrongPositions(r || {});
 
     const parts = buildWrongFeedbackParts(r || {});
     primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
 
+    // 尚未答對時保存本次送出的排列、縮排與紅色錯誤標記。
+    if (r?.ok && r?.is_correct === false) {
+      savePracticeState({
+        task_status: "revising",
+        attempt_id: String(r?.attempt_id || ""),
+        attempt_v2_id: String(r?.attempt_v2_id || ""),
+        attempt_no: Number(r?.attempt_no || 0) || null,
+        feedback_shown: true,
+        save_reason: "incorrect_submit",
+        force: true,
+      });
+    }
+
     if (r?.ok && r?.is_correct === true) {
-      localStorage.removeItem(PRACTICE_STATE_KEY);
-      localStorage.removeItem(RESTORE_ONCE_KEY);
-      localStorage.removeItem(RESTORE_MSG_KEY);
+      // 只有答對，才清除此題的排列、縮排、紅標與修正狀態。
+      // 其他尚未完成的題目仍各自保留。
+      clearPracticeStateForTask(task_id);
       await openSuccessModal(r);
     }
 
-    if (r?.ok && r?.is_correct === false) {
-      openFeedbackModal(r, task_id);
+  if (r?.ok && r?.is_correct === false) {
+    const flow =
+      r?.hint_flow && typeof r.hint_flow === "object"
+        ? r.hint_flow
+        : {};
+
+    const attemptNo = Number(r?.attempt_no || 0);
+    const wrongAttemptCount = Number(
+      flow.wrong_attempt_count
+      ?? r?.wrong_attempt_count
+      ?? 0
+    );
+
+    // 第二次錯誤：系統先重新判斷位置，再開啟 AI 提示。
+    if (
+      flow.type === "ai_hint"
+      || flow.auto_open_ai === true
+      || wrongAttemptCount === 2
+      || attemptNo === 2
+    ) {
+      openAiHintModalFromFlow(r, task_id);
       return;
     }
+
+    // 第一次錯誤：只顯示系統判定的錯誤位置
+    if (
+      flow.type === "first_system_hint"
+      || (!flow.type && wrongAttemptCount <= 1)
+      || (!flow.type && !wrongAttemptCount && attemptNo === 1)
+    ) {
+      showFirstSystemHint(r, task_id);
+      return;
+    }
+
+    // 第三次以上錯誤：只顯示本次最新錯誤位置、格數與紅色標記，
+    // 不再把第一次或第二次的位置合併進來，也不自動重新生成 AI。
+    if (
+      flow.type === "system_recheck"
+      || (!flow.type && wrongAttemptCount >= 3)
+      || (!flow.type && !wrongAttemptCount && attemptNo >= 3)
+    ) {
+      showSystemRecheck(r, task_id);
+      return;
+    }
+
+    // 若後端未回傳提示類型，採保守處理
+    showFirstSystemHint(r, task_id);
+    return;
+  }
   } catch (e) {
     state.err = e?.message || "送出失敗";
     result.value = { is_correct: false, feedback: state.err };
@@ -2077,6 +3366,29 @@ function normalizeTaskPayload(apiJson) {
   return { taskObj: t, pool, slots };
 }
 
+async function loadPersistedHintState() {
+  const taskId = currentTaskId();
+  if (!taskId || isTestMode.value) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/parsons/hint_state?task_id=${encodeURIComponent(taskId)}`, {
+      headers: authHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    const record = data?.hint_record;
+    if (!res.ok || !record) return;
+    feedbackModal.hintRecord = record;
+    feedbackModal.hintId = String(record.hint_id || "");
+    feedbackModal.attemptId = String(record.last_attempt_id || feedbackModal.attemptId || "");
+    feedbackModal.taskId = String(record.task_id || taskId || "");
+    feedbackModal.firstSystemHintText = String(record.first_system_hint_text || "");
+    feedbackModal.aiHint1Text = String(record.ai_hint_1_text || "");
+    feedbackModal.aiHint1Meta = sanitizeHintMeta(record.ai_hint_1_meta);
+    feedbackModal.aiHint2Text = String(record.ai_hint_2_text || "");
+    feedbackModal.aiHint2Meta = sanitizeHintMeta(record.ai_hint_2_meta);
+    feedbackModal.activeAiHintNo = 1;
+  } catch (_) {}
+}
+
 // ====== 載入題目 ======
 async function loadTask() {
   state.loading = true;
@@ -2164,6 +3476,7 @@ async function loadTask() {
     templateSlots.value = norm.slots;
 
     const restored = restorePracticeStateIfMatch(task.value);
+    await loadPersistedHintState();
 
     await bindBlankFocusHandlers();
     await recordEnterParsonsTaskFromVideo();
@@ -2234,19 +3547,70 @@ onMounted(() => {
   };
 
   document.addEventListener("keydown", _docKeydownHandler, true);
+
+  window.addEventListener(
+    "pagehide",
+    saveCurrentPracticeBeforeLeave
+  );
+
+  window.addEventListener(
+    "beforeunload",
+    saveCurrentPracticeBeforeLeave
+  );
+});
+
+
+onBeforeRouteLeave(() => {
+  saveCurrentPracticeBeforeLeave();
 });
 
 onBeforeUnmount(() => {
-  if (_docKeydownHandler) document.removeEventListener("keydown", _docKeydownHandler, true);
+  // SPA 返回上一頁時，onBeforeRouteLeave 已經在舊 route 上保存。
+  // 這裡不可再次保存，否則可能使用新 route 覆蓋正確的題目身分。
+  if (_docKeydownHandler) {
+    document.removeEventListener(
+      "keydown",
+      _docKeydownHandler,
+      true
+    );
+  }
+
+  window.removeEventListener(
+    "pagehide",
+    saveCurrentPracticeBeforeLeave
+  );
+
+  window.removeEventListener(
+    "beforeunload",
+    saveCurrentPracticeBeforeLeave
+  );
+
   try {
-    (_blankCleanupFns || []).forEach((fn) => { try { fn(); } catch (_) {} });
+    (_blankCleanupFns || []).forEach((fn) => {
+      try {
+        fn();
+      } catch (_) {}
+    });
   } catch (_) {}
+
   _blankCleanupFns = [];
 });
 
 watch(
-  () => [videoId.value, route.query.level, route.query.mode, route.query.test_role, route.query.test_cycle_id, route.query.test_index],
-  () => loadTask()
+  () => [
+    videoId.value,
+    route.query.level,
+    route.query.mode,
+    route.query.test_role,
+    route.query.test_cycle_id,
+    route.query.test_index,
+  ],
+  async () => {
+    // 同一個 Parsons 元件切換到另一題／另一影片時，
+    // 先保存舊題排列，再讓 loadTask() 清空畫面。
+    saveCurrentPracticeBeforeLeave();
+    await loadTask();
+  }
 );
 </script>
 
@@ -2389,12 +3753,12 @@ watch(
 }
 
 .cloze-row.affected .hint{
-  background: linear-gradient(90deg, #ffd888 0%, #ffc55a 100%);
-  color: #553a00;
+  background: linear-gradient(90deg, #ffe1e1 0%, #ffc8c8 100%);
+  color: #7f1d1d;
 }
 .cloze-row.affected .blank{
-  border-color: #d97706 !important;
-  box-shadow: 0 0 0 2px rgba(217, 119, 6, .24);
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 2px rgba(185, 28, 28, .12);
 }
 
 .hint-affected-icon{
@@ -2457,6 +3821,62 @@ watch(
 }
 .result.ok{ background:#e8fff2; border-color: #b6e5c8; }
 
+.first-hint-panel{
+  margin-top: 12px;
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid #fecaca;
+  background: #fff7f7;
+  box-shadow: var(--shadow-soft);
+}
+
+.first-hint-title{
+  font-size: 18px;
+  font-weight: 900;
+  color: #b91c1c;
+  margin-bottom: 8px;
+}
+
+.first-hint-meta{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.first-hint-meta span{
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: #fee2e2;
+  color: #7f1d1d;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.first-hint-text{
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.6;
+  color: #1f2937;
+}
+
+.floating-ai-hint{
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 900;
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: #2563eb;
+  color: #fff;
+  font-weight: 900;
+  box-shadow: 0 14px 30px rgba(37, 99, 235, 0.25);
+  cursor: pointer;
+}
+
 .fb-modal-backdrop{
   position: fixed;
   inset: 0;
@@ -2469,6 +3889,7 @@ watch(
 }
 
 .fb-modal{
+  position: relative;
   width: min(760px, 100%);
   max-height: 90vh;
   overflow: auto;
@@ -2478,6 +3899,26 @@ watch(
   box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
   padding: 18px;
   animation: modal-pop .2s ease-out both;
+}
+
+.ai-hint-close-icon{
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  width: 38px;
+  height: 38px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #64748b;
+  font-size: 34px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ai-hint-close-icon:hover{
+  background: #eef2ff;
+  color: #1d4ed8;
 }
 
 .fb-modal.success{
@@ -2501,12 +3942,108 @@ watch(
   color: #047857;
 }
 
+.fb-title.ai-hint-title{
+  color: #1557b7;
+  padding-right: 44px;
+}
+
+.fb-title.first-error-title{
+  color: #b91c1c;
+}
+
 .fb-section{
   border: 1px solid #e5e7eb;
   border-radius: 12px;
   padding: 12px;
   background: #ffffff;
   margin-top: 10px;
+}
+
+.ai-hint-content{
+  min-height: 128px;
+  padding: 16px 18px;
+  border-radius: 12px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  white-space: pre-wrap;
+}
+
+.ai-hint-meta-card{
+  margin: 8px 0 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid #dbeafe;
+  background: #f8fbff;
+  color: #1e3a8a;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ai-hint-meta-row{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ai-hint-meta-row + .ai-hint-meta-row{
+  margin-top: 4px;
+}
+
+.ai-hint-meta-label{
+  flex: 0 0 auto;
+  font-weight: 900;
+  color: #334155;
+}
+
+.ai-hint-meta-value{
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-weight: 800;
+}
+
+.fb-title.ai-hint-title ~ .fb-section .fb-note{
+  display: inline-block;
+  margin-top: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #1e3a8a;
+  font-size: 15px;
+}
+
+.ai-hint-error{
+  margin-top: 10px;
+  color: #b91c1c;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.first-error-section{
+  border-color: #fecaca;
+  background: #fffafa;
+}
+
+.first-hint-meta.in-modal{
+  margin-top: 4px;
+}
+
+.first-error-text{
+  margin-top: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid #fecaca;
+  background: #fff1f2;
+  color: #7f1d1d;
+  white-space: pre-wrap;
+}
+
+.first-error-note{
+  margin-top: 12px;
+  color: #7f1d1d;
+  background: #fff7ed;
+  border-color: #fed7aa;
 }
 
 .fb-section.success{
@@ -2538,6 +4075,11 @@ watch(
   font-weight: 700;
   color: #0f172a;
   line-height: 1.6;
+}
+
+.fb-text.muted{
+  color: #64748b;
+  font-weight: 800;
 }
 
 .fb-list{
@@ -2608,6 +4150,10 @@ watch(
   .qtext { font-size: 20px; }
   .panel { min-height: 0; }
   .board{ grid-template-columns: 1fr; }
+  .floating-ai-hint{
+    right: 14px;
+    bottom: 14px;
+  }
 }
 
 @keyframes rise-in {

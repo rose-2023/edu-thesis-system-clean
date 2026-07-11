@@ -15,6 +15,7 @@ from .teacher_analysis import teacher_analysis_bp
 from .teacher_io import teacher_io_bp
 from .avatars import avatars_bp
 
+
 # from .quiz import quiz_bp
 # api 串接
 
@@ -34,4 +35,5 @@ def register_blueprints(app):
     app.register_blueprint(parsons_bp, url_prefix="/api/parsons")
     app.register_blueprint(teacher_analysis_bp, url_prefix="/api/teacher/analysis")
     app.register_blueprint(teacher_io_bp, url_prefix="/api/teacher")
-    app.register_blueprint(avatars_bp, url_prefix="/api")
+    app.register_blueprint(avatars_bp, url_prefix="/api/users/me/avatar")
+

@@ -349,8 +349,13 @@ def _attempt_record_rows(include_student=True):
         "error_count",
         "error_types",
         "wrong_slots",
+        "error_details",
         "error_concept",
         "repeated_error",
+        "repeated_error_types",
+        "repeated_error_count",
+        "repeated_error_basis",
+        "repeated_error_rule_version",
         "started_at",
         "submitted_at",
         "elapsed_sec_raw",
@@ -378,6 +383,8 @@ def _attempt_record_rows(include_student=True):
         "correct_answer",
         "error_types",
         "wrong_slots",
+        "error_details",
+        "repeated_error_types",
         "review_reason",
     }
     datetime_fields = {"started_at", "submitted_at", "created_at", "updated_at"}

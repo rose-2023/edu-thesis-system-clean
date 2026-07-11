@@ -1,29 +1,9 @@
 from flask import Blueprint, request, jsonify, Response
 from app.db import db
-from app.avatar_utils import resolve_avatar_src
 from datetime import datetime, timezone
-from werkzeug.security import generate_password_hash
 
 records_bp = Blueprint("records", __name__)
 _TEST_STUDENT_ID = "11461127"
-_MAX_USER_CSV_BYTES = 2 * 1024 * 1024
-_VALID_GROUP_TYPES = {"control", "experimental"}
-_VALID_USER_ROLES = {"student", "teacher", "admin"}
-_SEXJ_ALIASES = {
-    "boy": "boy",
-    "m": "boy",
-    "male": "boy",
-    "男": "boy",
-    "男性": "boy",
-    "girl": "girl",
-    "f": "girl",
-    "female": "girl",
-    "女": "girl",
-    "女性": "girl",
-    "o": "other",
-    "other": "other",
-    "其他": "other",
-}
 
 
 def _parse_optional_bool(value):
@@ -37,13 +17,6 @@ def _parse_optional_bool(value):
     if normalized in {"0", "false", "no", "off"}:
         return False
     return None
-
-
-def _normalize_sexj(value):
-    normalized = str(value or "").strip().lower()
-    if not normalized:
-        return None
-    return _SEXJ_ALIASES.get(normalized)
 
 # =========================================================
 # Students (thesis_system.users)
@@ -67,15 +40,6 @@ def students():
             "class_name": 1,
             "group_type": 1,
             "is_test_data": 1,
-            "sexj": 1,
-            "avatar_type": 1,
-            "avatar_key": 1,
-            "avatar_src": 1,
-            "avatar_value": 1,
-            "avatar_url": 1,
-            "avatar_style": 1,
-            "avatar_license": 1,
-            "avatar_updated_at": 1,
             "created_at": 1,
         })
         .sort("created_at", -1)
@@ -83,10 +47,6 @@ def students():
         .limit(page_size)
     )
     students = list(cursor)
-    for student in students:
-        student["avatar_src"] = resolve_avatar_src(student)
-        student.pop("avatar_url", None)
-        student.pop("avatar_value", None)
     return jsonify({"ok": True, "students": students, "total": total})
 
 
@@ -94,8 +54,9 @@ def students():
 def import_students_csv():
     """
     匯入 students CSV
-    欄位：student_id,name,class_name,role,group_type,is_test_data,sexj
-    預設密碼固定為 student_id，資料庫只儲存 password_hash。
+    欄位（最少）：student_id,name,class_name
+    password 可選
+    - 若 CSV 沒 password 且「預設密碼」也沒填：用 student_id 當密碼（避免空密碼）
     """
     import io
     import csv
@@ -106,74 +67,43 @@ def import_students_csv():
     f = request.files["file"]
     if not f.filename:
         return jsonify({"ok": False, "message": "empty filename"}), 400
-    if not str(f.filename).lower().endswith(".csv"):
-        return jsonify({"ok": False, "message": "csv_file_required"}), 400
 
-    raw = f.stream.read(_MAX_USER_CSV_BYTES + 1)
-    if len(raw) > _MAX_USER_CSV_BYTES:
-        return jsonify({"ok": False, "message": "csv_file_too_large"}), 413
+    # [修改] 允許不填（不強制預設密碼）
+    default_password = (request.form.get("default_password") or "").strip()  # [修改]
+
+    raw = f.read()
     # Excel 常見 UTF-8 BOM
     text = raw.decode("utf-8-sig", errors="replace")
 
     reader = csv.DictReader(io.StringIO(text))
-    headers = {str(name or "").strip() for name in (reader.fieldnames or [])}
     required = {"student_id", "name", "class_name"}
-    if not required.issubset(headers):
-        return jsonify({"ok": False, "message": "CSV 欄位需包含 student_id,name,class_name"}), 400
+    if not required.issubset(set([h.strip() for h in (reader.fieldnames or [])])):
+        return jsonify({"ok": False, "message": "CSV 欄位需包含 student_id,name,class_name（password 可選）"}), 400
 
     upserts = 0
-    invalid_rows = []
-    for row_number, row in enumerate(reader, start=2):
+    for row in reader:
         sid = (row.get("student_id") or "").strip()
         name = (row.get("name") or "").strip()
         class_name = (row.get("class_name") or "").strip()
 
         if not sid:
-            invalid_rows.append({
-                "row": row_number,
-                "student_id": "",
-                "reason": "missing_student_id",
-            })
             continue
 
-        existing = db.users.find_one({"student_id": sid})
-        role = str(row.get("role") or "student").strip().lower() or "student"
-        if role not in _VALID_USER_ROLES:
-            invalid_rows.append({
-                "row": row_number,
-                "student_id": sid,
-                "reason": "invalid_role",
-            })
-            continue
-        sexj_raw = str(row.get("sexj") or "").strip()
-        sexj = _normalize_sexj(sexj_raw)
-        if sexj_raw and not sexj:
-            continue
+        pw = (row.get("password") or "").strip()  # [修改]
+        if not pw:
+            pw = default_password or sid  # [新增] CSV 無 password 且未填預設密碼時 → 用 student_id 當密碼
+
+        existing = db.users.find_one({"student_id": sid, "role": "student"})
         group_type_input = str(row.get("group_type") or "").strip()
         if group_type_input:
-            group_type = group_type_input.lower()
-            if group_type not in _VALID_GROUP_TYPES:
-                invalid_rows.append({
-                    "row": row_number,
-                    "student_id": sid,
-                    "reason": "invalid_group_type",
-                })
-                continue
+            group_type = group_type_input
         elif existing and "group_type" in existing:
             group_type = existing.get("group_type")
         else:
             group_type = None
 
-        is_test_data_raw = str(row.get("is_test_data") or "").strip()
-        csv_is_test_data = _parse_optional_bool(is_test_data_raw)
-        if is_test_data_raw and csv_is_test_data is None:
-            invalid_rows.append({
-                "row": row_number,
-                "student_id": sid,
-                "reason": "invalid_is_test_data",
-            })
-            continue
-        if sid == _TEST_STUDENT_ID:
+        csv_is_test_data = _parse_optional_bool(row.get("is_test_data"))
+        if sid == _TEST_STUDENT_ID or group_type is None:
             is_test_data = True
         elif csv_is_test_data is not None:
             is_test_data = csv_is_test_data
@@ -181,44 +111,25 @@ def import_students_csv():
             is_test_data = existing.get("is_test_data")
         else:
             is_test_data = False
-        if group_type is None and not is_test_data:
-            invalid_rows.append({
-                "row": row_number,
-                "student_id": sid,
-                "reason": "missing_group_type",
-            })
-            continue
 
         doc = {
             "student_id": sid,
             "name": name,
             "class_name": class_name,
-            "role": role,
+            "role": "student",
+            "password": pw,
             "group_type": group_type,
             "is_test_data": is_test_data,
-            "sexj": sexj,
-            "updated_at": datetime.now(timezone.utc),
         }
-        if existing:
-            if not existing.get("password_hash"):
-                doc["password_hash"] = generate_password_hash(sid)
-            if "created_at" not in existing:
-                doc["created_at"] = doc["updated_at"]
-            if "last_login_at" not in existing:
-                doc["last_login_at"] = None
-            db.users.update_one({"_id": existing["_id"]}, {"$set": doc})
-        else:
-            doc["password_hash"] = generate_password_hash(sid)
-            doc["created_at"] = doc["updated_at"]
-            doc["last_login_at"] = None
-            db.users.insert_one(doc)
+
+        db.users.update_one(
+            {"student_id": sid, "role": "student"},
+            {"$set": doc},
+            upsert=True
+        )
         upserts += 1
 
-    return jsonify({
-        "ok": True,
-        "upserts": upserts,
-        "invalid_rows": invalid_rows,
-    })
+    return jsonify({"ok": True, "upserts": upserts})
 
 
 @records_bp.get("/students/export_csv")
@@ -235,21 +146,13 @@ def export_students_csv():
     if class_name:
         q["class_name"] = class_name
 
-    rows = list(db.users.find(
-        q,
-        {"_id": 0, "student_id": 1, "name": 1, "class_name": 1, "sexj": 1},
-    ).sort("student_id", 1))
+    rows = list(db.users.find(q, {"_id": 0, "student_id": 1, "name": 1, "class_name": 1}).sort("student_id", 1))
 
     output = io.StringIO()
     w = csv.writer(output)
-    w.writerow(["student_id", "name", "class_name", "sexj"])
+    w.writerow(["student_id", "name", "class_name"])
     for r in rows:
-        w.writerow([
-            r.get("student_id", ""),
-            r.get("name", ""),
-            r.get("class_name", ""),
-            r.get("sexj") or "",
-        ])
+        w.writerow([r.get("student_id", ""), r.get("name", ""), r.get("class_name", "")])
 
     csv_text = output.getvalue()
     output.close()
@@ -307,7 +210,7 @@ def _safe_dt(v):
 @records_bp.get("/corrected_success.csv")
 def export_corrected_success_csv():
     """
-    GET /api/records/corrected_success.csv?class_name=資工系A&student_id=11461127&task_id=...&rq3_only=1
+    GET /api/records/corrected_success.csv?class_name=資管系A&student_id=11461127&task_id=...&rq3_only=1
 
     以 (student_id, task_id) 分組，依 created_at 排序：
     - 若先出現 is_correct=false，後續又出現 is_correct=true，則 corrected_success=1

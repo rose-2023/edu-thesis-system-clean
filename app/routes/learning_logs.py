@@ -49,19 +49,39 @@ HINT_METADATA_PATCH_KEYS = {
     "impact",
     "guiding_question",
     "generated_at",
+    "hint_id",
+    "requested_hint_no",
+    "hint_generation_count",
+    "hint_view_count",
+    "ai_hint_generation_count",
+    "ai_hint_view_count",
+    "first_system_hint_text",
+    "ai_hint_1_text",
+    "ai_hint_2_text",
+    "repeated_error",
+    "error_types",
 }
 HINT_TOP_LEVEL_DEFAULTS = {
+    "hint_id": None,
     "question_id": None,
     "unit_id": None,
     "question_type": None,
     "review_type": None,
     "hint_type": None,
+    "requested_hint_no": None,
     "hint_no": None,
     "hint_click_no": None,
     "max_hint_count": None,
+    "hint_generation_count": None,
+    "hint_view_count": None,
+    "ai_hint_generation_count": None,
+    "ai_hint_view_count": None,
     "hint_limit_reached": None,
     "hint_retry_count": None,
     "next_hint_no": None,
+    "first_system_hint_text": None,
+    "ai_hint_1_text": None,
+    "ai_hint_2_text": None,
     "hint_text": None,
     "hint_content": None,
     "hint_source": None,
@@ -72,7 +92,9 @@ HINT_TOP_LEVEL_DEFAULTS = {
     "close_method": None,
     "return_method": None,
     "error_type": None,
+    "error_types": [],
     "wrong_slots": [],
+    "repeated_error": None,
     "ai_diagnosis_summary": None,
 }
 ALLOWED_EVENT_TYPES = {
@@ -88,9 +110,33 @@ ALLOWED_EVENT_TYPES = {
     "hide_hint",
     "review_open",
     "review_close",
+    "first_error_hint_shown",
+    "ai_hint_modal_open",
+    "review_code_from_hint",
+    "ai_hint_modal_close",
+    "return_to_fix_from_hint",
+    "ai_hint_reopen",
+    "ai_hint_view",
+    "submit_after_hint",
+    "ai_hint_second_request",
     "return_to_task",
     "idle_detected",
     "heartbeat",
+}
+HINT_EVENT_TYPES = {
+    "view_hint",
+    "hide_hint",
+    "review_open",
+    "review_close",
+    "first_error_hint_shown",
+    "ai_hint_modal_open",
+    "review_code_from_hint",
+    "ai_hint_modal_close",
+    "return_to_fix_from_hint",
+    "ai_hint_reopen",
+    "ai_hint_view",
+    "submit_after_hint",
+    "ai_hint_second_request",
 }
 
 _INDEXES_READY = False
@@ -187,6 +233,16 @@ def _optional_attempt_no(value):
         return None
 
 
+def _optional_nonnegative_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+    except Exception:
+        return None
+
+
 def _attempt_context(attempt_id):
     normalized = _optional_string(attempt_id)
     if not normalized or not ObjectId.is_valid(normalized):
@@ -206,6 +262,11 @@ def _attempt_context(attempt_id):
             "error_types": 1,
             "wrong_slots": 1,
             "repeated_error": 1,
+            "error_details": 1,
+            "repeated_error_types": 1,
+            "repeated_error_count": 1,
+            "repeated_error_basis": 1,
+            "repeated_error_rule_version": 1,
         },
     )
     if attempt:
@@ -229,6 +290,11 @@ def _attempt_context(attempt_id):
             "wrong_indices": 1,
             "indent_errors": 1,
             "repeated_error": 1,
+            "error_details": 1,
+            "repeated_error_types": 1,
+            "repeated_error_count": 1,
+            "repeated_error_basis": 1,
+            "repeated_error_rule_version": 1,
         },
     )
     if not test_attempt:
@@ -261,6 +327,11 @@ def _attempt_context(attempt_id):
         "error_types": error_types,
         "wrong_slots": wrong_slots or [],
         "repeated_error": test_attempt.get("repeated_error") if isinstance(test_attempt.get("repeated_error"), bool) else False,
+        "error_details": test_attempt.get("error_details") if isinstance(test_attempt.get("error_details"), list) else [],
+        "repeated_error_types": test_attempt.get("repeated_error_types") if isinstance(test_attempt.get("repeated_error_types"), list) else [],
+        "repeated_error_count": test_attempt.get("repeated_error_count") if isinstance(test_attempt.get("repeated_error_count"), int) else 0,
+        "repeated_error_basis": test_attempt.get("repeated_error_basis"),
+        "repeated_error_rule_version": test_attempt.get("repeated_error_rule_version"),
     }
 
 
@@ -270,6 +341,8 @@ def _hint_event_metadata(event_type, student_id, session_id, task_id, attempt_id
     normalized["hint_type"] = normalized.get("hint_type") or "ai_hint"
     normalized["question_type"] = normalized.get("question_type") or "parsons"
     normalized["max_hint_count"] = MAX_HINT_COUNT
+    if event_type not in {"view_hint", "hide_hint", "review_open", "review_close"}:
+        return normalized
     query = {
         "student_id": student_id,
         "session_id": session_id,
@@ -317,6 +390,7 @@ def _hint_top_level_fields(metadata, task_id=None, include_task_fallback=True):
     hint_metadata = metadata if isinstance(metadata, dict) else {}
     return {
         **HINT_TOP_LEVEL_DEFAULTS,
+        "hint_id": _optional_string(hint_metadata.get("hint_id")),
         "question_id": _optional_string(
             hint_metadata.get("question_id")
             or (task_id if include_task_fallback else None)
@@ -325,11 +399,27 @@ def _hint_top_level_fields(metadata, task_id=None, include_task_fallback=True):
         "question_type": _optional_string(hint_metadata.get("question_type") or "parsons"),
         "review_type": _optional_string(hint_metadata.get("review_type")),
         "hint_type": _optional_string(hint_metadata.get("hint_type") or hint_metadata.get("review_type")),
+        "requested_hint_no": _optional_attempt_no(hint_metadata.get("requested_hint_no")),
         "hint_no": _optional_attempt_no(hint_metadata.get("hint_no")),
         "max_hint_count": _optional_attempt_no(hint_metadata.get("max_hint_count")),
+        "hint_generation_count": _optional_nonnegative_int(
+            hint_metadata.get("hint_generation_count")
+            if hint_metadata.get("hint_generation_count") is not None
+            else hint_metadata.get("ai_hint_generation_count")
+        ),
+        "hint_view_count": _optional_nonnegative_int(
+            hint_metadata.get("hint_view_count")
+            if hint_metadata.get("hint_view_count") is not None
+            else hint_metadata.get("ai_hint_view_count")
+        ),
+        "ai_hint_generation_count": _optional_nonnegative_int(hint_metadata.get("ai_hint_generation_count")),
+        "ai_hint_view_count": _optional_nonnegative_int(hint_metadata.get("ai_hint_view_count")),
         "hint_limit_reached": hint_metadata.get("hint_limit_reached") if isinstance(hint_metadata.get("hint_limit_reached"), bool) else None,
         "hint_retry_count": _optional_attempt_no(hint_metadata.get("hint_retry_count")),
         "next_hint_no": _optional_attempt_no(hint_metadata.get("next_hint_no")),
+        "first_system_hint_text": _optional_string(hint_metadata.get("first_system_hint_text")),
+        "ai_hint_1_text": _optional_string(hint_metadata.get("ai_hint_1_text")),
+        "ai_hint_2_text": _optional_string(hint_metadata.get("ai_hint_2_text")),
         "hint_text": _optional_string(hint_metadata.get("hint_text") or hint_metadata.get("hint_content")),
         "hint_content": _optional_string(hint_metadata.get("hint_content") or hint_metadata.get("hint_text")),
         "hint_source": _optional_string(hint_metadata.get("hint_source")),
@@ -345,7 +435,9 @@ def _hint_top_level_fields(metadata, task_id=None, include_task_fallback=True):
         "close_method": _optional_string(hint_metadata.get("close_method")),
         "return_method": _optional_string(hint_metadata.get("return_method")),
         "error_type": _optional_string(hint_metadata.get("error_type")),
+        "error_types": hint_metadata.get("error_types") if isinstance(hint_metadata.get("error_types"), list) else [],
         "wrong_slots": hint_metadata.get("wrong_slots") if isinstance(hint_metadata.get("wrong_slots"), list) else [],
+        "repeated_error": hint_metadata.get("repeated_error") if isinstance(hint_metadata.get("repeated_error"), bool) else None,
         "ai_diagnosis_summary": _optional_string(hint_metadata.get("ai_diagnosis_summary")),
     }
 
@@ -390,12 +482,17 @@ def write_learning_log(payload, enforced_student_id=None):
             "error_types": attempt.get("error_types") or [],
             "wrong_slots": attempt.get("wrong_slots") or [],
             "repeated_error": attempt.get("repeated_error"),
+            "error_details": attempt.get("error_details") if isinstance(attempt.get("error_details"), list) else [],
+            "repeated_error_types": attempt.get("repeated_error_types") if isinstance(attempt.get("repeated_error_types"), list) else [],
+            "repeated_error_count": attempt.get("repeated_error_count") if isinstance(attempt.get("repeated_error_count"), int) else 0,
+            "repeated_error_basis": attempt.get("repeated_error_basis"),
+            "repeated_error_rule_version": attempt.get("repeated_error_rule_version"),
         }
 
     now = _utc_now()
     session_id = _optional_string(data.get("session_id")) or str(uuid.uuid4())
     task_id = _optional_string(attempt.get("task_id") or data.get("task_id"))
-    if event_type in {"view_hint", "hide_hint", "review_open", "review_close"}:
+    if event_type in HINT_EVENT_TYPES:
         metadata = _hint_event_metadata(
             event_type,
             student_id,
@@ -452,7 +549,7 @@ def write_learning_log(payload, enforced_student_id=None):
         "created_at_taiwan": _taiwan_time_string(now),
         **HINT_TOP_LEVEL_DEFAULTS,
     }
-    if event_type in {"view_hint", "hide_hint", "review_open", "review_close"}:
+    if event_type in HINT_EVENT_TYPES:
         document.update(_hint_top_level_fields(metadata, task_id))
     result = db.learning_logs.insert_one(document)
     document["_id"] = result.inserted_id
@@ -623,12 +720,19 @@ def update_learning_log_metadata(log_id):
         update["wrong_slots"] = patch.get("wrong_slots") if isinstance(patch.get("wrong_slots"), list) else []
     top_fields = _hint_top_level_fields(patch, None, include_task_fallback=False)
     for key in (
+        "hint_id",
         "review_type",
+        "requested_hint_no",
         "hint_no",
         "max_hint_count",
+        "ai_hint_generation_count",
+        "ai_hint_view_count",
         "hint_limit_reached",
         "hint_retry_count",
         "next_hint_no",
+        "first_system_hint_text",
+        "ai_hint_1_text",
+        "ai_hint_2_text",
         "hint_text",
         "hint_source",
         "hint_loaded",
@@ -637,6 +741,8 @@ def update_learning_log_metadata(log_id):
         "button_name",
         "close_method",
         "return_method",
+        "error_types",
+        "repeated_error",
         "ai_diagnosis_summary",
     ):
         if key in patch:
@@ -645,7 +751,7 @@ def update_learning_log_metadata(log_id):
         {
             "log_id": str(log_id or "").strip(),
             "student_id": student_id,
-            "event_type": {"$in": ["view_hint", "review_open"]},
+            "event_type": {"$in": list(HINT_EVENT_TYPES)},
         },
         {"$set": update},
         projection={"metadata": 1, "log_id": 1},

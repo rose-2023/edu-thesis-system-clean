@@ -1,3 +1,4 @@
+# 補上舊資料的 parsons_test_attempts 的 task_id 與 answer 資料
 import argparse
 import os
 import sys
@@ -215,6 +216,37 @@ def build_update(attempt, question_context):
         error_types.append("sequence_error")
     if indent_errors:
         error_types.append("indentation_error")
+    target_concept = attempt.get("target_concept") or (question_context or {}).get("target_concept") or "unknown"
+    expected_position_by_block = {
+        normalize_id(block_id): index
+        for index, block_id in enumerate(expected_order)
+        if normalize_id(block_id)
+    }
+    error_details = []
+    for index in sequence_slots:
+        block_id = submitted_order[index] if index < len(submitted_order) else None
+        expected_block_id = expected_order[index] if index < len(expected_order) else None
+        error_details.append({
+            "slot": index,
+            "block_id": normalize_id(block_id) or None,
+            "error_type": "order",
+            "expected_block_id": normalize_id(expected_block_id) or None,
+            "submitted_position": index if block_id is not None else None,
+            "expected_position": expected_position_by_block.get(normalize_id(block_id)),
+            "concept_tag": target_concept,
+        })
+    for index in indent_errors:
+        block_id = submitted_order[index] if index < len(submitted_order) else None
+        submitted_indent = submitted_indentation[index] if index < len(submitted_indentation) else None
+        expected_indent = expected_indentation[index] if index < len(expected_indentation) else None
+        error_details.append({
+            "slot": index,
+            "block_id": normalize_id(block_id) or None,
+            "error_type": "indentation",
+            "submitted_indent": submitted_indent,
+            "expected_indent": expected_indent,
+            "concept_tag": target_concept,
+        })
 
     submitted_blocks = []
     for index, block_id in enumerate(submitted_order):
@@ -257,7 +289,12 @@ def build_update(attempt, question_context):
         "wrong_slots": sequence_slots,
         "error_count": len(set(sequence_slots + indent_errors)),
         "error_types": error_types,
-        "error_concept": attempt.get("target_concept") or (question_context or {}).get("target_concept") or "unknown",
+        "error_details": error_details,
+        "error_concept": target_concept,
+        "repeated_error_types": [],
+        "repeated_error_count": 0,
+        "repeated_error_basis": "same_task_same_error_type",
+        "repeated_error_rule_version": 1,
         "extra_wrong_count": max(0, len(submitted_order) - len(expected_order)),
         "total_slots": total_slots,
         "updated_at": datetime.now(timezone.utc),

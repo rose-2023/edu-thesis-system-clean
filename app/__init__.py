@@ -23,6 +23,11 @@ ROLE_PROTECTED_BLUEPRINTS = {
     "subtitle": {"teacher", "admin"},
 }
 
+ADMIN_UPLOAD_STUDENT_READ_ENDPOINTS = {
+    "admin_upload.list_videos",
+    "admin_upload.subtitle_content",
+}
+
 
 def create_app():
     app = Flask(__name__)
@@ -49,7 +54,7 @@ def create_app():
     @app.before_request
     def enforce_blueprint_session():
         if request.blueprint == "admin_upload":
-            if request.method == "GET" and request.path == "/api/admin_upload/videos":
+            if request.method == "GET" and request.endpoint in ADMIN_UPLOAD_STUDENT_READ_ENDPOINTS:
                 return active_session_guard({"student", "teacher", "admin"})
             return active_session_guard({"teacher", "admin"})
         allowed_roles = ROLE_PROTECTED_BLUEPRINTS.get(request.blueprint)

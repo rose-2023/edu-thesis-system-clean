@@ -99,6 +99,16 @@
           >
             視覺化分析
           </button>
+          <button
+            class="viewTab"
+            :class="{ active: analysisView === 'video' }"
+            type="button"
+            role="tab"
+            :aria-selected="analysisView === 'video'"
+            @click="analysisView = 'video'"
+          >
+            影片觀看紀錄
+          </button>
         </div>
       </section>
 
@@ -130,10 +140,24 @@
 
         <article v-if="isTestMode" class="overviewPanel">
           <div class="sectionHeader compactHeader">
-            <h2>{{ selectedMode === "pretest" ? "前測完成總覽" : "後測完成總覽" }}</h2>
+            <h2>{{ selectedModeConfig.label }}完成總覽</h2>
             <span>來源：parsons_attempts_v2 / parsons_test_attempts</span>
           </div>
-          <div class="overviewCards">
+          <div class="overviewCards compactCards">
+            <div class="overviewCard">
+              <div class="overviewLabel">已完成</div>
+              <div class="overviewValue">{{ selectedTestCompletion.completed_students ?? 0 }}/{{ selectedTestCompletion.total_students ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">完成率</div>
+              <div class="overviewValue">{{ formatPercent(selectedTestCompletion.completion_rate) }}</div>
+            </div>
+            <div class="overviewCard subtle">
+              <div class="overviewLabel">測驗題數</div>
+              <div class="overviewValue">{{ selectedTestCompletion.expected_task_count ?? 0 }}</div>
+            </div>
+          </div>
+          <div v-if="false" class="overviewCards">
             <div class="overviewCard">
               <div class="overviewLabel">應完成學生</div>
               <div class="overviewValue">{{ testCompletionOverview.total_students ?? 0 }}</div>
@@ -160,20 +184,18 @@
 
       <section class="panel">
         <div class="sectionHeader">
-          <h2>學生進度列表</h2>
-          <span>{{ studentProgressRows.length }} 位學生</span>
+          <h2>{{ progressTableTitle }}</h2>
+          <span>{{ progressCountLabel }}</span>
         </div>
-        <div class="tableWrap analytics-table-wrapper">
+        <div v-if="isTestMode" class="tableWrap analytics-table-wrapper">
           <table class="dataTable analytics-table progress-table">
             <colgroup>
-              <col style="width: 13%">
-              <col style="width: 16%">
-              <col style="width: 13%">
-              <col style="width: 11%">
-              <col style="width: 11%">
-              <col style="width: 13%">
-              <col style="width: 11%">
+              <col style="width: 15%">
+              <col style="width: 18%">
+              <col style="width: 14%">
               <col style="width: 12%">
+              <col style="width: 18%">
+              <col style="width: 23%">
             </colgroup>
             <thead>
               <tr>
@@ -181,9 +203,7 @@
                 <th>姓名</th>
                 <th>班級</th>
                 <th>組別</th>
-                <th class="center">前測</th>
-                <th class="center">學習任務</th>
-                <th class="center">後測</th>
+                <th class="center">{{ selectedModeConfig.label }}</th>
                 <th>最後操作時間</th>
               </tr>
             </thead>
@@ -194,32 +214,100 @@
                 <td>{{ row.class_name || "-" }}</td>
                 <td>{{ formatGroupType(row) }}</td>
                 <td class="center">
-                  <span class="status-badge" :class="statusClass(row.pretest_status)">
-                    {{ formatProgressStatus(row.pretest_status) }}
+                  <span class="status-badge" :class="statusClass(selectedTestProgressStatus(row))">
+                    {{ formatProgressStatus(selectedTestProgressStatus(row)) }}
                   </span>
-                  <div class="progress-sub">{{ row.pretest_completed_tasks || 0 }}/{{ row.pretest_total_tasks || 0 }} 題</div>
+                  <div class="progress-sub">{{ selectedTestCompletedTasks(row) }}/{{ selectedTestTotalTasks(row) }} 題</div>
                 </td>
-                <td class="center">
-                  <span class="status-badge" :class="statusClass(row.learning_status)">
-                    {{ formatProgressStatus(row.learning_status) }}
-                  </span>
-                  <div class="progress-sub">{{ row.learning_task_count || 0 }} 題有作答</div>
-                </td>
-                <td class="center">
-                  <span class="status-badge" :class="statusClass(row.posttest_status)">
-                    {{ formatProgressStatus(row.posttest_status) }}
-                  </span>
-                  <div class="progress-sub">{{ row.posttest_completed_tasks || 0 }}/{{ row.posttest_total_tasks || 0 }} 題</div>
-                </td>
-                <td>{{ formatDateTime(row.last_activity_at) }}</td>
+                <td>{{ formatDateTime(selectedProgressLastActivity(row)) }}</td>
               </tr>
               <tr v-if="!loading && studentProgressRows.length === 0">
-                <td class="empty" colspan="8">目前沒有符合條件的學生進度資料</td>
+                <td class="empty" colspan="6">目前沒有符合條件的學生進度資料</td>
               </tr>
             </tbody>
           </table>
         </div>
-        <div v-if="hasPagination(studentProgressRows)" class="paginationControls">
+        <div v-else class="tableWrap analytics-table-wrapper">
+          <table class="dataTable analytics-table practice-matrix-table">
+            <thead>
+              <tr>
+                <th>學號</th>
+                <th>姓名</th>
+                <th v-for="unit in practiceUnitColumns" :key="unit.unit_key" class="center">
+                  {{ unit.unit_label }}
+                </th>
+                <th class="center">整體完成</th>
+                <th>最後操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template v-for="row in pagedPracticeUnitRows" :key="row.student_id">
+                <tr>
+                  <td class="mono">{{ row.student_id }}</td>
+                  <td>{{ row.name || "-" }}</td>
+                  <td v-for="unit in practiceUnitColumns" :key="`${row.student_id}-${unit.unit_key}`" class="center">
+                    <button
+                      class="matrixCellBtn"
+                      :class="statusClass(practiceUnitCell(row, unit).status)"
+                      type="button"
+                      @click="togglePracticeUnit(row, unit)"
+                    >
+                      <span>{{ practiceUnitCell(row, unit).completed_tasks || 0 }}/{{ practiceUnitCell(row, unit).total_tasks || unit.task_total || 0 }}</span>
+                      <span>{{ formatProgressStatus(practiceUnitCell(row, unit).status) }}</span>
+                    </button>
+                  </td>
+                  <td class="center">
+                    <span class="status-badge" :class="statusClass(row.overall_status)">
+                      {{ row.overall_completed_tasks || 0 }}/{{ row.overall_total_tasks || 0 }}
+                    </span>
+                  </td>
+                  <td>{{ formatDateTime(row.latest_practice_at) }}</td>
+                </tr>
+                <tr v-if="isPracticeUnitExpanded(row)" class="matrixExpandRow">
+                  <td :colspan="practiceMatrixColspan">
+                    <div class="matrixExpandPanel">
+                      <div class="matrixExpandTitle">
+                        {{ row.student_id }} / {{ row.name || "-" }} / {{ expandedPracticeUnit.unitLabel }}
+                      </div>
+                      <table class="dataTable analytics-table compact-inner-table">
+                        <thead>
+                          <tr>
+                            <th>題目</th>
+                            <th class="center">狀態</th>
+                            <th class="center">提交次數</th>
+                            <th>最後作答</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="task in expandedPracticeTasks(row)" :key="`${row.student_id}-${task.task_id}`">
+                            <td>
+                              <div class="cell-task-title">{{ task.task_title || task.task_id || "-" }}</div>
+                              <div class="progress-sub mono">{{ task.task_id || "-" }}</div>
+                            </td>
+                            <td class="center">
+                              <span class="status-badge" :class="statusClass(task.status)">
+                                {{ formatProgressStatus(task.status) }}
+                              </span>
+                            </td>
+                            <td class="center compact">{{ task.submission_count || 0 }}</td>
+                            <td>{{ formatDateTime(task.last_submitted_at) }}</td>
+                          </tr>
+                          <tr v-if="expandedPracticeTasks(row).length === 0">
+                            <td class="empty" colspan="4">此單元目前沒有題目資料</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+              <tr v-if="!loading && practiceUnitRows.length === 0">
+                <td class="empty" :colspan="practiceMatrixColspan">目前沒有符合條件的平時練習進度資料</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-if="isTestMode && hasPagination(studentProgressRows)" class="paginationControls">
           <button
             class="pageBtn"
             type="button"
@@ -234,6 +322,105 @@
             type="button"
             :disabled="currentPage('studentProgress', studentProgressRows) >= pageCount(studentProgressRows)"
             @click="setPage('studentProgress', currentPage('studentProgress', studentProgressRows) + 1, studentProgressRows)"
+          >
+            下一頁
+          </button>
+        </div>
+        <div v-if="!isTestMode && hasPagination(practiceUnitRows)" class="paginationControls">
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('practiceUnitMatrix', practiceUnitRows) <= 1"
+            @click="setPage('practiceUnitMatrix', currentPage('practiceUnitMatrix', practiceUnitRows) - 1, practiceUnitRows)"
+          >
+            上一頁
+          </button>
+          <span>{{ paginationText("practiceUnitMatrix", practiceUnitRows) }}</span>
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('practiceUnitMatrix', practiceUnitRows) >= pageCount(practiceUnitRows)"
+            @click="setPage('practiceUnitMatrix', currentPage('practiceUnitMatrix', practiceUnitRows) + 1, practiceUnitRows)"
+          >
+            下一頁
+          </button>
+        </div>
+      </section>
+
+      <section v-if="!isTestMode" class="panel">
+        <div class="sectionHeader">
+          <h2>學生 × 題目最新一輪</h2>
+          <span>{{ practiceTaskLatestRows.length }} 列</span>
+        </div>
+        <div class="tableWrap analytics-table-wrapper">
+          <table class="dataTable analytics-table practice-latest-table">
+            <thead>
+              <tr>
+                <th>學號</th>
+                <th>姓名</th>
+                <th>單元</th>
+                <th>題目</th>
+                <th class="center">作答輪次</th>
+                <th class="center">輪內次數</th>
+                <th class="center">結果</th>
+                <th>最後作答時間</th>
+                <th class="center">提示總次數</th>
+                <th>提示摘要</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template v-for="row in pagedPracticeTaskLatestRows" :key="row.row_key">
+                <tr>
+                  <td class="mono">{{ row.student_id || "-" }}</td>
+                  <td>{{ row.student_name || "-" }}</td>
+                  <td>{{ row.unit_label || "-" }}</td>
+                  <td>
+                    <div class="cell-task-title">{{ row.task_title || row.task_id || "-" }}</div>
+                    <div class="progress-sub mono">{{ row.task_id || "-" }}</div>
+                  </td>
+                  <td class="center compact">{{ row.round_no || "-" }}</td>
+                  <td class="center compact">{{ row.round_attempt_count || 0 }}</td>
+                  <td class="center compact">
+                    <span class="status-badge" :class="statusClass(row.status)">
+                      {{ formatPracticeResult(row.result) }}
+                    </span>
+                  </td>
+                  <td>{{ formatDateTime(row.last_submitted_at) }}</td>
+                  <td class="center compact">{{ row.hint_total_count || 0 }}</td>
+                  <td>
+                    <button class="inlineActionBtn" type="button" @click="toggleHintJson(row)">
+                      {{ isHintJsonExpanded(row) ? "收合 JSON" : "查看 JSON" }}
+                    </button>
+                    <div class="progress-sub">{{ row.hint_summary_text || "-" }}</div>
+                  </td>
+                </tr>
+                <tr v-if="isHintJsonExpanded(row)" class="jsonExpandRow">
+                  <td colspan="10">
+                    <pre class="jsonPreview">{{ formatJson(row.hint_summary || {}) }}</pre>
+                  </td>
+                </tr>
+              </template>
+              <tr v-if="!loading && practiceTaskLatestRows.length === 0">
+                <td class="empty" colspan="10">目前沒有符合條件的學生題目進度資料</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-if="hasPagination(practiceTaskLatestRows)" class="paginationControls">
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('practiceLatestTasks', practiceTaskLatestRows) <= 1"
+            @click="setPage('practiceLatestTasks', currentPage('practiceLatestTasks', practiceTaskLatestRows) - 1, practiceTaskLatestRows)"
+          >
+            上一頁
+          </button>
+          <span>{{ paginationText("practiceLatestTasks", practiceTaskLatestRows) }}</span>
+          <button
+            class="pageBtn"
+            type="button"
+            :disabled="currentPage('practiceLatestTasks', practiceTaskLatestRows) >= pageCount(practiceTaskLatestRows)"
+            @click="setPage('practiceLatestTasks', currentPage('practiceLatestTasks', practiceTaskLatestRows) + 1, practiceTaskLatestRows)"
           >
             下一頁
           </button>
@@ -500,7 +687,7 @@
                       </span>
                       <span v-if="!row.error_types || row.error_types.length === 0">-</span>
                     </td>
-                    <td class="slot-list">{{ formatArray(row.wrong_slots) }}</td>
+                    <td class="slot-list">{{ formatArray(attemptIncorrectSlots(row)) }}</td>
                     <td class="center compact">{{ formatSeconds(row.duration_sec) }}</td>
                   </tr>
                   <tr v-if="!loading && selectedStudentId && studentAttempts.length === 0">
@@ -613,7 +800,7 @@
       </section>
       </template>
 
-      <template v-else>
+      <template v-else-if="analysisView === 'visual'">
         <div v-if="groupType === 'test_data'" class="visualTestNotice" role="status">
           目前為測試資料模式，圖表僅供系統測試，不納入正式研究分析。
         </div>
@@ -739,6 +926,164 @@
           <div v-if="!timelineEvents.length" class="visualizationEmpty">目前沒有符合條件的資料可視覺化。</div>
         </section>
       </template>
+
+      <template v-else>
+        <section class="panel">
+          <div class="sectionHeader">
+            <h2>影片觀看紀錄</h2>
+            <span>資料來源：video_rewatch_logs</span>
+          </div>
+          <p class="note">
+            此分頁僅呈現學生影片觀看歷程，作為輔助資料；不納入 Parsons 主分析指標。
+          </p>
+          <p v-if="videoRewatchError" class="message error">{{ videoRewatchError }}</p>
+          <section class="kpiGrid">
+            <article class="kpiCard">
+              <div class="kpiLabel">有觀看紀錄學生數</div>
+              <div class="kpiValue">{{ videoRewatchTotals.student_count || 0 }}</div>
+            </article>
+            <article class="kpiCard">
+              <div class="kpiLabel">觀看事件筆數</div>
+              <div class="kpiValue">{{ videoRewatchTotals.record_count || 0 }}</div>
+            </article>
+            <article class="kpiCard">
+              <div class="kpiLabel">總觀看時長</div>
+              <div class="kpiValue">{{ formatSeconds(videoRewatchTotals.total_watch_seconds) }}</div>
+            </article>
+          </section>
+        </section>
+
+        <section class="panel">
+          <div class="sectionHeader">
+            <h2>每位學生觀看摘要</h2>
+            <span>{{ videoRewatchSummary.length }} 位學生</span>
+          </div>
+          <div class="tableWrap analytics-table-wrapper">
+            <table class="dataTable analytics-table">
+              <thead>
+                <tr>
+                  <th>學生 ID</th>
+                  <th>姓名</th>
+                  <th>班級</th>
+                  <th>組別</th>
+                  <th class="center">觀看事件</th>
+                  <th class="center">影片數</th>
+                  <th class="center">總觀看時長</th>
+                  <th class="center">平均每筆</th>
+                  <th class="center">看完次數</th>
+                  <th>最後觀看時間</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in pagedVideoRewatchSummary" :key="row.student_id">
+                  <td class="mono">{{ row.student_id }}</td>
+                  <td>{{ row.student_name || "-" }}</td>
+                  <td>{{ row.class_name || "-" }}</td>
+                  <td>{{ formatGroupType(row) }}</td>
+                  <td class="center compact">{{ row.record_count || 0 }}</td>
+                  <td class="center compact">{{ row.video_count || 0 }}</td>
+                  <td class="center compact">{{ formatSeconds(row.total_watch_seconds) }}</td>
+                  <td class="center compact">{{ formatSeconds(row.avg_watch_seconds) }}</td>
+                  <td class="center compact">{{ row.completed_count || 0 }}</td>
+                  <td class="compact">{{ formatTaipeiDateTime(row.latest_event_at) }}</td>
+                </tr>
+                <tr v-if="!loading && videoRewatchSummary.length === 0">
+                  <td class="empty" colspan="10">目前沒有符合條件的影片觀看紀錄。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="hasPagination(videoRewatchSummary)" class="paginationControls compactPagination">
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('videoSummary', videoRewatchSummary) <= 1"
+              @click="setPage('videoSummary', currentPage('videoSummary', videoRewatchSummary) - 1, videoRewatchSummary)"
+            >
+              上一頁
+            </button>
+            <span>{{ paginationText("videoSummary", videoRewatchSummary) }}</span>
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('videoSummary', videoRewatchSummary) >= pageCount(videoRewatchSummary)"
+              @click="setPage('videoSummary', currentPage('videoSummary', videoRewatchSummary) + 1, videoRewatchSummary)"
+            >
+              下一頁
+            </button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="sectionHeader">
+            <h2>觀看事件明細</h2>
+            <span>{{ videoRewatchRecords.length }} 筆紀錄</span>
+          </div>
+          <div class="tableWrap analytics-table-wrapper">
+            <table class="dataTable analytics-table video-rewatch-table">
+              <thead>
+                <tr>
+                  <th>觀看時間</th>
+                  <th>學生 ID</th>
+                  <th>姓名</th>
+                  <th>影片</th>
+                  <th>事件</th>
+                  <th class="center">觀看秒數</th>
+                  <th class="center">本次增量</th>
+                  <th class="center">目前進度</th>
+                  <th class="center">影片長度</th>
+                  <th class="center">是否看完</th>
+                  <th>任務 ID</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in pagedVideoRewatchRecords" :key="row.log_id">
+                  <td class="compact">{{ formatTaipeiDateTime(row.event_at) }}</td>
+                  <td class="mono">{{ row.student_id || "-" }}</td>
+                  <td>{{ row.student_name || "-" }}</td>
+                  <td>
+                    <div class="cell-task-title" :title="row.video_title || row.video_id || '-'">
+                      {{ row.video_title || row.video_id || "-" }}
+                    </div>
+                    <div class="progress-sub">{{ row.unit_id || "-" }}</div>
+                  </td>
+                  <td>
+                    <span class="event-badge">{{ formatEventType(row.event_type, row) }}</span>
+                  </td>
+                  <td class="center compact">{{ formatSeconds(row.watch_seconds) }}</td>
+                  <td class="center compact">{{ formatSeconds(row.watch_delta_sec) }}</td>
+                  <td class="center compact">{{ formatSeconds(row.current_time_sec) }}</td>
+                  <td class="center compact">{{ formatSeconds(row.video_duration_sec) }}</td>
+                  <td class="center compact">{{ row.reached_end || row.completed_fully ? "是" : "否" }}</td>
+                  <td class="mono">{{ row.task_id || "-" }}</td>
+                </tr>
+                <tr v-if="!loading && videoRewatchRecords.length === 0">
+                  <td class="empty" colspan="11">目前沒有符合條件的 video_rewatch_logs 紀錄。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="hasPagination(videoRewatchRecords)" class="paginationControls compactPagination">
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('videoRecords', videoRewatchRecords) <= 1"
+              @click="setPage('videoRecords', currentPage('videoRecords', videoRewatchRecords) - 1, videoRewatchRecords)"
+            >
+              上一頁
+            </button>
+            <span>{{ paginationText("videoRecords", videoRewatchRecords) }}</span>
+            <button
+              class="pageBtn"
+              type="button"
+              :disabled="currentPage('videoRecords', videoRewatchRecords) >= pageCount(videoRewatchRecords)"
+              @click="setPage('videoRecords', currentPage('videoRecords', videoRewatchRecords) + 1, videoRewatchRecords)"
+            >
+              下一頁
+            </button>
+          </div>
+        </section>
+      </template>
     </main>
   </div>
 </template>
@@ -770,12 +1115,22 @@ const csvMessage = ref("");
 const invalidRows = ref([]);
 const studentCsvInput = ref(null);
 const analysis = ref(emptyAnalysis());
+const videoRewatch = ref(emptyVideoRewatch());
+const videoRewatchError = ref("");
 const studentOptions = ref([]);
+const expandedPracticeUnit = reactive({
+  studentId: "",
+  unitKey: "",
+  unitLabel: "",
+});
+const expandedHintJsonKey = ref("");
 // 分頁功能
 const pageSize = 5;
 const chartPreviewLimit = 10;
 const showAllCharts = ref(false);
 const pagination = reactive({
+  practiceUnitMatrix: 1,
+  practiceLatestTasks: 1,
   studentProgress: 1,
   studentSummary: 1,
   taskErrors: 1,
@@ -783,6 +1138,8 @@ const pagination = reactive({
   studentAttempts: 1,
   studentLogs: 1,
   studentTimeline: 1,
+  videoSummary: 1,
+  videoRecords: 1,
 });
 
 const selectedModeConfig = computed(() => (
@@ -791,19 +1148,42 @@ const selectedModeConfig = computed(() => (
 const kpis = computed(() => analysis.value.kpis || {});
 const userGroupOverview = computed(() => analysis.value.user_group_overview || {});
 const testCompletionOverview = computed(() => analysis.value.test_completion_overview || {});
+const testCompletionOverviews = computed(() => analysis.value.test_completion_overviews || {});
+const pretestCompletion = computed(() => testCompletionOverviews.value.pretest || {});
+const posttestCompletion = computed(() => testCompletionOverviews.value.posttest || {});
 const studentProgressRows = computed(() => analysis.value.student_progress_rows || []);
+const practiceUnitColumns = computed(() => analysis.value.practice_unit_columns || []);
+const practiceUnitRows = computed(() => analysis.value.practice_unit_progress_rows || []);
+const practiceTaskLatestRows = computed(() => analysis.value.practice_task_latest_rows || []);
 const studentRows = computed(() => analysis.value.student_overview || []);
 const taskRows = computed(() => analysis.value.task_error_analysis || []);
 const conceptRows = computed(() => analysis.value.concept_error_analysis || []);
 const studentAttempts = computed(() => analysis.value.student_attempts || []);
 const studentLogs = computed(() => analysis.value.student_logs || []);
+const videoRewatchTotals = computed(() => videoRewatch.value.summary || {});
+const videoRewatchSummary = computed(() => videoRewatch.value.student_summary || []);
+const videoRewatchRecords = computed(() => videoRewatch.value.records || []);
 const pagedStudentProgressRows = computed(() => pageItems(studentProgressRows.value, "studentProgress"));
+const pagedPracticeUnitRows = computed(() => pageItems(practiceUnitRows.value, "practiceUnitMatrix"));
+const pagedPracticeTaskLatestRows = computed(() => pageItems(practiceTaskLatestRows.value, "practiceLatestTasks"));
 const pagedStudentRows = computed(() => pageItems(studentRows.value, "studentSummary"));
 const pagedTaskRows = computed(() => pageItems(taskRows.value, "taskErrors"));
 const pagedConceptRows = computed(() => pageItems(conceptRows.value, "conceptErrors"));
 const pagedStudentAttempts = computed(() => pageItems(studentAttempts.value, "studentAttempts"));
 const pagedStudentLogs = computed(() => pageItems(studentLogs.value, "studentLogs"));
+const pagedVideoRewatchSummary = computed(() => pageItems(videoRewatchSummary.value, "videoSummary"));
+const pagedVideoRewatchRecords = computed(() => pageItems(videoRewatchRecords.value, "videoRecords"));
 const isTestMode = computed(() => selectedMode.value === "pretest" || selectedMode.value === "posttest");
+const selectedTestCompletion = computed(() => (
+  selectedMode.value === "posttest" ? posttestCompletion.value : pretestCompletion.value
+));
+const progressTableTitle = computed(() => (
+  isTestMode.value ? `${selectedModeConfig.value.label}學生進度列表` : "平時練習進度列表"
+));
+const progressCountLabel = computed(() => (
+  isTestMode.value ? `${studentProgressRows.value.length} 位學生` : `${practiceUnitRows.value.length} 位學生`
+));
+const practiceMatrixColspan = computed(() => Math.max(4 + practiceUnitColumns.value.length, 4));
 const conceptChartItems = computed(() => (
   [...conceptRows.value]
     .sort((a, b) => Number(b.wrong_attempts || 0) - Number(a.wrong_attempts || 0))
@@ -920,6 +1300,9 @@ const timelineEvents = computed(() => {
     "ai_hint_view",
     "submit_after_hint",
     "ai_hint_second_request",
+    "second_hint_reminder_shown",
+    "second_hint_reminder_clicked",
+    "second_hint_reminder_ignored",
     "return_to_task",
   ]);
   return studentLogs.value
@@ -979,12 +1362,52 @@ function emptyAnalysis() {
       total_student_count: 0,
     },
     test_completion_overview: null,
+    test_completion_overviews: {
+      pretest: null,
+      posttest: null,
+    },
+    data_sources: [],
+    wrong_slot_distribution: [],
+    wrong_type_distribution: [],
+    intervention_metrics: {
+      wrong_attempt_count: 0,
+      hint_intervention_count: 0,
+      hint_intervention_rate: 0,
+      corrected_after_hint_count: 0,
+      corrected_after_hint_rate: 0,
+      no_hint_wrong_count: 0,
+      corrected_without_hint_count: 0,
+      corrected_without_hint_rate: 0,
+    },
+    pre_post_score_gain: {
+      matched_student_count: 0,
+      avg_score_gain: null,
+      rows: [],
+      data_sources: [],
+    },
     student_progress_rows: [],
+    practice_unit_columns: [],
+    practice_unit_progress_rows: [],
+    practice_task_latest_rows: [],
     student_overview: [],
     task_error_analysis: [],
     concept_error_analysis: [],
     student_attempts: [],
     student_logs: [],
+  };
+}
+
+function emptyVideoRewatch() {
+  return {
+    ok: true,
+    data_source: "video_rewatch_logs",
+    summary: {
+      student_count: 0,
+      record_count: 0,
+      total_watch_seconds: 0,
+    },
+    student_summary: [],
+    records: [],
   };
 }
 
@@ -1027,8 +1450,17 @@ function resetPagination() {
   }
 }
 
+function resetPracticeExpansions() {
+  expandedPracticeUnit.studentId = "";
+  expandedPracticeUnit.unitKey = "";
+  expandedPracticeUnit.unitLabel = "";
+  expandedHintJsonKey.value = "";
+}
+
 function clampPagination() {
   const sources = {
+    practiceUnitMatrix: practiceUnitRows.value,
+    practiceLatestTasks: practiceTaskLatestRows.value,
     studentProgress: studentProgressRows.value,
     studentSummary: studentRows.value,
     taskErrors: taskRows.value,
@@ -1036,6 +1468,8 @@ function clampPagination() {
     studentAttempts: studentAttempts.value,
     studentLogs: studentLogs.value,
     studentTimeline: timelineEvents.value,
+    videoSummary: videoRewatchSummary.value,
+    videoRecords: videoRewatchRecords.value,
   };
   for (const [key, rows] of Object.entries(sources)) {
     pagination[key] = currentPage(key, rows);
@@ -1079,6 +1513,12 @@ function formatArray(value) {
   return Array.isArray(value) && value.length ? value.join(", ") : "-";
 }
 
+function attemptIncorrectSlots(row) {
+  if (Array.isArray(row?.incorrect_slots)) return row.incorrect_slots;
+  if (Array.isArray(row?.wrong_slots)) return row.wrong_slots;
+  return [];
+}
+
 const eventTypeLabels = {
   session_start: "工作階段開始",
   session_end: "工作階段結束",
@@ -1114,6 +1554,9 @@ Object.assign(eventTypeLabels, {
   ai_hint_view: "查看 AI 提示",
   submit_after_hint: "提示後提交",
   ai_hint_second_request: "查看第二次 AI 提示",
+  second_hint_reminder_shown: "第二次提示提醒顯示",
+  second_hint_reminder_clicked: "點擊第二次提示提醒",
+  second_hint_reminder_ignored: "未查看第二次提示",
 });
 
 const metadataValueLabels = {
@@ -1234,6 +1677,9 @@ function formatMetadataSummary(row) {
     "ai_hint_view",
     "submit_after_hint",
     "ai_hint_second_request",
+    "second_hint_reminder_shown",
+    "second_hint_reminder_clicked",
+    "second_hint_reminder_ignored",
   ].includes(row.event_type)) {
     const hintId = metadata.hint_id || row.hint_id;
     const hintNo = metadata.requested_hint_no ?? metadata.hint_no ?? row.requested_hint_no ?? row.hint_no;
@@ -1250,8 +1696,11 @@ function formatMetadataSummary(row) {
     if (Array.isArray(metadata.error_types) && metadata.error_types.length) {
       parts.push(`錯誤類型：${metadata.error_types.join("、")}`);
     }
-    if (Array.isArray(metadata.wrong_slots) && metadata.wrong_slots.length) {
-      parts.push(`錯誤位置：${metadata.wrong_slots.join(", ")}`);
+    const incorrectSlots = Array.isArray(metadata.incorrect_slots)
+      ? metadata.incorrect_slots
+      : metadata.wrong_slots;
+    if (Array.isArray(incorrectSlots) && incorrectSlots.length) {
+      parts.push(`錯誤位置：${incorrectSlots.join(", ")}`);
     }
     const hintText = compactMetadataText(
       metadata.hint_content
@@ -1322,6 +1771,89 @@ function formatDateTime(value) {
   return value ? formatTaipeiDateTime(value) : "-";
 }
 
+function practiceUnitCell(row, unit) {
+  const unitKey = typeof unit === "string" ? unit : unit?.unit_key;
+  return row?.units?.[unitKey] || {
+    completed_tasks: 0,
+    attempted_tasks: 0,
+    total_tasks: typeof unit === "object" ? Number(unit?.task_total || 0) : 0,
+    status: "not_started",
+    tasks: [],
+  };
+}
+
+function togglePracticeUnit(row, unit) {
+  const studentId = String(row?.student_id || "");
+  const unitKey = String(unit?.unit_key || "");
+  if (!studentId || !unitKey) return;
+  if (expandedPracticeUnit.studentId === studentId && expandedPracticeUnit.unitKey === unitKey) {
+    expandedPracticeUnit.studentId = "";
+    expandedPracticeUnit.unitKey = "";
+    expandedPracticeUnit.unitLabel = "";
+    return;
+  }
+  expandedPracticeUnit.studentId = studentId;
+  expandedPracticeUnit.unitKey = unitKey;
+  expandedPracticeUnit.unitLabel = String(unit?.unit_label || unitKey);
+}
+
+function isPracticeUnitExpanded(row) {
+  return expandedPracticeUnit.studentId === String(row?.student_id || "")
+    && Boolean(expandedPracticeUnit.unitKey);
+}
+
+function expandedPracticeTasks(row) {
+  if (!isPracticeUnitExpanded(row)) return [];
+  return practiceUnitCell(row, expandedPracticeUnit.unitKey).tasks || [];
+}
+
+function formatPracticeResult(value) {
+  if (value === "correct") return "正確";
+  if (value === "incorrect") return "錯誤";
+  if (value === "not_started") return "未開始";
+  return "-";
+}
+
+function toggleHintJson(row) {
+  const key = String(row?.row_key || "");
+  if (!key) return;
+  expandedHintJsonKey.value = expandedHintJsonKey.value === key ? "" : key;
+}
+
+function isHintJsonExpanded(row) {
+  return expandedHintJsonKey.value === String(row?.row_key || "");
+}
+
+function formatJson(value) {
+  try {
+    return JSON.stringify(value || {}, null, 2);
+  } catch (error) {
+    return String(value || "");
+  }
+}
+
+function selectedTestProgressStatus(row) {
+  return selectedMode.value === "posttest" ? row?.posttest_status : row?.pretest_status;
+}
+
+function selectedTestCompletedTasks(row) {
+  return selectedMode.value === "posttest"
+    ? Number(row?.posttest_completed_tasks || 0)
+    : Number(row?.pretest_completed_tasks || 0);
+}
+
+function selectedTestTotalTasks(row) {
+  return selectedMode.value === "posttest"
+    ? Number(row?.posttest_total_tasks || 0)
+    : Number(row?.pretest_total_tasks || 0);
+}
+
+function selectedProgressLastActivity(row) {
+  if (selectedMode.value === "posttest") return row?.latest_posttest_at || null;
+  if (selectedMode.value === "pretest") return row?.latest_pretest_at || null;
+  return row?.latest_practice_at || null;
+}
+
 function selectedGroupFilter() {
   if (groupType.value === "control") return "control";
   if (groupType.value === "experimental") return "experimental";
@@ -1358,6 +1890,16 @@ function buildGroupExportQuery() {
 function buildQuery() {
   const params = buildFilterQuery();
   params.set("logs_limit", "120");
+  params.set("_ts", String(Date.now()));
+  return params;
+}
+
+function buildVideoRewatchQuery() {
+  const params = new URLSearchParams();
+  if (className.value) params.set("class_name", className.value);
+  if (groupType.value) params.set("group_type", groupType.value);
+  if (selectedStudentId.value) params.set("student_id", selectedStudentId.value);
+  params.set("limit", "1000");
   params.set("_ts", String(Date.now()));
   return params;
 }
@@ -1771,23 +2313,39 @@ async function fetchAnalysis() {
   try {
     loading.value = true;
     errorMsg.value = "";
-    const [analysisResponse] = await Promise.all([
+    videoRewatchError.value = "";
+    const [analysisResponse, videoRewatchResponse] = await Promise.all([
       fetch(`${API_BASE}/api/teacher/analysis/parsons?${buildQuery().toString()}`),
+      fetch(`${API_BASE}/api/teacher/analysis/video-rewatch?${buildVideoRewatchQuery().toString()}`),
       fetchStudentOptions(),
     ]);
     const data = await analysisResponse.json().catch(() => ({}));
     if (!analysisResponse.ok || data?.ok === false) {
       throw new Error(data?.message || `analysis failed: ${analysisResponse.status}`);
     }
+    const videoData = await videoRewatchResponse.json().catch(() => ({}));
     analysis.value = {
       ...emptyAnalysis(),
       ...data,
     };
+    if (!videoRewatchResponse.ok || videoData?.ok === false) {
+      videoRewatch.value = emptyVideoRewatch();
+      videoRewatchError.value = videoData?.message || `video rewatch analysis failed: ${videoRewatchResponse.status}`;
+    } else {
+      videoRewatch.value = {
+        ...emptyVideoRewatch(),
+        ...videoData,
+      };
+    }
+    resetPracticeExpansions();
     resetPagination();
   } catch (error) {
     errorMsg.value = error?.message || String(error);
     analysis.value = emptyAnalysis();
+    videoRewatch.value = emptyVideoRewatch();
+    videoRewatchError.value = "";
     studentOptions.value = [];
+    resetPracticeExpansions();
     resetPagination();
   } finally {
     loading.value = false;
@@ -1797,22 +2355,37 @@ async function fetchAnalysis() {
 function setMode(mode) {
   selectedMode.value = mode;
   selectedStudentId.value = "";
+  resetPracticeExpansions();
   fetchAnalysis();
 }
 
 function onGroupChange() {
   selectedStudentId.value = "";
+  resetPracticeExpansions();
   fetchAnalysis();
 }
 
 function selectStudent(studentId) {
   if (!studentId) return;
   selectedStudentId.value = studentId;
+  resetPracticeExpansions();
   fetchAnalysis();
 }
 
 watch(
-  [studentProgressRows, studentRows, taskRows, conceptRows, studentAttempts, studentLogs, timelineEvents],
+  [
+    studentProgressRows,
+    practiceUnitRows,
+    practiceTaskLatestRows,
+    studentRows,
+    taskRows,
+    conceptRows,
+    studentAttempts,
+    studentLogs,
+    timelineEvents,
+    videoRewatchSummary,
+    videoRewatchRecords,
+  ],
   () => clampPagination(),
 );
 
@@ -2072,6 +2645,30 @@ onMounted(() => {
   gap: 10px;
 }
 
+.testOverviewPair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.testOverviewCard {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.testOverviewTitle {
+  margin-bottom: 10px;
+  color: #1e3a8a;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.compactCards {
+  grid-template-columns: repeat(3, minmax(90px, 1fr));
+}
+
 .overviewCard {
   min-width: 0;
   padding: 13px 14px;
@@ -2103,6 +2700,102 @@ onMounted(() => {
 
 .progress-table {
   min-width: 980px;
+}
+
+.practice-matrix-table,
+.practice-latest-table {
+  min-width: 1040px;
+}
+
+.matrixCellBtn {
+  display: inline-grid;
+  min-width: 86px;
+  gap: 2px;
+  justify-items: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 7px 9px;
+  color: #334155;
+  background: #f8fafc;
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.matrixCellBtn.done {
+  color: #166534;
+  border-color: #86efac;
+  background: #dcfce7;
+}
+
+.matrixCellBtn.doing {
+  color: #92400e;
+  border-color: #fcd34d;
+  background: #fef3c7;
+}
+
+.matrixCellBtn.idle {
+  color: #475569;
+  border-color: #cbd5e1;
+  background: #f1f5f9;
+}
+
+.matrixCellBtn:hover {
+  border-color: #146c64;
+  box-shadow: 0 0 0 3px rgba(20, 108, 100, 0.1);
+}
+
+.matrixExpandRow td,
+.jsonExpandRow td {
+  background: #f8fafc;
+}
+
+.matrixExpandPanel {
+  padding: 10px;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.matrixExpandTitle {
+  margin-bottom: 8px;
+  color: #1e3a8a;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.compact-inner-table {
+  min-width: 640px;
+}
+
+.inlineActionBtn {
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  padding: 5px 10px;
+  color: #146c64;
+  background: #ffffff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.inlineActionBtn:hover {
+  border-color: #146c64;
+  background: #f0fdfa;
+}
+
+.jsonPreview {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  color: #172033;
+  background: #ffffff;
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
 }
 
 .status-badge {
@@ -2523,6 +3216,10 @@ onMounted(() => {
     grid-template-columns: repeat(2, minmax(160px, 1fr));
   }
 
+  .testOverviewPair {
+    grid-template-columns: 1fr;
+  }
+
   .kpiGrid {
     grid-template-columns: repeat(3, minmax(160px, 1fr));
   }
@@ -2557,6 +3254,7 @@ onMounted(() => {
 
   .filters,
   .overviewCards,
+  .testOverviewPair,
   .kpiGrid {
     grid-template-columns: 1fr;
   }

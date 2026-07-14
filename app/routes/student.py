@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timezone
 from ..db import db
+from ..unit_labels import unit_label_map, unit_label
 from ..avatar_utils import resolve_avatar_src
 from ..session_auth import current_participant_id, current_student_id
 import os
@@ -125,11 +126,11 @@ def units_progress():
         videos = list(
             db.videos.find(
                 {"deleted": {"$ne": True}, "is_deleted": {"$ne": True}},
-                {"_id": 1, "unit": 1, "title": 1, "is_active": 1},
+                {"_id": 1, "unit": 1, "title": 1, "is_active": 1, "active": 1},
             )
         )
         # 只計算「啟用」的影片；若你的 schema 不叫 is_active，這段也不會炸（預設 True）
-        videos = [v for v in videos if v.get("is_active", True)]
+        videos = [v for v in videos if v.get("is_active", v.get("active", True))]
 
         # unit -> [video_id]
         unit_videos: dict = {}
@@ -139,6 +140,7 @@ def units_progress():
                 continue
             vid = str(v.get("_id"))
             unit_videos.setdefault(u, []).append(vid)
+        labels = unit_label_map(unit_videos.keys())
 
         # 2) 取得學生作答紀錄（parsons_attempts）
         #    以「某影片至少有一次正確作答」視為該影片完成
@@ -164,6 +166,7 @@ def units_progress():
             units_out.append(
                 {
                     "unit": unit,
+                    "unit_label": labels.get(unit) or unit,
                     "total_videos": total,
                     "done_videos": done,
                     "progress": progress,
@@ -345,6 +348,7 @@ def unit_learning(unit):
 
     video = {
         "unit": v.get("unit"),
+        "unit_label": unit_label(v.get("unit")),
         "title": v.get("title"),
         "video_url": "/" + (v.get("path") or "").lstrip("/"),
         "subtitle_path": "/" + (v.get("subtitle_path") or "").lstrip("/"),

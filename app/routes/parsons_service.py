@@ -1349,6 +1349,10 @@ def _build_fallback_payload_from_doc(doc: dict, constraints: dict) -> Optional[D
             return None
 
         solution_lines = [str(b.get("text") or "") for b in solution_blocks]
+        rule_check = build_rule_check(solution_lines, constraints)
+        if not bool((rule_check or {}).get("ok")):
+            return None
+
         _labels = _build_contextual_semantic_labels(solution_lines, question_text)
         for i, b in enumerate(solution_blocks):
             b["semantic_zh"] = _soften_semantic_hint(_labels[i], b.get("text") or "", is_distractor=False)
@@ -1369,7 +1373,7 @@ def _build_fallback_payload_from_doc(doc: dict, constraints: dict) -> Optional[D
             },
             "unit_type": (constraints or {}).get("unit_type") or "loop",
             "constraints": constraints,
-            "rule_check": build_rule_check(solution_lines, constraints),
+            "rule_check": rule_check,
             "source_subtitle": {"text_used": ""},
             "subtitle_range": {"start_index": 0, "end_index": 0, "start_ts": 0, "end_ts": 0},
             "subtitle_text_used": "",
@@ -1382,7 +1386,7 @@ def _build_fallback_payload_from_doc(doc: dict, constraints: dict) -> Optional[D
 # =========================
 # t5doc_to_parsons_task (teacher->student normalize)
 # =========================
-
+# 後端備援題目生成器（舊版程式內建備援）
 def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: str = "L1", teacher_description: str = "") -> Dict[str, Any]:
     constraints = resolve_unit_constraints(unit)
     unit_type = (constraints or {}).get("unit_type") or "loop"
@@ -1397,7 +1401,7 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
 
     if unit_type == "io":
         question_text = "（備援題目）請輸入兩個整數，並輸出它們的總和。"
-        solution_lines = ["x = int(input())", "y = int(input())", "print(x + y)"]
+        solution_lines = ["x = int(input())", "y = int(input())", "total = x + y", "print(total)"]
         distractor_lines = ["x = input()", "y = input()", "print(x - y)", "print(x * y)"]
 
     elif unit_type == "condition":
@@ -1433,7 +1437,25 @@ def simple_fallback_generate(sub_text: str, unit: str, video_title: str, level: 
         ]
 
     else:
-        if loop_style == "while_only":
+        if (constraints or {}).get("require_list_ops") or (constraints or {}).get("prefer_list_ops"):
+            question_text = "（備援題目）請輸入 3 筆成績，先存入串列，再用 for 迴圈走訪串列並輸出總和。"
+            solution_lines = [
+                "scores = []",
+                "for i in range(3):",
+                "    score = int(input())",
+                "    scores.append(score)",
+                "total = 0",
+                "for score in scores:",
+                "    total += score",
+                "print(total)",
+            ]
+            distractor_lines = [
+                "scores = 0",
+                "score.append(scores)",
+                "for score in range(scores):",
+                "total = score",
+            ]
+        elif loop_style == "while_only":
             question_text = "（備援題目）請使用 while 迴圈，計算 1 到 3 的總和並輸出結果。"
             solution_lines = [
                 "i = 1",
@@ -1519,7 +1541,14 @@ def resolve_unit_constraints(unit: str) -> Dict[str, Any]:
     if "-WHILE" in u or u.startswith("U5"):
         return {"unit_type": "loop", "loop_style": "while_only"}
     if "-LIST" in u or u.startswith("U6"):
-        return {"unit_type": "loop", "loop_style": "for_only", "prefer_list_ops": True}
+        return {
+            "unit_type": "loop",
+            "loop_style": "for_only",
+            "prefer_list_ops": True,
+            "require_list_ops": True,
+            "require_append": True,
+            "require_list_iteration": True,
+        }
     if "-FUNCTION" in u or u.startswith("U7"):
         return {"unit_type": "function", "require_def": True, "forbid_class": True}
     if "-LOOP" in u:
@@ -1537,6 +1566,8 @@ def _pick_trace_window(segs: list, constraints: dict, max_lines: int = 7) -> Dic
         "function": ["def", "function", "函式", "return", "參數", "呼叫"],
     }
     kws = kw_map.get(unit_type, [])
+    if (constraints or {}).get("prefer_list_ops") or (constraints or {}).get("require_list_ops"):
+        kws = list(kws) + ["list", "列表", "清單", "串列", "陣列", "append", "走訪"]
     hit = None
     for i, s in enumerate(segs or []):
         t = (s.get("text") or "").lower()
@@ -1781,6 +1812,9 @@ def build_rule_check(solution_lines: list, constraints: dict) -> Dict[str, Any]:
         "has_range": _re.search(r"\brange\s*\(", text) is not None,
         "has_accumulate": (_re.search(r"\+=", text) is not None) or (_re.search(r"(\w+)\s*=\s*\1\s*\+\s*\d+", text) is not None),
         "has_break": _re.search(r"\bbreak\b", text) is not None,
+        "has_list_literal": _re.search(r"=\s*\[\s*\]", text) is not None,
+        "has_append": _re.search(r"\.\s*append\s*\(", text) is not None,
+        "has_list_iteration": _re.search(r"^\s*for\s+[A-Za-z_]\w*\s+in\s+(?!range\b)[A-Za-z_]\w*\s*:", text, flags=_re.M) is not None,
     }
     rc["has_loop"] = rc["has_for"] or rc["has_while"]
 
@@ -1841,6 +1875,19 @@ def build_rule_check(solution_lines: list, constraints: dict) -> Dict[str, Any]:
             elif loop_style == "while_only" and rc["has_for"]:
                 ok = False
                 reason = "while_only but contains for"
+            elif constraints.get("require_list_ops") or constraints.get("prefer_list_ops"):
+                if not rc["has_for"]:
+                    ok = False
+                    reason = "list task missing for"
+                elif not rc["has_list_literal"]:
+                    ok = False
+                    reason = "list task missing [] initialization"
+                elif constraints.get("require_append") and not rc["has_append"]:
+                    ok = False
+                    reason = "list task missing append"
+                elif constraints.get("require_list_iteration") and not rc["has_list_iteration"]:
+                    ok = False
+                    reason = "list task missing for-list traversal"
 
     rc["ok"] = ok
     rc["reason"] = reason
@@ -1925,6 +1972,14 @@ def _label_for_code_line(line: str) -> str:
         return "補充另一個條件分支"
     if _re.match(r"else\s*:", s):
         return "處理其餘未符合條件的情況"
+
+    # list
+    if _re.match(r"\w+\s*=\s*\[\s*\]", s):
+        return "建立空串列，用來收集多筆資料"
+    if ".append(" in low:
+        return "把目前資料加入串列"
+    if _re.match(r"for\s+\w+\s+in\s+(?!range\()\w+\s*:", s):
+        return "使用 for 迴圈走訪串列中的資料"
 
     # input / print
     if "input(" in low:
@@ -3129,6 +3184,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     constraints = resolve_unit_constraints(unit)
     unit_type = (constraints or {}).get("unit_type") or "loop"
     function_mode = (unit_type == "function")
+    require_list_ops = bool((constraints or {}).get("require_list_ops") or (constraints or {}).get("prefer_list_ops"))
 
     # --- subtitles ---
     segs = parse_srt_segments(subtitle_text)
@@ -3384,6 +3440,30 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         },
     ]
 
+    scenarios_list = [
+        {
+            "name": "list_sum_append",
+            "desc": "串列累加：輸入 3 筆成績，先建立空串列 []，每次用 append() 加入資料，再用 for 迴圈走訪串列計算總和並輸出。",
+            "tests": [["80", "90", "70"]],
+            "check": "nums>=1",
+            "keywords": ["list", "列表", "清單", "串列", "append", "走訪", "總和", "加總"],
+        },
+        {
+            "name": "list_print_items",
+            "desc": "串列走訪：輸入 3 筆資料，先存入串列，再用 for 迴圈逐一走訪串列並輸出每個元素。",
+            "tests": [["5", "8", "13"]],
+            "check": "nums>=1",
+            "keywords": ["list", "列表", "清單", "串列", "append", "走訪", "逐一"],
+        },
+        {
+            "name": "list_filter_even",
+            "desc": "串列篩選：輸入 3 個整數，存入串列後用 for 迴圈走訪串列，輸出其中的偶數。",
+            "tests": [["3", "4", "8"]],
+            "check": "nums>=1",
+            "keywords": ["list", "列表", "清單", "串列", "append", "走訪", "偶數", "篩選"],
+        },
+    ]
+
     scenarios_while = [
         {
             "name": "avg_scores",
@@ -3415,7 +3495,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         },
         {
             "name": "guess_game",
-            "desc": "猜數字：反覆輸入猜測直到猜中答案（可在程式中寫死答案），輸出猜測次數。",
+            "desc": "猜數字：反覆輸入猜測直到猜中答案（可在程式中寫死答案），最後輸出猜測次數。",
             "tests": [["3", "7"]],
             "check": "nums>=1",
             "keywords": ["猜", "猜數字", "guess"],
@@ -3442,6 +3522,8 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     # 依 loop_style 選對應情境池
     if function_mode:
         scenarios = scenarios_function
+    elif require_list_ops:
+        scenarios = scenarios_list
     elif loop_style == "for_only":
         scenarios = scenarios_for
     elif loop_style == "while_only":
@@ -3743,6 +3825,22 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         joined = "\n".join(lines).lower()
         return ("break" in joined) or any(ln.strip().startswith("while ") and ("true" not in ln.lower()) for ln in lines)
 
+    def _has_list_literal(lines: list) -> bool:
+        return _re.search(r"=\s*\[\s*\]", "\n".join(lines or [])) is not None
+
+    def _has_append_call(lines: list) -> bool:
+        return _re.search(r"\.\s*append\s*\(", "\n".join(lines or [])) is not None
+
+    def _has_list_iteration(lines: list) -> bool:
+        return _re.search(
+            r"^\s*for\s+[A-Za-z_]\w*\s+in\s+(?!range\b)[A-Za-z_]\w*\s*:",
+            "\n".join(lines or []),
+            flags=_re.M,
+        ) is not None
+
+    def _has_for_loop(lines: list) -> bool:
+        return _re.search(r"^\s*for\b", "\n".join(lines or []), flags=_re.M) is not None
+
     # AST sandbox
     ALLOWED_NODES = (
         ast.Module, ast.Assign, ast.AugAssign, ast.Expr, ast.Call,
@@ -3770,11 +3868,17 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             #     return False
 
             # ✅ 仍保留：擋掉危險/你不希望出現的語法
-            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Attribute, ast.Subscript,
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Subscript,
                                  ast.Lambda, ast.With, ast.Try, ast.ClassDef)):
                 print("[AST_SAFE] rejected node:", type(node).__name__)
                 print("[AST_SAFE] code:\n" + code)
                 return False
+
+            if isinstance(node, ast.Attribute):
+                if node.attr != "append" or not isinstance(node.value, ast.Name):
+                    print("[AST_SAFE] rejected attribute:", getattr(node, "attr", ""))
+                    print("[AST_SAFE] code:\n" + code)
+                    return False
 
             if (not function_mode) and isinstance(node, ast.FunctionDef):
                 print("[AST_SAFE] rejected node:", type(node).__name__)
@@ -3789,6 +3893,11 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
                         print("[AST_SAFE] rejected call:", node.func.id)
                         print("[AST_SAFE] code:\n" + code)
                         return False
+                elif isinstance(node.func, ast.Attribute):
+                    if node.func.attr != "append" or not isinstance(node.func.value, ast.Name):
+                        print("[AST_SAFE] rejected call:", getattr(node.func, "attr", ""))
+                        print("[AST_SAFE] code:\n" + code)
+                        return False
                 else:
                     # 例如 obj.method() 會是 Attribute call（上面已擋 Attribute），但這裡保險
                     print("[AST_SAFE] rejected call: non-Name func")
@@ -3798,13 +3907,14 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         return True
 
     def _run_with_inputs(code: str, inputs: list) -> str:
-        it = iter(inputs)
+        input_values = [str(x) for x in (inputs or [])]
+        it = iter(input_values)
 
         def _fake_input(prompt=""):
             try:
                 return next(it)
             except StopIteration:
-                return ""
+                raise RuntimeError(f"input exhausted after {len(input_values)} values")
 
         out = io.StringIO()
         safe_globals = {"__builtins__": {}}
@@ -3820,6 +3930,45 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         with contextlib.redirect_stdout(out):
             exec(code, safe_globals, safe_locals)
         return out.getvalue().strip()
+
+    def _extract_guess_target(code: str) -> Optional[float]:
+        """Best-effort parse for guess-game constants so verifier inputs match AI output."""
+        try:
+            tree = ast.parse(code)
+        except Exception:
+            return None
+        likely_names = {
+            "target", "target_score", "target_number", "target_value",
+            "answer", "answer_score", "ans",
+            "secret", "secret_score", "secret_number",
+            "correct", "correct_score", "correct_number",
+            "goal", "goal_score",
+        }
+        counter_tokens = ("count", "guess", "attempt", "tries")
+        fallback_value = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if not names:
+                continue
+            val = node.value
+            if isinstance(val, ast.Constant) and isinstance(val.value, (int, float)):
+                parsed = float(val.value)
+            elif isinstance(val, ast.Constant) and isinstance(val.value, str):
+                try:
+                    parsed = float(val.value.strip())
+                except Exception:
+                    continue
+            else:
+                continue
+            if any(name in likely_names for name in names):
+                return parsed
+            if fallback_value is None and parsed not in (0, 1) and not any(
+                token in name.lower() for name in names for token in counter_tokens
+            ):
+                fallback_value = parsed
+        return fallback_value
 
     def _output_check(check: str, out: str) -> bool:
         # ✅ 圖形題不需驗測資輸出
@@ -3904,6 +4053,11 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             expected_count = max(0, len(in_vals) - 1)
             if not _has_num(nums, expected_count):
                 return "while semantic check failed: sentinel_ok missing count"
+
+        if scenario_name == "guess_game" and len(in_vals) >= 1:
+            expected_count = len(in_vals)
+            if not _has_num(nums, expected_count):
+                return "while semantic check failed: guess_game missing guess count"
 
         return ""
 
@@ -4022,6 +4176,16 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
         if not _has_print(solution_lines):
             return "missing print output"
 
+        if (not function_mode) and require_list_ops:
+            if not _has_for_loop(solution_lines):
+                return "list task missing for loop"
+            if not _has_list_literal(solution_lines):
+                return "list task missing [] initialization"
+            if not _has_append_call(solution_lines):
+                return "list task missing append()"
+            if not _has_list_iteration(solution_lines):
+                return "list task missing for-list traversal"
+
         # ✅ 修正：圖形/for-range 類題目不需要 input() 也不需要結束條件
         # 判斷是否為「純輸出型」題（for range + print，無需互動）
         is_output_only = (
@@ -4064,6 +4228,13 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 
         # 互動型：跑測資驗收
         test_inputs = (scenario_tests[:1] or [[]])
+        scenario_name_for_grade = str((picked or {}).get("name") or "")
+        if scenario_name_for_grade == "guess_game":
+            target = _extract_guess_target(code)
+            if target is not None:
+                wrong = target - 1 if abs(target) > 1e-9 else target + 1
+                test_inputs = [[str(int(wrong) if float(wrong).is_integer() else wrong),
+                                str(int(target) if float(target).is_integer() else target)]]
 
         qmix = " ".join([
             str(question_text or ""),
@@ -4125,6 +4296,15 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
     elif function_mode:
         loop_style_rule = "- 本題必須定義並使用至少一個函式（def），禁止使用 class。"
 
+    list_ops_rule = ""
+    if require_list_ops and (not function_mode):
+        list_ops_rule = (
+            "- 本題是串列題：solution_lines 必須建立空串列（例如 scores = []）。\n"
+            "- 必須使用 append() 將資料加入串列。\n"
+            "- 必須使用 for item in scores: 這類語法走訪串列本身。\n"
+            "- 可以用 for i in range(3): 控制輸入筆數，但不能只用 range() 完成題目；一定要再走訪串列。"
+        )
+
     if_requirement_rule = ""
     if require_if_from_context and (not function_mode):
         if_requirement_rule = "- 字幕/老師描述提到條件判斷：solution_lines 必須包含至少一個 if。"
@@ -4172,7 +4352,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 
     # ✅ 根據老師描述判斷是否為「純輸出型」（圖形、數列），動態調整規則
     _td_lc = (teacher_description or "").lower()
-    _is_pattern_task = has_teacher_desc and any(k in _td_lc for k in [
+    _is_pattern_task = (not require_list_ops) and has_teacher_desc and any(k in _td_lc for k in [
         "三角形", "直角", "正方形", "菱形", "星號", "圖形", "pattern", "triangle", "square", "*",
         "數列", "列印", "輸出數字", "輸出星號",
     ])
@@ -4226,6 +4406,8 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             loop_rules += "\n" + int_input_rule
         if output_format_rule:
             loop_rules += "\n" + output_format_rule
+        if list_ops_rule:
+            loop_rules += "\n" + list_ops_rule
         diversity_block = f"""
 【多樣化要求（本次 regenerate 變化）】
 - 變化種子：{variation_seed}
@@ -4268,6 +4450,7 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
 {function_profile_summary}
 若老師描述明確，請優先依據描述生成題目。
 {loop_style_rule}
+{list_ops_rule}
 {if_requirement_rule}
 {function_input_rule}
 {function_no_loop_rule}
@@ -4312,10 +4495,14 @@ def ai_generate_parsons_from_subtitle(subtitle_text: str, unit: str, video_title
             err_hint = ""
             if "compile failed" in last_error:
                 err_hint = f"\n⚠️  編譯錯誤詳情：{last_error}\n請逐行檢查：縮排是否正確（4 spaces）、冒號是否遺漏、括號是否配對。"
+            elif "list task" in last_error:
+                err_hint = "\n⚠️  串列題必須同時包含 scores = []、scores.append(...)，以及 for score in scores: 走訪串列。"
             elif "missing" in last_error:
                 err_hint = f"\n⚠️  {last_error}：請確認 solution_lines 包含所需語法元素。"
             elif "for_only" in last_error:
                 err_hint = "\n⚠️  不可使用 while 或 break，請改用 for i in range(n) 控制次數。"
+            elif "input exhausted" in last_error:
+                err_hint = "\n⚠️  測資已用完但程式仍要求 input()。請確認 while 迴圈能在題意的結束條件、sentinel 或猜中目標後停止。"
             elif "subtitle concept" in last_error:
                 err_hint = "\n⚠️  題目與程式概念沒有對齊字幕重點，請補強關鍵詞語意。"
             user_msg = f"""

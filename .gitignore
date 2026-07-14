@@ -48,3 +48,6 @@ dist/
 # md檔不需要上傳
 # =========================
 AGENTS.md
+
+# 壞掉的檔案
+parsons.py.corrupted_20260714_142550.bak

@@ -7,6 +7,7 @@ from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from bson import ObjectId
 from ..db import db
+from ..unit_labels import unit_label_map
 
 admin_upload_bp = Blueprint("admin_upload", __name__)
 
@@ -279,7 +280,13 @@ def list_units():
         units = db.videos.distinct("unit", {"deleted": {"$ne": True}})
         units = [u for u in units if u]
         units.sort()
-        return jsonify({"ok": True, "units": units})
+        labels = unit_label_map(units)
+        return jsonify({
+            "ok": True,
+            "units": units,
+            "items": [{"id": u, "name": labels.get(u) or u, "unit_label": labels.get(u) or u} for u in units],
+            "unit_labels": labels,
+        })
     except Exception as e:
         return jsonify({"ok": False, "message": "讀取單元失敗", "error": str(e)}), 500
 
@@ -817,7 +824,10 @@ def list_videos():
 
         vids = list(cursor)
 
+        labels = unit_label_map([v.get("unit") for v in vids])
+
         for v in vids:
+            raw_unit = v.get("unit")
             v["_id"] = str(v["_id"])
             if isinstance(v.get("created_at"), datetime):
                 v["created_at"] = safe_iso(v["created_at"])
@@ -833,6 +843,7 @@ def list_videos():
             v.setdefault("subtitle_current_version", 1)
             v.setdefault("subtitle_versions_count", 1)
             v.setdefault("related_task_ids", [])
+            v["unit_label"] = labels.get(raw_unit) or raw_unit or ""
 
         return jsonify({
             "ok": True,

@@ -16,6 +16,21 @@ TIMEZONE_NAME = "Asia/Taipei"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 TEST_STUDENT_ID = "11461127"
 MAX_HINT_COUNT = 2
+HINT_METADATA_TOP_LEVEL_REMOVED_FIELD_KEYS = {
+    "wrong_index",
+    "concept",
+    "concept_tag",
+    "concept_scope",
+}
+
+HINT_METADATA_ALWAYS_REMOVED_FIELD_KEYS = {
+    "subtitle_range",
+    "subtitle_ranges",
+    "subtitle_broad_range",
+    "subtitle_narrow_range",
+    "subtitle_range_available",
+    "subtitle_scope",
+}
 HINT_METADATA_PATCH_KEYS = {
     "review_type",
     "hint_no",
@@ -61,6 +76,24 @@ HINT_METADATA_PATCH_KEYS = {
     "repeated_error",
     "error_types",
 }
+
+
+def _clean_hint_metadata_fields(value, *, depth=0):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in HINT_METADATA_ALWAYS_REMOVED_FIELD_KEYS:
+                continue
+            if depth == 0 and key_text in HINT_METADATA_TOP_LEVEL_REMOVED_FIELD_KEYS:
+                continue
+            cleaned[key_text] = _clean_hint_metadata_fields(item, depth=depth + 1)
+        return cleaned
+    if isinstance(value, list):
+        return [_clean_hint_metadata_fields(item, depth=depth + 1) for item in value]
+    return value
+
+
 HINT_TOP_LEVEL_DEFAULTS = {
     "hint_id": None,
     "question_id": None,
@@ -119,6 +152,11 @@ ALLOWED_EVENT_TYPES = {
     "ai_hint_view",
     "submit_after_hint",
     "ai_hint_second_request",
+    "second_hint_reminder_shown",
+    "second_hint_reminder_clicked",
+    "second_hint_reminder_ignored",
+    # C 策略固定中文語意提示：記錄系統已呈現固定提示，但不算 AI hint。
+    "fixed_semantic_feedback_presented",
     "return_to_task",
     "idle_detected",
     "heartbeat",
@@ -137,6 +175,9 @@ HINT_EVENT_TYPES = {
     "ai_hint_view",
     "submit_after_hint",
     "ai_hint_second_request",
+    "second_hint_reminder_shown",
+    "second_hint_reminder_clicked",
+    "second_hint_reminder_ignored",
 }
 
 _INDEXES_READY = False
@@ -243,6 +284,29 @@ def _optional_nonnegative_int(value):
         return None
 
 
+def _int_list(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        try:
+            parsed = int(item)
+        except Exception:
+            continue
+        if parsed >= 0:
+            out.append(parsed)
+    return sorted(set(out))
+
+
+def _attempt_wrong_slots_for_log(attempt):
+    doc = attempt if isinstance(attempt, dict) else {}
+    if isinstance(doc.get("sequence_slots"), list):
+        return _int_list(doc.get("sequence_slots"))
+    if isinstance(doc.get("wrong_slots"), list):
+        return _int_list(doc.get("wrong_slots"))
+    return []
+
+
 def _attempt_context(attempt_id):
     normalized = _optional_string(attempt_id)
     if not normalized or not ObjectId.is_valid(normalized):
@@ -260,6 +324,9 @@ def _attempt_context(attempt_id):
             "score": 1,
             "error_count": 1,
             "error_types": 1,
+            "incorrect_slots": 1,
+            "sequence_slots": 1,
+            "indentation_slots": 1,
             "wrong_slots": 1,
             "repeated_error": 1,
             "error_details": 1,
@@ -270,6 +337,7 @@ def _attempt_context(attempt_id):
         },
     )
     if attempt:
+        attempt["wrong_slots"] = _attempt_wrong_slots_for_log(attempt)
         return attempt
 
     test_attempt = db.parsons_test_attempts.find_one(
@@ -336,7 +404,7 @@ def _attempt_context(attempt_id):
 
 
 def _hint_event_metadata(event_type, student_id, session_id, task_id, attempt_id, metadata):
-    normalized = dict(metadata or {})
+    normalized = _clean_hint_metadata_fields(dict(metadata or {}))
     normalized["review_type"] = "ai_hint"
     normalized["hint_type"] = normalized.get("hint_type") or "ai_hint"
     normalized["question_type"] = normalized.get("question_type") or "parsons"
@@ -480,7 +548,7 @@ def write_learning_log(payload, enforced_student_id=None):
             "score": attempt.get("score"),
             "error_count": attempt.get("error_count"),
             "error_types": attempt.get("error_types") or [],
-            "wrong_slots": attempt.get("wrong_slots") or [],
+            "wrong_slots": _attempt_wrong_slots_for_log(attempt),
             "repeated_error": attempt.get("repeated_error"),
             "error_details": attempt.get("error_details") if isinstance(attempt.get("error_details"), list) else [],
             "repeated_error_types": attempt.get("repeated_error_types") if isinstance(attempt.get("repeated_error_types"), list) else [],
@@ -654,6 +722,7 @@ def _limited_metadata_value(value, depth=0):
 def _hint_metadata_patch(metadata):
     if not isinstance(metadata, dict):
         return {}
+    metadata = _clean_hint_metadata_fields(metadata)
     patch = {}
     for key in HINT_METADATA_PATCH_KEYS:
         if key in metadata:

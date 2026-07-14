@@ -21,6 +21,7 @@ from app.routes.teacher_analysis import (
     _normalize_group_filter,
     _normalize_test_role,
     _optional_string,
+    _read_video_rewatch_logs,
     _safe_rate,
     _valid_duration,
 )
@@ -344,13 +345,13 @@ def _attempt_record_rows(include_student=True):
         "score",
         "submitted_order",
         "submitted_indentation",
-        "submitted_indentation_by_block",
         "correct_answer",
         "error_count",
         "error_types",
-        "wrong_slots",
+        "incorrect_slots",
+        "sequence_slots",
+        "indentation_slots",
         "error_details",
-        "error_concept",
         "repeated_error",
         "repeated_error_types",
         "repeated_error_count",
@@ -362,7 +363,6 @@ def _attempt_record_rows(include_student=True):
         "duration_sec",
         "duration_outlier",
         "duration_outlier_reason",
-        "needs_review",
         "review_reason",
         "timezone",
         "created_at",
@@ -379,10 +379,11 @@ def _attempt_record_rows(include_student=True):
     json_fields = {
         "submitted_order",
         "submitted_indentation",
-        "submitted_indentation_by_block",
         "correct_answer",
         "error_types",
-        "wrong_slots",
+        "incorrect_slots",
+        "sequence_slots",
+        "indentation_slots",
         "error_details",
         "repeated_error_types",
         "review_reason",
@@ -428,6 +429,66 @@ def _learning_log_rows(include_student=True):
         row = {key: log.get(key, "") for key in headers}
         row["event_at"] = _format_csv_datetime(log.get("event_at"))
         row["metadata"] = _json_csv_cell(log.get("metadata") or {})
+        rows.append(row)
+    return headers, rows
+
+
+def _video_rewatch_log_rows(include_student=True):
+    headers = [
+        "event_at",
+        "log_id",
+        "student_id",
+        "student_name",
+        "class_name",
+        "group_type",
+        "is_test_data",
+        "event_type",
+        "video_id",
+        "video_title",
+        "unit_id",
+        "watch_session_id",
+        "task_id",
+        "attempt_id",
+        "watch_seconds",
+        "watch_delta_sec",
+        "watch_seconds_for_total",
+        "duration_minutes",
+        "current_time_sec",
+        "video_duration_sec",
+        "playback_rate",
+        "reached_end",
+        "completed_fully",
+        "watch_start_at",
+        "watch_end_at",
+        "segment_start_sec",
+        "segment_end_sec",
+        "seek_count",
+        "total_seek_distance",
+        "avg_seek_distance",
+        "is_frequent_seeker",
+        "page",
+        "source",
+    ]
+    class_name = _optional_string(request.args.get("class_name"))
+    group_filter = _normalize_group_filter(request.args.get("group_type"))
+    student_id = _optional_string(request.args.get("student_id")) if include_student else None
+    records, _profiles = _read_video_rewatch_logs(
+        class_name,
+        group_filter,
+        student_id,
+        request.args.get("limit") or 5000,
+    )
+
+    rows = []
+    datetime_fields = {"event_at", "watch_start_at", "watch_end_at"}
+    for record in records:
+        row = {key: record.get(key, "") for key in headers}
+        for key in datetime_fields:
+            value = record.get(key)
+            if isinstance(value, str):
+                row[key] = value
+            else:
+                row[key] = _format_csv_datetime(value)
         rows.append(row)
     return headers, rows
 
@@ -596,10 +657,12 @@ def export_student_summary_csv():
 def export_group_learning_data_zip():
     attempt_headers, attempt_rows = _attempt_record_rows(include_student=False)
     log_headers, log_rows = _learning_log_rows(include_student=False)
+    video_headers, video_rows = _video_rewatch_log_rows(include_student=False)
     return _zip_csv_response(
         [
             ("parsons_attempt_records.csv", attempt_headers, attempt_rows),
             ("learning_logs.csv", log_headers, log_rows),
+            ("video_rewatch_logs.csv", video_headers, video_rows),
         ],
         "parsons_group_learning_data.zip",
     )
@@ -609,3 +672,9 @@ def export_group_learning_data_zip():
 def export_learning_logs_csv():
     headers, rows = _learning_log_rows()
     return _csv_response(headers, rows, "parsons_learning_logs.csv")
+
+
+@teacher_io_bp.get("/export/video-rewatch-logs.csv")
+def export_video_rewatch_logs_csv():
+    headers, rows = _video_rewatch_log_rows()
+    return _csv_response(headers, rows, "video_rewatch_logs.csv")

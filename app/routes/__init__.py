@@ -35,5 +35,9 @@ def register_blueprints(app):
     app.register_blueprint(parsons_bp, url_prefix="/api/parsons")
     app.register_blueprint(teacher_analysis_bp, url_prefix="/api/teacher/analysis")
     app.register_blueprint(teacher_io_bp, url_prefix="/api/teacher")
-    app.register_blueprint(avatars_bp, url_prefix="/api/users/me/avatar")
+    # 頭像 API 實際路徑由 avatars.py 內的 route 決定：
+    # GET   /api/avatars
+    # PATCH /api/users/me/avatar
+    # 這裡只掛 /api，避免變成 /api/users/me/avatar/avatars 這種錯誤路徑。
+    app.register_blueprint(avatars_bp, url_prefix="/api")
 

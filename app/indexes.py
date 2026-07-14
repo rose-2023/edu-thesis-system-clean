@@ -1,6 +1,5 @@
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError
-
 from .db import db
 
 
@@ -43,6 +42,23 @@ CORE_INDEXES = {
         ([("task_id", ASCENDING)], "task_id_1", False),
         ([("attempt_id", ASCENDING)], "attempt_id_1", False),
         ([("event_at", ASCENDING)], "event_at_1", False),
+    ],
+    "hint_library": [
+        ([("hint_key", ASCENDING), ("version", DESCENDING)], "hint_key_version_1", False),
+        (
+            [
+                ("concept_tag", ASCENDING),
+                ("error_type", ASCENDING),
+                ("hint_level", ASCENDING),
+                ("scope", ASCENDING),
+                ("language", ASCENDING),
+                ("is_active", ASCENDING),
+            ],
+            "concept_error_level_scope_lang_active_1",
+            False,
+        ),
+        ([("task_scope", ASCENDING), ("task_family", ASCENDING), ("is_active", ASCENDING)], "task_scope_family_active_1", False),
+        ([("updated_at", DESCENDING)], "updated_at_-1", False),
     ],
     "video_rewatch_logs": [
         ([("student_id", ASCENDING)], "student_id_1", False),

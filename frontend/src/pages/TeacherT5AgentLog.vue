@@ -7,23 +7,44 @@
     <main class="main">
       <h1 class="title">AI 代理 Parsons 題目生成紀錄</h1>
 
-      <!-- [新增] 後測開放控制（僅新增按鈕，不影響既有功能） -->
+      <!-- 測驗開放控制 -->
       <div class="posttest-bar">
-        <div class="posttest-left">
-          <span class="posttest-label">後測狀態：</span>
-          <span class="posttest-status" :class="{ open: postOpen === true, closed: postOpen === false }">
-            {{ postOpen === null ? "未讀取" : (postOpen ? "已開放" : "未開放") }}
-          </span>
-          <span class="posttest-hint">（依單元控制：{{ testCycleId }}）</span>
+        <div class="test-control-group">
+          <div class="posttest-left">
+            <span class="posttest-label">前測狀態：</span>
+            <span class="posttest-status" :class="{ open: preOpen === true, closed: preOpen === false }">
+              {{ preOpen === null ? "未讀取" : (preOpen ? "已開放" : "未開放") }}
+            </span>
+            <span class="posttest-hint">（首次登入控制：default）</span>
+          </div>
+
+          <div class="posttest-actions">
+            <button class="btn primary" :disabled="!testCycleId || preOpenLoading" @click="setPreOpen(true)">
+              發布前測
+            </button>
+            <button class="btn warn" :disabled="!testCycleId || preOpenLoading" @click="setPreOpen(false)">
+              取消前測發布
+            </button>
+          </div>
         </div>
 
-        <div class="posttest-actions">
-          <button class="btn primary" :disabled="!testCycleId || postOpenLoading" @click="setPostOpen(true)">
-            後測發布
-          </button>
-          <button class="btn warn" :disabled="!testCycleId || postOpenLoading" @click="setPostOpen(false)">
-            後測取消發布
-          </button>
+        <div class="test-control-group">
+          <div class="posttest-left">
+            <span class="posttest-label">後測狀態：</span>
+            <span class="posttest-status" :class="{ open: postOpen === true, closed: postOpen === false }">
+              {{ postOpen === null ? "未讀取" : (postOpen ? "已開放" : "未開放") }}
+            </span>
+            <span class="posttest-hint">（全班後測控制：default）</span>
+          </div>
+
+          <div class="posttest-actions">
+            <button class="btn primary" :disabled="postOpenLoading" @click="setPostOpen(true)">
+              發布後測
+            </button>
+            <button class="btn warn" :disabled="postOpenLoading" @click="setPostOpen(false)">
+              取消後測發布
+            </button>
+          </div>
         </div>
       </div>
       <section class="grid">
@@ -36,7 +57,9 @@
               <label>單元</label>
               <select v-model="selectedUnit" :disabled="loading.units">
                 <option value="">請選擇</option>
-                <option v-for="u in units" :key="u.id" :value="u.id">{{ u.name }}</option>
+                <option v-for="u in units" :key="u.id" :value="u.id">
+                  {{ u.name }}（{{ u.raw_name || u.id }}）
+                </option>
               </select>
             </div>
 
@@ -46,6 +69,25 @@
                 <option value="">請選擇</option>
                 <option v-for="v in videos" :key="v.id" :value="v.id">{{ v.title }}</option>
               </select>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label>學生端單元名稱</label>
+              <input
+                v-model="unitLabelDraft"
+                :disabled="!selectedUnit || unitLabelSaving"
+                placeholder="例：條件判斷"
+              />
+            </div>
+
+            <div class="field">
+              <label>單元名稱同步</label>
+              <button class="btn primary" :disabled="!selectedUnit || !unitLabelDraft.trim() || unitLabelSaving" @click="saveUnitLabel">
+                {{ unitLabelSaving ? "儲存中..." : "儲存單元名稱" }}
+              </button>
+              <p class="hint" v-if="unitLabelMessage">{{ unitLabelMessage }}</p>
             </div>
           </div>
 
@@ -90,7 +132,7 @@
         </div>
 
         <!-- B -->
-        <div class="card">
+        <!-- <div class="card">
           <h2 class="card-title">B. AI 代理任務流程</h2>
           <div class="flow">
             <div class="step">
@@ -122,10 +164,10 @@
             <div>使用模型：OpenAI</div>
             <div>執行方式：AI Agent 自動生成</div>
           </div>
-        </div>
+        </div> -->
 
         <!-- C -->
-        <div class="card">
+        <!-- <div class="card">
           <h2 class="card-title">C. 題目設定</h2>
           <div class="kvcol">
             <div class="kv"><span class="k">類型：</span>Parsons 程式除錯題</div>
@@ -133,7 +175,7 @@
             <div class="kv"><span class="k">語言：</span>Python</div>
             <div class="kv"><span class="k">依據：</span>影片字幕檔生成</div>
           </div>
-        </div>
+        </div> -->
 
         <!-- D -->
         <div class="card">
@@ -306,7 +348,8 @@
           <p class="hint err" v-if="err.e">{{ err.e }}</p>
         </div>
 
-        <div class="card card-wide">
+        <!-- E 區塊 -->
+        <!-- <div class="card card-wide">
           <h2 class="card-title">E. 老師手動秒數校正</h2>
 
           <div class="row2">
@@ -411,7 +454,7 @@
           <div class="hint" v-else>
             請先選擇題目版本並載入秒數校正資料。
           </div>
-        </div>
+        </div> -->
       </section>
 
     <!-- ===== Concept Draft Modal ===== -->
@@ -744,12 +787,32 @@
                 </div>
               </div>
               <hr class="pvHr" />
+              <div class="previewEditBar">
+                <button class="btn mini" v-if="!previewEditMode" @click="startPreviewEdit" :disabled="previewSaving">
+                  編輯題目內容
+                </button>
+                <button class="btn primary mini" v-if="previewEditMode" @click="savePreviewEdits" :disabled="previewSaving">
+                  {{ previewSaving ? "儲存中..." : "儲存修改" }}
+                </button>
+                <button class="btn mini" v-if="previewEditMode" @click="cancelPreviewEdit" :disabled="previewSaving">
+                  取消編輯
+                </button>
+                <span class="previewEditMsg" :class="{ err: previewSaveMessage && previewSaveMessage.includes('失敗') }">
+                  {{ previewSaveMessage }}
+                </span>
+              </div>
             </div>
 
             <!-- 題目說明 -->
             <div class="pvSection">
               <div class="pvH">【題目說明】</div>
-              <div class="pvBox">
+              <textarea
+                v-if="previewEditMode"
+                class="pvEditText pvPromptEdit"
+                v-model="previewEditForm.prompt"
+                placeholder="請輸入學生端看到的題目敘述"
+              ></textarea>
+              <div v-else class="pvBox">
                 {{ previewData.prompt ? previewData.prompt : "（未提供題目敘述）" }}
               </div>
             </div>
@@ -892,6 +955,14 @@
             <div class="pvSection">
               <div class="pvHRow">
                 <div class="pvH">Parsons 區塊（AI 生成）</div>
+                <button
+                  v-if="previewEditMode"
+                  class="btn mini addBlockBtn"
+                  type="button"
+                  @click="addPreviewSolutionBlock"
+                >
+                  新增正解片段
+                </button>
                 <label class="dSwitch" title="控制老師端與學生端是否顯示中文語意提示">
                   <input
                     type="checkbox"
@@ -903,7 +974,30 @@
                   <span class="dSwitchText">{{ hideSemanticZh ? "中文語意：隱藏" : "中文語意：顯示" }}</span>
                 </label>
               </div>
-              <div class="pvGrid">
+              <div class="pvGrid" v-if="previewEditMode">
+                <div class="pvBlock pvBlockEdit" v-for="(b, idx) in previewEditForm.solutionBlocks" :key="'edit-s-' + b.id">
+                  <div class="blockEditMeta">
+                    <span>第 {{ idx + 1 }} 格</span>
+                    <span class="mono">ID: {{ b.id }}</span>
+                    <label>縮排 <input class="pvIndentInput" type="number" min="0" step="1" v-model.number="b.indent" /></label>
+                    <button
+                      class="btn mini danger blockDeleteBtn"
+                      type="button"
+                      :disabled="previewEditForm.solutionBlocks.length <= 1"
+                      title="從正解答案中移除此程式片段"
+                      @click="removePreviewSolutionBlock(b.id)"
+                    >
+                      刪除
+                    </button>
+                  </div>
+                  <textarea class="pvEditCode" v-model="b.text" spellcheck="false"></textarea>
+                  <textarea class="pvEditMeaning" v-model="b.meaning_zh" placeholder="中文語意提示（選填）"></textarea>
+                </div>
+                <div v-if="!previewEditForm.solutionBlocks.length" class="pvEmpty">
+                  尚無 Parsons 區塊資料（請確認題目生成時是否有存 blocks）。
+                </div>
+              </div>
+              <div class="pvGrid" v-else>
                 <div class="pvBlock" v-for="b in (previewData.parsons_blocks || [])" :key="b.id">
                   <div class="code">{{ b.text || "（空）" }}</div>
                   <div class="zh" v-if="!hideSemanticZh">中文語意（AI）：{{ enhanceMeaning(b.text, b.meaning_zh) }}</div>
@@ -918,7 +1012,41 @@
           <div class="pvSection">
             <div class="pvH">B-2 干擾區塊（Distractor Blocks｜AI 生成）</div>
 
-            <div class="pvGrid">
+            <div class="pvGrid" v-if="previewEditMode">
+              <div
+                class="pvBlock pvBlockD pvBlockEdit"
+                v-for="(b, idx) in previewEditForm.distractorBlocks"
+                :key="'edit-d-' + b.id"
+                :class="{ removed: !isKeepDistractor(b.id) }"
+              >
+                <div class="dCtrl">
+                  <label class="dSwitch" :title="isKeepDistractor(b.id) ? '目前：顯示（學生端會看到）' : '目前：隱藏（學生端不會看到）'">
+                    <input
+                      type="checkbox"
+                      :checked="isKeepDistractor(b.id)"
+                      @change="setDistractorVisible(b.id, $event.target.checked)"
+                    />
+                    <span class="dSlider"></span>
+                    <span class="dSwitchText">{{ isKeepDistractor(b.id) ? "顯示" : "隱藏" }}</span>
+                  </label>
+                </div>
+
+                <div v-if="!isKeepDistractor(b.id)" class="dMask" aria-hidden="true"></div>
+
+                <div class="blockEditMeta">
+                  <span>干擾 {{ idx + 1 }}</span>
+                  <span class="mono">ID: {{ b.id }}</span>
+                  <label>縮排 <input class="pvIndentInput" type="number" min="0" step="1" v-model.number="b.indent" /></label>
+                </div>
+                <textarea class="pvEditCode" v-model="b.text" spellcheck="false"></textarea>
+                <textarea class="pvEditMeaning" v-model="b.meaning_zh" placeholder="中文語意提示（選填）"></textarea>
+              </div>
+
+              <div v-if="!previewEditForm.distractorBlocks.length" class="pvEmpty">
+                尚無干擾區塊資料（請確認生成流程是否有存 distractor_blocks）。
+              </div>
+            </div>
+            <div class="pvGrid" v-else>
               <div
                 class="pvBlock pvBlockD"
                 v-for="b in (previewData.distractor_blocks || [])"
@@ -956,7 +1084,15 @@
             <!-- 正確答案順序 -->
             <div class="pvSection">
               <div class="pvH">【正確答案順序（僅教師可見）】</div>
-              <div class="pvOrder">
+              <div v-if="previewEditMode" class="pvOrderEditWrap">
+                <input
+                  class="pvOrderInput"
+                  v-model="previewEditForm.solutionOrderText"
+                  placeholder="例如：b1 -> b2 -> b3"
+                />
+                <div class="hint">請使用上方正解區塊的 ID 排列；可用空白、逗號或 -> 分隔。</div>
+              </div>
+              <div v-else class="pvOrder">
                 {{ previewData.solution_order_text || "（未提供）" }}
               </div>
               <div class="pvIndentControls" v-if="solutionDetailList.length">
@@ -1011,9 +1147,13 @@
           <!-- ✅ 新增：固定底部按鈕列 -->
           <div class="modal-foot" v-if="!modal.loading && !modal.err && previewData?.ok">
             <div class="pvActions">
-              <button class="btn primary" @click="publishFromPreview" :disabled="previewData.meta.enabled">發布至學生題庫</button>
-              <button class="btn" @click="regenerate">重新生成新版本</button>
-              <button class="btn warn" @click="returnNotPublish">退回不發布</button>
+              <button class="btn" v-if="!previewEditMode" @click="startPreviewEdit" :disabled="previewSaving">編輯題目內容</button>
+              <button class="btn primary" v-if="previewEditMode" @click="savePreviewEdits" :disabled="previewSaving">
+                {{ previewSaving ? "儲存中..." : "儲存修改" }}
+              </button>
+              <button class="btn primary" @click="publishFromPreview" :disabled="previewSaving || previewData.meta.enabled">發布至學生題庫</button>
+              <button class="btn" @click="regenerate" :disabled="previewSaving">重新生成新版本</button>
+              <button class="btn warn" @click="returnNotPublish" :disabled="previewSaving">退回不發布</button>
               <button class="btn" @click="closeModal">關閉</button>
             </div>
           </div>
@@ -1068,6 +1208,16 @@ async function t5Post(path, data = {}, config = {}) {
   }
 }
 
+async function t5Patch(path, data = {}, config = {}) {
+  try {
+    return await api.patch(`${T5_BASE_PRIMARY}${path}`, data, _withT5Timeout(config));
+  } catch (e) {
+    const status = e?.response?.status;
+    if (status === 404) return await api.patch(`${T5_BASE_FALLBACK}${path}`, data, _withT5Timeout(config));
+    throw e;
+  }
+}
+
 async function parsonsGet(path, config = {}) {
   return api.get(`/api/parsons${path}`, { ...(config || {}), timeout: PARSONS_TIMEOUT_MS });
 }
@@ -1089,6 +1239,13 @@ const videos = ref([]);
 const selectedUnit = ref("");
 const selectedVideo = ref("");
 const selectedSubtitleVersion = ref("");
+const unitLabelDraft = ref("");
+const unitLabelSaving = ref(false);
+const unitLabelMessage = ref("");
+
+const selectedUnitRecord = computed(() => (
+  units.value.find((u) => String(u.id || "") === String(selectedUnit.value || "")) || null
+));
 
 // ===== [新增] D 區表格顯示 helper =====
 function getSourceType(q) {
@@ -1123,41 +1280,70 @@ function isStudentVisible(q) {
   return !!q?.enabled || getStatus(q) === "published";
 }
 
-// [新增] ===== 後測開放控制（依單元） =====
+// [新增] ===== 測驗開放控制（依單元） =====
 const testCycleId = computed(() => (selectedUnit.value || "default").toString().trim());
+const preTestCycleId = computed(() => "default");
+const postTestCycleId = computed(() => "default");
+const preOpen = ref(null); // null=未讀取, true/false=狀態
 const postOpen = ref(null); // null=未讀取, true/false=狀態
+const preOpenLoading = ref(false);
 const postOpenLoading = ref(false);
 
 async function fetchPostOpen() {
-  if (!testCycleId.value) return;
+  preOpenLoading.value = true;
   postOpenLoading.value = true;
   try {
-    const { data } = await api.get("/api/parsons/test/cycle/get", { params: { test_cycle_id: testCycleId.value } }); // [新增]
-    postOpen.value = !!data?.post_open;
+    const [preRes, postRes] = await Promise.all([
+      t5Get("/test_control", { params: { test_cycle_id: preTestCycleId.value } }),
+      t5Get("/test_control", { params: { test_cycle_id: postTestCycleId.value } }),
+    ]);
+    preOpen.value = !!preRes?.data?.pre_open;
+    postOpen.value = !!postRes?.data?.post_open;
   } catch (e) {
     // 若後端尚未加入此 API，不讓頁面壞掉
+    preOpen.value = null;
     postOpen.value = null;
   } finally {
+    preOpenLoading.value = false;
     postOpenLoading.value = false;
+  }
+}
+
+async function setPreOpen(open) {
+  if (!testCycleId.value) return;
+
+  preOpenLoading.value = true;
+
+  try {
+    const { data } = await t5Post("/test_control", {
+      test_cycle_id: preTestCycleId.value,
+      test_role: "pre",
+      pre_open: open
+    });
+
+    preOpen.value = !!data?.pre_open;
+  } catch (e) {
+    console.error("toggle pretest error:", e);
+  } finally {
+    preOpenLoading.value = false;
   }
 }
 
 // [新增] 切換單元時重新讀取後測開放狀態
 async function setPostOpen(open) {
-  if (!testCycleId.value) return;
-
   postOpenLoading.value = true;
 
   try {
-    await api.post("/api/parsons/test/cycle/toggle", {
-      test_cycle_id: testCycleId.value,
+    const { data } = await t5Post("/test_control", {
+      test_cycle_id: postTestCycleId.value,
+      test_role: "post",
       post_open: open
     });
 
-    postOpen.value = open;
+    postOpen.value = !!data?.post_open;
 
   } catch (e) {
-    console.error("toggle error:", e);
+    console.error("toggle posttest error:", e);
   } finally {
     postOpenLoading.value = false;
   }
@@ -1198,6 +1384,15 @@ const segmentEditorTaskId = ref("");
 const pageSegmentEditorLoading = ref(false);
 const segmentEditorDebug = ref(null);
 const predictedWindowMap = ref({});
+const previewEditMode = ref(false);
+const previewSaving = ref(false);
+const previewSaveMessage = ref("");
+const previewEditForm = reactive({
+  prompt: "",
+  solutionBlocks: [],
+  distractorBlocks: [],
+  solutionOrderText: "",
+});
 
 // Modal
 const modal = reactive({
@@ -3278,15 +3473,20 @@ async function loadSegmentEditorTask(taskId) {
 
     if (!previewData.value) previewData.value = {};
     const mapBlocks = (arr = []) =>
-      (arr || []).map((b, idx) => ({
-        id: String(b.id ?? b._id ?? `b${idx}`),
-        text: b.text || b.code || b.line || "",
-        meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
-        enabled: b?.enabled !== false,
-        indent: Number.isFinite(Number(b.indent))
-          ? Number(b.indent)
-          : (String(b.text || b.code || b.line || "").length - String(b.text || b.code || b.line || "").replace(/^\s+/, "").length)
-      }));
+      (arr || []).map((b, idx) => {
+        const text = b.text || b.code || b.line || "";
+        const hasExplicitIndent = b?.indent !== undefined && b?.indent !== null && b?.indent !== "";
+        return {
+          id: String(b.id ?? b._id ?? `b${idx}`),
+          text,
+          meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
+          enabled: b?.enabled !== false,
+          indent: hasExplicitIndent && Number.isFinite(Number(b.indent))
+            ? Number(b.indent)
+            : (String(text).length - String(text).replace(/^\s+/, "").length),
+          has_explicit_indent: hasExplicitIndent,
+        };
+      });
 
     previewData.value.source_type = (selectedQ?.source_type || data.source_type || data.gen_source || "fixed").toString().toLowerCase();
     previewData.value.meta = {
@@ -3303,6 +3503,12 @@ async function loadSegmentEditorTask(taskId) {
       created_by: "AI Agent"
     };
     previewData.value.parsons_blocks = mapBlocks(data.solution_blocks);
+    previewData.value.distractor_blocks = mapBlocks(data.distractor_blocks);
+    previewData.value.prompt = data?.question?.prompt || previewData.value.prompt || "";
+    previewData.value.solution_order = Array.isArray(data.solution_order) && data.solution_order.length
+      ? data.solution_order.map((x) => String(x || "").trim()).filter(Boolean)
+      : previewData.value.parsons_blocks.map((b) => b.id);
+    previewData.value.solution_order_text = formatSolutionOrderText(previewData.value.solution_order);
 
     // 從 /question API 直接帶回章節欄位，確保重新開啟可讀到已儲存正式章節。
     previewData.value.concept_chapters_formal = data.concept_chapters_formal || [];
@@ -3436,19 +3642,27 @@ async function openPreview(row = null) {
 
 
     const mapBlocks = (arr = []) =>
-      (arr || []).map((b, idx) => ({
-        id: String(b.id ?? b._id ?? `b${idx}`),
-        text: b.text || b.code || b.line || "",
-        meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
-        enabled: b?.enabled !== false,
-        indent: Number.isFinite(Number(b.indent))
-          ? Number(b.indent)
-          : (String(b.text || b.code || b.line || "").length - String(b.text || b.code || b.line || "").replace(/^\s+/, "").length)
-      }));
+      (arr || []).map((b, idx) => {
+        const text = b.text || b.code || b.line || "";
+        const hasExplicitIndent = b?.indent !== undefined && b?.indent !== null && b?.indent !== "";
+        return {
+          id: String(b.id ?? b._id ?? `b${idx}`),
+          text,
+          meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
+          enabled: b?.enabled !== false,
+          indent: hasExplicitIndent && Number.isFinite(Number(b.indent))
+            ? Number(b.indent)
+            : (String(text).length - String(text).replace(/^\s+/, "").length),
+          has_explicit_indent: hasExplicitIndent,
+        };
+      });
 
     const solutionOrderText = Array.isArray(data.solution_order)
       ? data.solution_order.join(" → ")
       : (data.solution_order || "");
+    const solutionOrder = Array.isArray(data.solution_order)
+      ? data.solution_order.map((x) => String(x || "").trim()).filter(Boolean)
+      : parseSolutionOrderText(data.solution_order || "");
 
     previewData.value = {
       ok: true,
@@ -3474,6 +3688,7 @@ async function openPreview(row = null) {
       alignment_confidence: (data.alignment_confidence && typeof data.alignment_confidence === "object") ? data.alignment_confidence : {},
       parsons_blocks: mapBlocks(data.solution_blocks),
       distractor_blocks: mapBlocks(data.distractor_blocks),
+      solution_order: solutionOrder,
       solution_order_text: solutionOrderText
     };
 
@@ -3485,6 +3700,8 @@ async function openPreview(row = null) {
 
     reviewForm.tags = data.review_tags || [];
     reviewForm.note = data.review_note || "";
+    previewEditMode.value = false;
+    resetPreviewEditForm(previewData.value);
 
   } catch (e) {
     console.error("[openPreview] error =", e);
@@ -3523,11 +3740,14 @@ const solutionDetailList = computed(() => {
 
   const rows = (order || []).map((id, idx) => {
     const b = map.get(String(id));
+    const hasExplicitIndent = b?.has_explicit_indent === true
+      || (b?.indent !== undefined && b?.indent !== null && b?.indent !== "");
     return {
       idx: idx + 1,
       id: String(id),
       text: b?.text || "（找不到對應區塊）",
       indent: Number.isFinite(Number(b?.indent)) ? Number(b?.indent) : 0,
+      has_explicit_indent: hasExplicitIndent,
       meaning_zh: b?.meaning_zh || "",
     };
   });
@@ -3543,7 +3763,10 @@ const solutionDetailList = computed(() => {
     }
 
     const fallbackIndent = level * 4;
-    const finalIndent = Number(r?.indent || 0) > 0 ? Number(r.indent) : fallbackIndent;
+    const explicitIndent = Number(r?.indent);
+    const finalIndent = r?.has_explicit_indent && Number.isFinite(explicitIndent)
+      ? Math.max(0, explicitIndent)
+      : fallbackIndent;
 
     if (/:\s*$/.test(line) && !/^#/.test(line)) {
       level += 1;
@@ -3614,6 +3837,220 @@ const selectedVideoTitle = computed(() => {
 const editableQuestions = computed(() => {
   return (questions.value || []).filter((q) => !!q?.task_id);
 });
+
+function clonePreviewBlocks(blocks = []) {
+  return (Array.isArray(blocks) ? blocks : []).map((b, idx) => {
+    const raw = b && typeof b === "object" ? b : {};
+    const text = String(raw.text ?? raw.code ?? raw.line ?? "");
+    const hasExplicitIndent = raw.has_explicit_indent === true
+      || (raw.indent !== undefined && raw.indent !== null && raw.indent !== "");
+    return {
+      id: String(raw.id ?? raw._id ?? `b${idx}`),
+      text,
+      meaning_zh: String(raw.meaning_zh ?? raw.semantic_zh ?? raw.semantic ?? raw.zh ?? ""),
+      enabled: raw.enabled !== false,
+      indent: hasExplicitIndent && Number.isFinite(Number(raw.indent))
+        ? Number(raw.indent)
+        : (text.length - text.replace(/^\s+/, "").length),
+      has_explicit_indent: hasExplicitIndent,
+    };
+  });
+}
+
+function previewOrderFromData(data = previewData.value) {
+  const direct = data?.solution_order;
+  if (Array.isArray(direct) && direct.length) {
+    return direct.map((x) => String(x || "").trim()).filter(Boolean);
+  }
+  const text = String(data?.solution_order_text || "").trim();
+  const parsed = parseSolutionOrderText(text);
+  if (parsed.length) return parsed;
+  return clonePreviewBlocks(data?.parsons_blocks || data?.solution_blocks || []).map((b) => b.id);
+}
+
+function parseSolutionOrderText(text) {
+  return String(text || "")
+    .split(/\s*(?:->|=>|\u2192|,|;|\||\/|\uFF0C|\u3001|\n|\t|\s+)\s*/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .filter((x, idx, arr) => arr.indexOf(x) === idx);
+}
+
+function formatSolutionOrderText(order = []) {
+  return (Array.isArray(order) ? order : []).map((x) => String(x || "").trim()).filter(Boolean).join(" -> ");
+}
+
+function nextPreviewSolutionBlockId() {
+  const ids = new Set([
+    ...(previewEditForm.solutionBlocks || []).map((b) => String(b?.id || "")),
+    ...(previewEditForm.distractorBlocks || []).map((b) => String(b?.id || "")),
+    ...((previewData.value?.parsons_blocks || []).map((b) => String(b?.id || ""))),
+    ...((previewData.value?.distractor_blocks || []).map((b) => String(b?.id || ""))),
+  ].filter(Boolean));
+
+  let max = 0;
+  ids.forEach((id) => {
+    const m = /^b(\d+)$/i.exec(id);
+    if (m) max = Math.max(max, Number(m[1]) || 0);
+  });
+
+  let n = Math.max(max + 1, (previewEditForm.solutionBlocks || []).length + 1);
+  let id = `b${n}`;
+  while (ids.has(id)) {
+    n += 1;
+    id = `b${n}`;
+  }
+  return id;
+}
+
+function addPreviewSolutionBlock() {
+  const id = nextPreviewSolutionBlockId();
+  previewEditForm.solutionBlocks = [
+    ...(previewEditForm.solutionBlocks || []),
+    {
+      id,
+      text: "",
+      meaning_zh: "",
+      enabled: true,
+      indent: 0,
+      has_explicit_indent: true,
+    },
+  ];
+
+  const validIds = new Set((previewEditForm.solutionBlocks || []).map((b) => String(b?.id || "")));
+  const order = parseSolutionOrderText(previewEditForm.solutionOrderText)
+    .filter((orderId) => validIds.has(String(orderId || "")));
+  if (!order.includes(id)) order.push(id);
+  previewEditForm.solutionOrderText = formatSolutionOrderText(order);
+  previewSaveMessage.value = `已新增 ${id}，請填入程式碼後按「儲存修改」`;
+}
+
+function removePreviewSolutionBlock(blockId) {
+  const id = String(blockId || "").trim();
+  if (!id) return;
+  if ((previewEditForm.solutionBlocks || []).length <= 1) {
+    previewSaveMessage.value = "至少需要保留一個正解程式片段";
+    return;
+  }
+
+  previewEditForm.solutionBlocks = (previewEditForm.solutionBlocks || []).filter(
+    (b) => String(b?.id || "") !== id
+  );
+
+  const remainingIds = new Set((previewEditForm.solutionBlocks || []).map((b) => String(b?.id || "")));
+  let nextOrder = parseSolutionOrderText(previewEditForm.solutionOrderText)
+    .filter((orderId) => remainingIds.has(String(orderId || "")));
+  if (!nextOrder.length) {
+    nextOrder = (previewEditForm.solutionBlocks || []).map((b) => String(b?.id || "")).filter(Boolean);
+  }
+  previewEditForm.solutionOrderText = formatSolutionOrderText(nextOrder);
+  previewSaveMessage.value = `已從正解答案移除 ${id}，按「儲存修改」後會更新 parsons_tasks`;
+}
+
+function resetPreviewEditForm(data = previewData.value) {
+  const solutionBlocks = clonePreviewBlocks(data?.parsons_blocks || data?.solution_blocks || []);
+  previewEditForm.prompt = String(data?.prompt || "");
+  previewEditForm.solutionBlocks = solutionBlocks;
+  previewEditForm.distractorBlocks = clonePreviewBlocks(data?.distractor_blocks || []);
+  previewEditForm.solutionOrderText = formatSolutionOrderText(previewOrderFromData(data));
+  previewSaveMessage.value = "";
+}
+
+function startPreviewEdit() {
+  resetPreviewEditForm();
+  previewEditMode.value = true;
+}
+
+function cancelPreviewEdit() {
+  resetPreviewEditForm();
+  previewEditMode.value = false;
+}
+
+function previewPayloadBlocks(blocks = [], options = {}) {
+  const useKeepState = Boolean(options.useKeepState);
+  return clonePreviewBlocks(blocks).map((b) => ({
+    id: b.id,
+    text: b.text,
+    meaning_zh: b.meaning_zh,
+    semantic_zh: b.meaning_zh,
+    enabled: useKeepState ? isKeepDistractor(b.id) : b.enabled !== false,
+    indent: Number.isFinite(Number(b.indent)) ? Number(b.indent) : 0,
+  }));
+}
+
+function buildPreviewSavePayload() {
+  const taskId = previewData.value?.meta?.task_id;
+  if (!taskId) throw new Error("缺少 task_id，無法儲存");
+
+  const solutionBlocks = previewPayloadBlocks(
+    previewEditMode.value ? previewEditForm.solutionBlocks : (previewData.value?.parsons_blocks || [])
+  );
+  const distractorBlocks = previewPayloadBlocks(
+    previewEditMode.value ? previewEditForm.distractorBlocks : (previewData.value?.distractor_blocks || []),
+    { useKeepState: true }
+  );
+  const prompt = String(previewEditMode.value ? previewEditForm.prompt : (previewData.value?.prompt || "")).trim();
+  const solutionOrder = previewEditMode.value
+    ? parseSolutionOrderText(previewEditForm.solutionOrderText)
+    : previewOrderFromData(previewData.value);
+
+  if (!prompt) throw new Error("題目敘述不可空白");
+  if (!solutionBlocks.length) throw new Error("至少需要一個正解程式片段");
+  const emptyBlock = solutionBlocks.find((b) => !String(b.text || "").trim());
+  if (emptyBlock) throw new Error(`正解片段 ${emptyBlock.id} 不可空白`);
+
+  const knownIds = new Set(solutionBlocks.map((b) => b.id));
+  const order = solutionOrder.length ? solutionOrder : solutionBlocks.map((b) => b.id);
+  const missing = order.filter((id) => !knownIds.has(id));
+  if (missing.length) {
+    throw new Error(`答案順序含有不存在的 block id：${missing.join(", ")}`);
+  }
+
+  return {
+    task_id: taskId,
+    review_tags: reviewForm.tags || [],
+    review_note: reviewForm.note || "",
+    distractor_keep: { ...distractorKeep },
+    hide_semantic_zh: !!hideSemanticZh.value,
+    question_prompt: prompt,
+    solution_blocks: solutionBlocks,
+    distractor_blocks: distractorBlocks,
+    solution_order: order,
+  };
+}
+
+function syncPreviewFromPayload(payload) {
+  if (!previewData.value) return;
+  previewData.value.prompt = payload.question_prompt || "";
+  previewData.value.parsons_blocks = clonePreviewBlocks(payload.solution_blocks || []);
+  previewData.value.distractor_blocks = clonePreviewBlocks(payload.distractor_blocks || []);
+  previewData.value.solution_order = Array.isArray(payload.solution_order) ? payload.solution_order : [];
+  previewData.value.solution_order_text = formatSolutionOrderText(previewData.value.solution_order);
+  resetDistractorKeep(previewData.value.distractor_blocks || []);
+  resetPreviewEditForm(previewData.value);
+}
+
+async function savePreviewEdits(options = {}) {
+  const silent = Boolean(options.silent);
+  previewSaving.value = true;
+  previewSaveMessage.value = "";
+  try {
+    const payload = buildPreviewSavePayload();
+    await t5Post("/question/review_save", payload);
+    syncPreviewFromPayload(payload);
+    previewEditMode.value = false;
+    previewSaveMessage.value = "已儲存修改到 parsons_tasks";
+    await fetchQuestions();
+    return true;
+  } catch (e) {
+    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "儲存失敗";
+    previewSaveMessage.value = msg;
+    if (!silent) alert("儲存失敗：" + msg);
+    throw e;
+  } finally {
+    previewSaving.value = false;
+  }
+}
 
 const modalPrompt = computed(() => {
   const q = modal.data?.question || {};
@@ -3769,6 +4206,28 @@ async function fetchUnits() {
     err.a = "讀取單元失敗，請稍後再試。";
   } finally {
     loading.units = false;
+  }
+}
+
+async function saveUnitLabel() {
+  const unitId = String(selectedUnit.value || "").trim();
+  const label = String(unitLabelDraft.value || "").trim();
+  if (!unitId || !label) return;
+  unitLabelSaving.value = true;
+  unitLabelMessage.value = "";
+  try {
+    const { data } = await t5Patch("/unit_label", { unit_id: unitId, label });
+    if (!data?.ok) throw new Error(data?.error || "save failed");
+    units.value = units.value.map((item) => (
+      String(item.id || "") === unitId
+        ? { ...item, name: label, unit_label: label }
+        : item
+    ));
+    unitLabelMessage.value = "已儲存，學生首頁與學習頁會使用此名稱。";
+  } catch (e) {
+    unitLabelMessage.value = "儲存失敗，請稍後再試。";
+  } finally {
+    unitLabelSaving.value = false;
   }
 }
 
@@ -4462,6 +4921,9 @@ async function onToggleSemanticVisibility(checked) {
 
 // ===== watchers =====
 watch(selectedUnit, async (u) => {
+  const record = selectedUnitRecord.value;
+  unitLabelDraft.value = record?.unit_label || record?.name || record?.raw_name || u || "";
+  unitLabelMessage.value = "";
   if (!u) return;
   await fetchVideos(u);
 });
@@ -4503,14 +4965,8 @@ async function publishFromPreview() {
     const taskId = previewData.value?.meta?.task_id;
     if (!taskId) throw new Error("缺少 task_id，無法發布");
 
-    // 1) 先存老師審核（tags/note + 干擾保留移除）
-    await t5Post("/question/review_save", {
-      task_id: taskId,
-      review_tags: reviewForm.tags || [],
-      review_note: reviewForm.note || "",
-      distractor_keep: { ...distractorKeep }, // ✅ 把 ✅/❌ 狀態送到後端
-      hide_semantic_zh: !!hideSemanticZh.value,
-    });
+    // 1) 先存老師審核與預覽編輯內容，再發布
+    await savePreviewEdits({ silent: true });
 
     // 2) 再發布（學生端可見）
     await t5Post("/question/publish", {
@@ -4555,8 +5011,19 @@ function enhanceMeaning(codeText, rawMeaning) {
 }
 
 
-function returnNotPublish() {
-  alert("（示意）已退回：你下一步要接後端 /return，把題目 status=已退回 並存 review tags/note。");
+async function returnNotPublish() {
+  try {
+    const taskId = previewData.value?.meta?.task_id;
+    if (!taskId) throw new Error("缺少 task_id，無法退回");
+
+    await savePreviewEdits({ silent: true });
+    await t5Post("/question/unpublish", { task_id: taskId });
+    await fetchQuestions();
+    await openPreview({ task_id: taskId });
+    alert("已退回不發布：學生端不會看到這題。");
+  } catch (e) {
+    alert("退回不發布失敗：" + (e?.response?.data?.message || e?.message || "unknown"));
+  }
 }
 
 
@@ -5074,6 +5541,93 @@ watch(selectedUnit, () => {
   padding-top: 6px;
 }
 
+.previewEditBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.previewEditMsg {
+  font-size: 13px;
+  color: #166534;
+  font-weight: 700;
+}
+
+.pvEditText,
+.pvEditCode,
+.pvEditMeaning,
+.pvOrderInput {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #fff;
+  color: #111827;
+  padding: 10px 12px;
+  outline: none;
+}
+
+.pvEditText:focus,
+.pvEditCode:focus,
+.pvEditMeaning:focus,
+.pvOrderInput:focus {
+  border-color: rgba(59,130,246,.65);
+  box-shadow: 0 0 0 4px rgba(59,130,246,.12);
+}
+
+.pvPromptEdit {
+  min-height: 120px;
+  resize: vertical;
+  line-height: 1.7;
+}
+
+.pvBlockEdit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.blockEditMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  font-weight: 800;
+  color: #334155;
+}
+
+.pvIndentInput {
+  width: 72px;
+  margin-left: 4px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 5px 7px;
+}
+
+.pvEditCode {
+  min-height: 74px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  line-height: 1.55;
+}
+
+.pvEditMeaning {
+  min-height: 58px;
+  resize: vertical;
+  line-height: 1.55;
+  background: #f8fafc;
+}
+
+.pvOrderEditWrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .concept-meta-bar{
   display: flex;
   flex-wrap: wrap;
@@ -5389,6 +5943,25 @@ watch(selectedUnit, () => {
 }
 .btn.primary:hover{ background: #0b1220; }
 
+.btn.danger {
+  background: #fee2e2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+.btn.danger:hover {
+  background: #fecaca;
+}
+.btn.danger:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+.blockDeleteBtn {
+  margin-left: auto;
+}
+.addBlockBtn {
+  margin-left: auto;
+}
+
 .btn.warn{
   background: #fff1f2;
   border-color: rgba(244,63,94,.35);
@@ -5623,6 +6196,14 @@ watch(selectedUnit, () => {
   border-radius: 10px;
   background: #fff;
 }
+.test-control-group{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  flex:1 1 360px;
+  min-width:0;
+}
 .posttest-left{
   display:flex;
   align-items:center;
@@ -5641,6 +6222,14 @@ watch(selectedUnit, () => {
   align-items:center;
   gap:8px;
   flex-wrap:wrap;
+}
+
+@media (max-width: 1100px) {
+  .posttest-bar,
+  .test-control-group {
+    align-items:flex-start;
+    flex-direction:column;
+  }
 }
 
 /* ===== 穩定模式切換開關 ===== */

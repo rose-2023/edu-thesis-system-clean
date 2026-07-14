@@ -44,9 +44,9 @@
 
           <!-- ✅【新增】後測進度點點：與老師端「後測發布/取消發布」連動（同一份 test_control） -->
           <div class="postProgress">
-            <div class="progressTitle">
+            <!-- <div class="progressTitle">
               後測：<span>{{ postOpen ? (postDone ? "已完成" : "進行中") : "未開放" }}</span>
-            </div>
+            </div> -->
             <div class="dots postDots" v-if="postOpen">
               <span
                 v-for="i in postTotalDots"
@@ -370,11 +370,11 @@ function unitDisplayName(rawUnit) {
 
   // 先保留同一主單元下的子題型差異（但不顯示 Ux- 代碼）
   if (prefix === "U3") {
-    if (subTag === "for") return "for 迴圈";
-    if (subTag === "loop") return "迴圈觀念解析";
+    if (subTag === "for") return "定數迴圈";
+    if (subTag === "loop") return "for迴圈觀念解析";
   }
   if (prefix === "U2") {
-    if (subTag === "if") return "if 條件判斷";
+    if (subTag === "if") return "條件判斷與應用";
     if (subTag === "ifelse") return "if-else 條件判斷";
     if (subTag === "elif") return "elif 條件判斷";
   }
@@ -388,14 +388,15 @@ function unitDisplayName(rawUnit) {
     if (cleanTail) return cleanTail;
   }
 
+  // 單元名稱對照表（若沒有中文尾綴，就用對照表）
   const nameMap = {
     U1: "輸入輸出",
-    U2: "條件判斷",
+    U2: "條件判斷與應用",
     U3: "迴圈觀念解析",
     U4: "巢狀迴圈",
     U5: "不定數迴圈",
-    U6: "串列與字典",
-    U7: "函數觀念解析",
+    U6: "串列觀念解析",
+    // U7: "函數觀念解析",
   };
   return nameMap[prefix] || String(rawUnit || "").trim();
 }
@@ -425,7 +426,7 @@ async function loadHomeData() {
 
     units.value = (data.units || []).map((u, idx) => ({
       unit: u.unit,
-      name: unitDisplayName(u.unit),
+      name: u.unit_label || u.name || unitDisplayName(u.unit),
       progress: Number(u.progress || 0),
       total_videos: Number(u.total_videos || 0),
       theme: themePool[idx % themePool.length],

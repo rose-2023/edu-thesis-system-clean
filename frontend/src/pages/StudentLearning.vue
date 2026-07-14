@@ -5,7 +5,7 @@
         <div class="brand-dot"></div>
         <div class="topbar-texts">
           <div class="title">單元列表</div>
-          <div class="subtitle">{{ displayUnitName(currentUnit) }}<span v-if="currentTitle">：{{ currentTitle }}</span></div>
+          <div class="subtitle">{{ currentUnitLabel || displayUnitName(currentUnit) }}<span v-if="currentTitle">：{{ currentTitle }}</span></div>
         </div>
       </div>
 
@@ -31,7 +31,7 @@
           <button class="unit-header" @click="toggleUnit(idx)">
             <div class="unit-left">
               <span class="chev" :class="{ open: openIndex === idx }">▾</span>
-              <span class="unit-title">{{ displayUnitName(u.unit) }}</span>
+              <span class="unit-title">{{ u.unitLabel || displayUnitName(u.unit) }}</span>
             </div>
             <span class="count">{{ u.videos.length }} 部</span>
           </button>
@@ -277,6 +277,7 @@ const selectedVideo = ref(null);
 const selectedVideoId = ref(null);
 
 const currentUnit = ref("");
+const currentUnitLabel = ref("");
 const currentTitle = ref("");
 const subtitleCues = ref([]);
 const activeSubtitleText = ref("");
@@ -333,11 +334,11 @@ function displayUnitName(rawUnit) {
   const tail = String(m?.[3] || "").trim();
 
   if (prefix === "U3") {
-    if (subTag === "for") return "for 迴圈";
+    if (subTag === "for") return "定數迴圈";
     if (subTag === "loop") return "迴圈觀念解析";
   }
   if (prefix === "U2") {
-    if (subTag === "if") return "if 條件判斷";
+    if (subTag === "if") return "條件判斷與應用";
     if (subTag === "ifelse") return "if-else 條件判斷";
     if (subTag === "elif") return "elif 條件判斷";
   }
@@ -350,12 +351,12 @@ function displayUnitName(rawUnit) {
 
   const nameMap = {
     U1: "輸入輸出",
-    U2: "條件判斷",
+    U2: "條件判斷與應用",
     U3: "迴圈觀念解析",
     U4: "巢狀迴圈",
     U5: "不定數迴圈",
-    U6: "串列與字典",
-    U7: "函數觀念解析",
+    U6: "串列觀念解析",
+    // U7: "函數觀念解析",
   };
   return nameMap[prefix] || raw;
 }
@@ -377,10 +378,13 @@ function groupByUnit(videos) {
   for (const v of videos) {
     const rawUnit = _normalizeRawUnit(v.unit || "未分類");
     const key = _normalizeUnitKey(rawUnit) || "未分類";
-    if (!map.has(key)) map.set(key, { unit: rawUnit, unitKey: key, videos: [] });
+    const label = String(v.unit_label || v.unitLabel || "").trim() || displayUnitName(rawUnit);
+    if (!map.has(key)) map.set(key, { unit: rawUnit, unitKey: key, unitLabel: label, videos: [] });
+    if (label && !map.get(key).unitLabel) map.get(key).unitLabel = label;
     map.get(key).videos.push({
       ...v,
       unit: rawUnit,
+      unit_label: label,
     });
   }
   return [...map.values()].sort((a, b) =>
@@ -541,6 +545,7 @@ function selectVideo(u, v) {
   selectedVideo.value = v;
   selectedVideoId.value = v._id || v.id || v.video_id;
   currentUnit.value = u.unit;
+  currentUnitLabel.value = u.unitLabel || v.unit_label || displayUnitName(u.unit);
   currentTitle.value = v.title;
   resetWatchSession();
   loadSubtitleForVideo(v);

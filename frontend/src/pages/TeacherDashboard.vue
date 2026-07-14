@@ -88,30 +88,90 @@
           </div>
         </section>
 
-        <!-- Units（保留你原本，並加入③ 操作入口） -->
-        <section class="card">
-          <div class="card-title">單元管理</div>
-
-          <div class="unit-row header">
-            <div>單元</div><div>影片</div><div>練習</div><div></div>
-          </div>
-
-          <div v-for="u in units" :key="u.unit" class="unit-row">
-            <div class="unit-name">{{ u.unit }}｜{{ u.title }}</div>
-            <div>影片({{ u.videos_count }})</div>
-            <div>練習({{ u.practices_count }})</div>
-
-            <!-- ✅ ③ 新增：影片/題庫 快捷入口（不移除你原本的管理） -->
-            <div class="unit-actions">
-              <button class="btn small ghost2" type="button" @click="goUploadUnit(u.unit)">影片</button>
-              <button class="btn small" type="button" @click="goBankUnit(u.unit)">題庫</button>
-
-              <!-- ✅ 你原本的管理按鈕保留 -->
-              <button class="btn small" type="button" @click="manageUnit(u.unit)">管理</button>
+        <!-- 單元與題庫 -->
+        <section class="card card-wide">
+          <div class="card-head dashboard-head">
+            <div>
+              <div class="card-title">單元與題庫</div>
+              <div class="card-subtitle">名稱沿用 TeacherT5AgentLog.vue 的單元命名</div>
+            </div>
+            <div class="chips">
+              <span class="chip">{{ selectedUnitRecord?.name || "請先選擇單元" }}</span>
+              <span class="chip">影片 {{ selectedUnitRecord?.videos_count || 0 }}</span>
+              <span class="chip">題庫 {{ selectedUnitRecord?.practices_count || 0 }}</span>
             </div>
           </div>
 
-          <div v-if="!units.length" class="muted">尚未建立單元</div>
+          <div class="dashboard-split">
+            <div class="unit-panel">
+              <div class="unit-row header">
+                <div>單元</div><div>影片</div><div>題庫</div><div></div>
+              </div>
+
+              <div
+                v-for="u in units"
+                :key="u.unit"
+                class="unit-row"
+                :class="{ selected: selectedUnit === u.unit }"
+                @click="selectedUnit = u.unit"
+              >
+                <div class="unit-name">
+                  <div class="unit-title">{{ u.name }}</div>
+                  <div class="unit-raw">{{ u.unit }}</div>
+                </div>
+                <div>影片({{ u.videos_count }})</div>
+                <div>題庫({{ u.practices_count }})</div>
+
+                <div class="unit-actions">
+                  <button class="btn small ghost2" type="button" @click.stop="goUploadUnit(u.unit)">影片</button>
+                  <button class="btn small" type="button" @click.stop="goBankUnit(u.unit)">題庫</button>
+                  <button class="btn small" type="button" @click.stop="manageUnit(u.unit)">管理</button>
+                </div>
+              </div>
+
+              <div v-if="!units.length" class="muted">尚未建立單元</div>
+            </div>
+
+            <div class="preview-panel">
+              <div class="preview-head">
+                <div>
+                  <div class="preview-title">題庫預覽</div>
+                  <div class="preview-subtitle">{{ selectedUnitRecord?.name || "請先點選左側單元" }}</div>
+                </div>
+                <button
+                  class="btn small"
+                  type="button"
+                  :disabled="!selectedUnit"
+                  @click="goBankUnit(selectedUnit)"
+                >
+                  查看題庫
+                </button>
+              </div>
+
+              <div v-if="selectedUnitRecord?.task_preview?.length" class="preview-list">
+                <div class="preview-row preview-row-header">
+                  <div>題目</div>
+                  <div>狀態</div>
+                  <div>建立</div>
+                </div>
+
+                <div v-for="task in selectedUnitRecord.task_preview" :key="task.task_id" class="preview-row">
+                  <div class="task-title">
+                    <div class="mono">{{ task.task_code || task.task_id }}</div>
+                    <div class="task-sub">{{ task.title || "未命名題目" }}</div>
+                  </div>
+                  <div>
+                    <span class="status-pill" :class="task.enabled ? 'status-on' : 'status-off'">
+                      {{ task.enabled ? "啟用" : "停用" }}
+                    </span>
+                  </div>
+                  <div class="task-time">{{ task.created_at || "—" }}</div>
+                </div>
+              </div>
+
+              <div v-else class="muted">這個單元目前沒有題庫預覽</div>
+            </div>
+          </div>
         </section>
       </main>
     </div>
@@ -139,10 +199,15 @@ const resourceCounts = reactive({
   posttest_question_count: 0,
 });
 const units = ref([]);
+const selectedUnit = ref("");
 const startDate = ref("");
 const endDate = ref("");
 const dashboardLoading = ref(false);
 const dashboardError = ref("");
+
+const selectedUnitRecord = computed(() => (
+  units.value.find((u) => String(u.unit || "") === String(selectedUnit.value || "")) || null
+));
 
 // ✅ 你原本註解掉的 watch / fetchVideos 我不動（照你的要求）
 // watch(
@@ -210,7 +275,18 @@ async function loadDashboard() {
     resourceCounts.practice_task_count = data.resource_counts.practice_task_count || 0;
     resourceCounts.pretest_question_count = data.resource_counts.pretest_question_count || 0;
     resourceCounts.posttest_question_count = data.resource_counts.posttest_question_count || 0;
-    units.value = data.units || [];
+    units.value = (data.units || []).map((u) => ({
+      ...u,
+      unit: u.unit || u.raw_name || "",
+      raw_name: u.raw_name || u.unit || "",
+      name: u.name || u.unit_label || u.title || u.unit || "",
+      unit_label: u.unit_label || u.name || u.title || u.unit || "",
+      task_preview: Array.isArray(u.task_preview) ? u.task_preview : [],
+    }));
+
+    if (!selectedUnit.value || !units.value.some((u) => String(u.unit) === String(selectedUnit.value))) {
+      selectedUnit.value = units.value[0]?.unit || "";
+    }
 
     if (data.date_range?.start_date) startDate.value = data.date_range.start_date;
     if (data.date_range?.end_date) endDate.value = data.date_range.end_date;
@@ -352,6 +428,115 @@ function manageUnit(unit) {
   font-weight: 700;
 }
 
+.card-wide {
+  grid-column: 1 / -1;
+}
+
+.dashboard-head {
+  align-items: center;
+}
+
+.dashboard-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  gap: 14px;
+}
+
+.unit-panel,
+.preview-panel {
+  border: 1px solid #e8ecf2;
+  border-radius: 14px;
+  background: #fcfdff;
+  padding: 12px;
+}
+
+.preview-panel {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.preview-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.preview-title {
+  font-weight: 900;
+  color: #111;
+}
+
+.preview-subtitle {
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #64748b;
+}
+
+.preview-list {
+  display: grid;
+  gap: 8px;
+}
+
+.preview-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) 110px 120px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid #eef1f5;
+}
+
+.preview-row-header {
+  border-top: 0;
+  padding-top: 0;
+  font-size: 12px;
+  font-weight: 900;
+  color: #64748b;
+}
+
+.task-title {
+  min-width: 0;
+}
+
+.task-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.35;
+}
+
+.task-time {
+  font-size: 12px;
+  color: #475569;
+  font-weight: 700;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 64px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.status-on {
+  background: #ecfdf3;
+  color: #15803d;
+  border: 1px solid #b7ebc6;
+}
+
+.status-off {
+  background: #fff1f2;
+  color: #b42318;
+  border: 1px solid #fecdd3;
+}
+
 .date-filter {
   display: flex;
   align-items: flex-end;
@@ -454,6 +639,7 @@ function manageUnit(unit) {
   align-items: center;
   padding: 12px 0;
   border-top: 1px solid #ededed;
+  cursor: pointer;
 }
 
 .unit-row.header {
@@ -461,6 +647,36 @@ function manageUnit(unit) {
   color: #666;
   font-weight: 900;
   padding-top: 0;
+  cursor: default;
+}
+
+.unit-row.selected {
+  background: #f7fbff;
+}
+
+.unit-title {
+  font-weight: 900;
+  color: #111;
+}
+
+.unit-raw {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.unit-row.header .unit-actions {
+  justify-content: flex-end;
+}
+
+@media (max-width: 1100px) {
+  .dashboard-split {
+    grid-template-columns: 1fr;
+  }
+
+  .preview-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .unit-name {

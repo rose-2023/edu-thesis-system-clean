@@ -3,6 +3,7 @@ from flask import Blueprint, request, jsonify
 from datetime import datetime, time, timezone, timedelta
 from bson import ObjectId
 from ..db import db
+from ..unit_labels import unit_label_map
 
 try:
     from zoneinfo import ZoneInfo
@@ -27,6 +28,12 @@ TAIPEI_TZ = _taipei_timezone()
 
 def _utc_now():
     return datetime.now(timezone.utc)
+
+
+def _safe_iso(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value) if value else ""
 
 
 def _date_input(value):
@@ -139,6 +146,39 @@ def _test_question_count(collection_name, legacy_role):
     return count if count else _legacy_test_task_count(legacy_role)
 
 
+def _task_preview_for_unit(unit: str, limit: int = 5):
+    if not _collection_exists("parsons_tasks"):
+        return []
+
+    query = {
+        "unit": unit,
+        "deleted": {"$ne": True},
+    }
+    cursor = db.parsons_tasks.find(query).sort([("created_at", -1)]).limit(max(1, int(limit or 5)))
+    preview = []
+    for t in cursor:
+        source_type = (
+            (t.get("source_type") or "").strip().lower()
+            or (t.get("gen_source") or "").strip().lower()
+            or ("ai" if bool(t.get("ai_generated")) else "fixed")
+        )
+        raw_status = (
+            (t.get("status") or "").strip().lower()
+            or (t.get("review_status") or "").strip().lower()
+            or ("published" if bool(t.get("enabled", False)) else "pending")
+        )
+        preview.append({
+            "task_id": str(t.get("_id")),
+            "task_code": t.get("task_code", ""),
+            "title": t.get("title") or t.get("question_text") or t.get("video_title") or "",
+            "status": raw_status,
+            "enabled": bool(t.get("enabled", False)),
+            "source_type": source_type,
+            "created_at": _safe_iso(t.get("created_at")),
+        })
+    return preview
+
+
 @teacher_dashboard_bp.get("")
 def dashboard():
     """
@@ -168,6 +208,7 @@ def dashboard():
         pretest_question_count = _test_question_count("pre_parsons_questions", "pre")
         posttest_question_count = _test_question_count("post_parsons_questions", "post")
         units_list = _distinct_units()
+        labels = unit_label_map(units_list)
         resource_counts = {
             "unit_count": len(units_list),
             "video_count": total_videos,
@@ -192,9 +233,13 @@ def dashboard():
             practices_in_unit = _count_not_deleted("parsons_tasks", {"unit": unit})
             units_data.append({
                 "unit": unit,
-                "title": f"{unit} 單元",
+                "raw_name": unit,
+                "name": labels.get(unit) or unit,
+                "unit_label": labels.get(unit) or unit,
+                "title": labels.get(unit) or f"{unit} 單元",
                 "videos_count": videos_in_unit,
-                "practices_count": practices_in_unit
+                "practices_count": practices_in_unit,
+                "task_preview": _task_preview_for_unit(unit, limit=5),
             })
         
         return jsonify({

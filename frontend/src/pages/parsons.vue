@@ -20,12 +20,37 @@
             v-for="(slot, idx) in templateSlots"
             :key="slot.slot"
             class="cloze-row"
-            :class="{ wrong: isPrimaryWrong(idx), affected: isAffectedWrong(idx) }"
+            :class="{
+              wrong: isPrimaryWrong(idx),
+              affected: isAffectedWrong(idx),
+              'c-wrong': isCStrategy && isWrongSlot(idx),
+            }"
           >
-            <div class="hint" v-if="effectiveShowSemanticZh && (slot.expected_meaning_zh || filled[slot.slot]?.meaning_zh)">
-              <span v-if="isAffectedWrong(idx)" class="hint-affected-icon" aria-hidden="true">⚠</span>
-              {{ idx + 1 }}. {{ slot.expected_meaning_zh || filled[slot.slot]?.meaning_zh }}
-            </div>
+
+          <div class="hint" v-if="shouldShowSlotSemantic(slot, idx)">
+            <span
+              v-if="isCStrategy ? isWrongSlot(idx) : isAffectedWrong(idx)"
+              class="hint-affected-icon"
+              aria-hidden="true"
+          >
+          </span>
+
+            {{ idx + 1 }}. {{ semanticTextForSlot(slot) }}
+          </div>
+
+          <div
+            v-if="hasSlotAdjustmentTags(idx)"
+            class="slot-error-tags"
+          >
+            <span
+              v-for="tag in slotAdjustmentTags(idx)"
+              :key="tag.key"
+              class="slot-error-tag"
+              :class="tag.kind"
+            >
+              {{ tag.label }}
+            </span>
+          </div>
 
             <div
               class="blank"
@@ -92,9 +117,9 @@
     <div v-if="firstHintPanel.visible" class="first-hint-panel">
       <div class="first-hint-title">❌ {{ firstHintPanel.headline }}</div>
       <div class="first-hint-meta">
-        <span>錯誤格數：{{ firstHintPanel.wrongCount }} 格</span>
-        <span>錯誤位置：{{ firstHintPanel.wrongPositionText }}</span>
-        <span>錯誤類型：{{ firstHintPanel.errorTypeText }}</span>
+        <span>需調整區塊：{{ firstHintPanel.wrongCount }} 個</span>
+        <span>順序問題：{{ firstHintPanel.sequenceCount }} 個</span>
+        <span>縮排問題：{{ firstHintPanel.indentationCount }} 個</span>
       </div>
       <div class="first-hint-text">{{ firstHintPanel.text }}</div>
     </div>
@@ -105,6 +130,8 @@
       @click="reopenAiHintFromFloating"
       type="button"
     >
+      <span v-if="showSecondHintFloatingBadge" class="floating-ai-hint-badge">1</span>
+      <span class="floating-ai-hint-label">{{ floatingAiHintLabel }}</span>
       查看 AI 提示
     </button>
 
@@ -161,21 +188,46 @@
           </div>
         </template>
 
+        <template v-else-if="feedbackModal.mode === 'fixed_semantic_feedback'">
+          <div class="fb-title first-error-title">❌ {{ firstHintPanel.headline }}</div>
+
+          <div class="fb-section first-error-section fixed-feedback-section">
+            <div class="fb-label">固定錯誤提示</div>
+            <div class="first-hint-meta in-modal">
+              <span>需調整區塊：{{ firstHintPanel.wrongCount }} 個</span>
+              <span>順序問題：{{ firstHintPanel.sequenceCount }} 個</span>
+              <span>縮排問題：{{ firstHintPanel.indentationCount }} 個</span>
+            </div>
+            <div class="fb-text first-error-text">
+              {{ firstHintPanel.text }}
+            </div>
+            <div class="fb-note first-error-note">
+              返回題目後，紅框旁會標示「順序需要調整」或「縮排需要調整」。
+            </div>
+          </div>
+
+          <div class="fb-actions">
+            <button class="btn submit" @click="returnToFixFromFixedFeedback">
+              返回題目修正
+            </button>
+          </div>
+        </template>
+
         <template v-else-if="feedbackModal.mode === 'first_system_hint'">
           <div class="fb-title first-error-title">❌ {{ firstHintPanel.headline }}</div>
 
           <div class="fb-section first-error-section">
             <div class="fb-label">第一次錯誤提示</div>
             <div class="first-hint-meta in-modal">
-              <span>錯誤格數：{{ firstHintPanel.wrongCount }} 格</span>
-              <span>錯誤位置：{{ firstHintPanel.wrongPositionText }}</span>
-              <span>錯誤事項：{{ firstHintPanel.errorTypeText }}</span>
+              <span>需調整區塊：{{ firstHintPanel.wrongCount }} 個</span>
+              <span>順序問題：{{ firstHintPanel.sequenceCount }} 個</span>
+              <span>縮排問題：{{ firstHintPanel.indentationCount }} 個</span>
             </div>
             <div class="fb-text first-error-text">
               {{ firstHintPanel.text }}
             </div>
             <div class="fb-note first-error-note">
-              請先依照紅色標記的位置修正。
+              返回題目後，紅框旁會標示「順序需要調整」或「縮排需要調整」。
             </div>
           </div>
 
@@ -190,16 +242,31 @@
           <div class="fb-section first-error-section">
             <div class="fb-label">錯誤提示</div>
             <div class="first-hint-meta in-modal">
-              <span>錯誤格數：{{ firstHintPanel.wrongCount }} 格</span>
-              <span>錯誤位置：{{ firstHintPanel.wrongPositionText }}</span>
-              <span>錯誤事項：{{ firstHintPanel.errorTypeText }}</span>
+              <span>需調整區塊：{{ firstHintPanel.wrongCount }} 個</span>
+              <span>順序問題：{{ firstHintPanel.sequenceCount }} 個</span>
+              <span>縮排問題：{{ firstHintPanel.indentationCount }} 個</span>
             </div>
             <div class="fb-text first-error-text">
               {{ firstHintPanel.text }}
             </div>
             <div class="fb-note first-error-note">
-              請先依照紅色標記的位置修正。
+              返回題目後，紅框旁會標示「順序需要調整」或「縮排需要調整」。
             </div>
+          </div>
+
+          <div v-if="showSecondHintModalPrompt" class="second-hint-reminder in-modal">
+            <div class="second-hint-reminder-copy">
+              <div class="second-hint-reminder-title">{{ secondHintReminderTitle }}</div>
+              <div class="second-hint-reminder-text">{{ secondHintReminderText }}</div>
+            </div>
+            <button
+              class="btn submit second-hint-reminder-btn"
+              type="button"
+              :disabled="feedbackModal.secondHintLoading"
+              @click="openSecondHintFromReminder('click_result_second_hint')"
+            >
+              {{ feedbackModal.secondHintLoading ? secondHintReminderLoadingLabel : secondHintReminderButtonLabel }}
+            </button>
           </div>
 
           <div class="fb-actions">
@@ -495,6 +562,22 @@ const templateSlots = ref([]);
 const teacherForcedHideSemantic = ref(false);
 const effectiveShowSemanticZh = computed(() => !teacherForcedHideSemantic.value);
 
+// 回饋策略：舊資料沒有欄位時預設 B，避免影響原本功能
+const feedbackStrategy = computed(() => {
+  const strategy = String(
+    task.value?.feedback_strategy || "B"
+  ).trim().toUpperCase();
+
+  // 後端未來會用 Z 分配寫入 A/B/C。
+  // A：AI 回饋 + 反思題；B：第二次錯誤後 AI 回饋；C：固定中文回饋。
+  // 目前只先完成 C 的特殊分支，A 暫時不改動既有 B 流程。
+  return ["A", "B", "C"].includes(strategy) ? strategy : "B";
+});
+
+const isCStrategy = computed(() => {
+  return feedbackStrategy.value === "C";
+});
+
 // ====== 拖曳狀態 ======
 const dragging = ref(null);
 const overSlot = ref(null);
@@ -605,6 +688,7 @@ async function bindBlankFocusHandlers() {
 const result = ref(null);
 const wrongIndices = ref([]);
 const primaryWrongIndex = ref(null);
+const wrongSlotIssueMap = ref({});
 
 // ====== UI 狀態 ======
 const state = reactive({
@@ -664,6 +748,9 @@ const feedbackModal = reactive({
   aiHint2Meta: {},
   activeAiHintNo: 1,
   secondHintLoading: false,
+  secondHintNoticeVisible: false,
+  secondHintReminderShownLogged: false,
+  secondHintReminderResolved: false,
   firstHint: "",
   secondHint: "",
   possibleCauses: [],
@@ -677,13 +764,63 @@ const firstHintPanel = reactive({
   headline: "",
   text: "",
   wrongCount: 0,
+  sequenceCount: 0,
+  indentationCount: 0,
   wrongPositionText: "紅色標記的位置",
   errorTypeText: "待檢查",
   hintRecord: null,
 });
 
 const showFloatingAiHintButton = computed(() => {
-  return Boolean(!feedbackModal.open && feedbackModal.hintRecord && feedbackModal.aiHint1Text);
+  return Boolean(
+    !isCStrategy.value &&
+    !feedbackModal.open &&
+    feedbackModal.hintRecord &&
+    feedbackModal.aiHint1Text
+  );
+});
+
+const hasSavedSecondAiHint = computed(() => Boolean(
+  feedbackModal.hintRecord &&
+  feedbackModal.aiHint1Text &&
+  feedbackModal.aiHint2Text
+));
+
+const hasPendingSecondAiHint = computed(() => Boolean(
+  !isCStrategy.value &&
+  feedbackModal.hintRecord &&
+  feedbackModal.aiHint1Text &&
+  !feedbackModal.aiHint2Text &&
+  (
+    feedbackModal.secondHintNoticeVisible ||
+    (
+      result.value &&
+      result.value.is_correct === false &&
+      Number(feedbackModal.attemptNo || result.value?.attempt_no || 0) >= 2
+    )
+  )
+));
+
+const showSecondHintModalPrompt = computed(() => Boolean(
+  feedbackModal.open &&
+  feedbackModal.mode === "system_recheck" &&
+  hasPendingSecondAiHint.value
+));
+
+const showSecondHintFloatingBadge = computed(() => Boolean(
+  showFloatingAiHintButton.value &&
+  hasPendingSecondAiHint.value
+));
+
+const secondHintReminderTitle = "\u4f60\u9084\u6709 1 \u6b21 AI \u63d0\u793a\u67e5\u770b\u6a5f\u6703\u3002";
+const secondHintReminderText = "\u76ee\u524d\u932f\u8aa4\u4f4d\u7f6e\u5df2\u6a19\u793a\u5b8c\u6210\uff0c\u53ef\u4ee5\u67e5\u770b\u66f4\u805a\u7126\u7684\u7b2c\u4e8c\u6b21\u63d0\u793a\u5f8c\u518d\u4fee\u6b63\u3002";
+const secondHintReminderButtonLabel = "\u67e5\u770b\u7b2c\u4e8c\u6b21 AI \u63d0\u793a";
+const secondHintReminderLoadingLabel = "\u7b2c\u4e8c\u6b21 AI \u63d0\u793a\u8f09\u5165\u4e2d...";
+
+const floatingAiHintLabel = computed(() => {
+  if (hasSavedSecondAiHint.value) return "\u67e5\u770b\u5df2\u4fdd\u5b58\u63d0\u793a";
+  if (hasPendingSecondAiHint.value) return "\u7b2c 2 \u6b21\u63d0\u793a\u53ef\u67e5\u770b";
+  return "\u67e5\u770b AI \u63d0\u793a";
 });
 
 const generatedAiHintCount = computed(() => {
@@ -702,9 +839,41 @@ const activeAiHintText = computed(() => {
     : feedbackModal.aiHint1Text;
 });
 
-function sanitizeHintMeta(meta) {
+const topLevelRemovedAiHintMetaKeys = new Set([
+  "wrong_index",
+  "concept",
+  "concept_tag",
+  "concept_scope",
+]);
+
+const alwaysRemovedAiHintMetaKeys = new Set([
+  "subtitle_range",
+  "subtitle_ranges",
+  "subtitle_broad_range",
+  "subtitle_narrow_range",
+  "subtitle_range_available",
+  "subtitle_scope",
+]);
+
+function sanitizeHintMeta(meta, depth = 0) {
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) return {};
-  return { ...meta };
+  const cleaned = {};
+  for (const [key, value] of Object.entries(meta)) {
+    if (alwaysRemovedAiHintMetaKeys.has(key)) continue;
+    if (depth === 0 && topLevelRemovedAiHintMetaKeys.has(key)) continue;
+    if (Array.isArray(value)) {
+      cleaned[key] = value.map((item) => (
+        item && typeof item === "object" && !Array.isArray(item)
+          ? sanitizeHintMeta(item, depth + 1)
+          : item
+      ));
+    } else if (value && typeof value === "object") {
+      cleaned[key] = sanitizeHintMeta(value, depth + 1);
+    } else {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
 }
 
 function firstNonEmptyHintMeta(...candidates) {
@@ -737,7 +906,7 @@ const activeAiHintConceptScope = computed(() => {
   if (scopes.length) {
     return Array.from(new Set(scopes)).join("、");
   }
-  return String(meta.concept_scope || meta.concept_label || "").trim();
+  return String(meta.concept_label || "").trim();
 });
 
 const activeAiHintScopeLabel = computed(() => {
@@ -747,15 +916,6 @@ const activeAiHintScopeLabel = computed(() => {
   if (level === 2 || scope === "narrow") return "聚焦概念提示";
   return "廣泛概念提示";
 });
-
-function hasHintSubtitleRange(meta) {
-  const range = meta?.subtitle_range && typeof meta.subtitle_range === "object"
-    ? meta.subtitle_range
-    : meta;
-  const start = Number(range?.start);
-  const end = Number(range?.end);
-  return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start;
-}
 
 const activeAiHintDisplayNo = computed(() => {
   return feedbackModal.activeAiHintNo === 2 ? 2 : 1;
@@ -931,6 +1091,7 @@ function resetFilled() {
   for (const k of Object.keys(filled)) delete filled[k];
   wrongIndices.value = [];
   primaryWrongIndex.value = null;
+  wrongSlotIssueMap.value = {};
   result.value = null;
   state.err = "";
   feedbackModal.aiHint1Meta = {};
@@ -947,12 +1108,323 @@ function isPrimaryWrong(idx) {
   return p === Number(idx);
 }
 
+// 檢查指定索引的插槽是否受影響（即是否為錯誤插槽但非主要錯誤插槽）
+function isWrongSlot(idx) {
+  if (
+    !Array.isArray(wrongIndices.value) ||
+    wrongIndices.value.length === 0
+  ) {
+    return false;
+  }
+
+  const targetIndex = Number(idx);
+
+  if (!Number.isFinite(targetIndex)) {
+    return false;
+  }
+
+  return wrongIndices.value.some(
+    (value) => Number(value) === targetIndex
+  );
+}
+
+// B 策略會有一個主要錯誤格與其他受影響錯誤格。
+// C 策略也沿用這個判斷作紅色標記，但顯示內容改成固定中文語意。
 function isAffectedWrong(idx) {
-  if (!Array.isArray(wrongIndices.value) || !wrongIndices.value.length) return false;
-  const n = Number(idx);
-  if (!Number.isFinite(n)) return false;
-  const hasMatch = wrongIndices.value.some((v) => Number(v) === n);
-  return hasMatch && !isPrimaryWrong(n);
+  return isWrongSlot(idx) && !isPrimaryWrong(idx);
+}
+
+function addSlotIssue(map, idx, kind) {
+  const slotIndex = Number(idx);
+  if (!Number.isFinite(slotIndex) || slotIndex < 0) return;
+
+  const issueKind = String(kind || "").trim();
+  if (!["sequence", "indentation"].includes(issueKind)) return;
+
+  const key = String(slotIndex);
+  const current = Array.isArray(map[key]) ? map[key] : [];
+  if (!current.includes(issueKind)) {
+    map[key] = [...current, issueKind];
+  }
+}
+
+function normalizeSlotIssueMap(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const map = {};
+  for (const [rawKey, rawIssues] of Object.entries(value)) {
+    const idx = Number(rawKey);
+    if (!Number.isFinite(idx) || idx < 0) continue;
+    const issues = Array.isArray(rawIssues) ? rawIssues : [rawIssues];
+    for (const issue of issues) {
+      addSlotIssue(map, idx, issue);
+    }
+  }
+  return map;
+}
+
+function defaultSequenceIssueMap(positions = []) {
+  const map = {};
+  for (const idx of normalizeWrongPositions(positions)) {
+    addSlotIssue(map, idx, "sequence");
+  }
+  return map;
+}
+
+function mergeSlotLists(...lists) {
+  return Array.from(
+    new Set(
+      lists
+        .flatMap((list) => normalizeWrongPositions(list))
+        .filter((idx) => Number.isFinite(Number(idx)))
+    )
+  ).sort((a, b) => a - b);
+}
+
+function collectErrorTypes(...candidates) {
+  return Array.from(
+    new Set(
+      candidates
+        .flatMap((candidate) => Array.isArray(candidate) ? candidate : [])
+        .map((item) => String(item || "").trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+}
+
+function buildWrongSlotIssueMap(r = {}, flow = {}, record = {}) {
+  const positions = firstNonEmptyWrongPositions(
+    flow.current_error_positions,
+    flow.second_error_positions,
+    flow.first_error_positions,
+    record.latest_error_positions,
+    record.second_error_positions,
+    record.first_error_positions,
+    r.current_error_positions,
+    r.incorrect_slots,
+    r.wrong_indices_all,
+    r.wrong_indices,
+    r.wrong_slots,
+    r.indent_errors,
+    r.wrong_index != null ? [r.wrong_index] : []
+  );
+
+  const sequenceSlots = mergeSlotLists(
+    flow.sequence_slots,
+    r.sequence_slots,
+    r.wrong_slots
+  );
+
+  const indentationSlots = mergeSlotLists(
+    flow.indentation_slots,
+    r.indentation_slots,
+    r.indent_errors
+  );
+
+  const map = {};
+  sequenceSlots.forEach((idx) => addSlotIssue(map, idx, "sequence"));
+  indentationSlots.forEach((idx) => addSlotIssue(map, idx, "indentation"));
+
+  const detailCandidates = [
+    r.wrong_slot_details,
+    flow.wrong_slot_details,
+    flow.current_wrong_slot_details,
+    record.latest_wrong_slot_details,
+  ];
+
+  for (const details of detailCandidates) {
+    if (!Array.isArray(details)) continue;
+    for (const detail of details) {
+      const idx = Number(
+        detail?.slot_index ?? detail?.index ?? detail?.wrong_index
+      );
+      if (!Number.isFinite(idx)) continue;
+      const types = collectErrorTypes(detail?.error_types);
+      if (types.some((type) => type.includes("indent"))) {
+        addSlotIssue(map, idx, "indentation");
+      }
+      if (types.some((type) => (
+        type.includes("sequence") ||
+        type.includes("structure") ||
+        type.includes("order") ||
+        type.includes("branch") ||
+        type.includes("logic")
+      ))) {
+        addSlotIssue(map, idx, "sequence");
+      }
+    }
+  }
+
+  const globalTypes = collectErrorTypes(
+    flow.current_error_types,
+    flow.second_error_types,
+    flow.first_error_types,
+    record.latest_error_types,
+    record.second_error_types,
+    record.first_error_types,
+    r.current_error_types,
+    r.error_types
+  );
+  const globalHasIndent = globalTypes.some((type) => type.includes("indent"));
+  const globalHasSequence = globalTypes.some((type) => (
+    type.includes("sequence") ||
+    type.includes("structure") ||
+    type.includes("order") ||
+    type.includes("branch") ||
+    type.includes("logic")
+  ));
+
+  for (const idx of positions) {
+    const key = String(idx);
+    if (Array.isArray(map[key]) && map[key].length) continue;
+    if (globalHasIndent && !globalHasSequence) {
+      addSlotIssue(map, idx, "indentation");
+    } else {
+      addSlotIssue(map, idx, "sequence");
+    }
+  }
+
+  return map;
+}
+
+function summarizeSlotIssues(issueMap = {}, fallbackPositions = []) {
+  const map = normalizeSlotIssueMap(issueMap);
+  const slotSet = new Set(
+    Object.keys(map)
+      .map((idx) => Number(idx))
+      .filter((idx) => Number.isFinite(idx))
+  );
+
+  for (const idx of normalizeWrongPositions(fallbackPositions)) {
+    slotSet.add(Number(idx));
+  }
+
+  let sequenceCount = 0;
+  let indentationCount = 0;
+
+  for (const idx of slotSet) {
+    const issues = Array.isArray(map[String(idx)]) ? map[String(idx)] : [];
+    if (issues.includes("sequence")) sequenceCount += 1;
+    if (issues.includes("indentation")) indentationCount += 1;
+    if (!issues.length) sequenceCount += 1;
+  }
+
+  return {
+    total: slotSet.size,
+    sequenceCount,
+    indentationCount,
+  };
+}
+
+function buildAdjustmentHeadline(count = 0) {
+  const total = Math.max(0, Number(count) || 0);
+  return `有 ${total} 個程式區塊需要調整`;
+}
+
+function buildAdjustmentFeedbackText(summary = {}, fallbackCount = 0) {
+  const total = Math.max(0, Number(summary.total || fallbackCount) || 0);
+  const sequenceCount = Math.max(0, Number(summary.sequenceCount || 0) || 0);
+  const indentationCount = Math.max(0, Number(summary.indentationCount || 0) || 0);
+  const issueParts = [];
+
+  if (sequenceCount > 0) {
+    issueParts.push(`順序問題 ${sequenceCount} 個`);
+  }
+  if (indentationCount > 0) {
+    issueParts.push(`縮排問題 ${indentationCount} 個`);
+  }
+
+  const issueText = issueParts.length
+    ? `其中 ${issueParts.join("、")}。`
+    : "";
+
+  return `目前有 ${total} 個程式區塊需要調整。${issueText}返回題目後，請依照紅框旁的標籤修正。`;
+}
+
+function applyWrongSlotIssuesFromResult(r = {}, flow = {}, record = {}) {
+  const map = buildWrongSlotIssueMap(r, flow, record);
+  wrongSlotIssueMap.value = normalizeSlotIssueMap(map);
+  return summarizeSlotIssues(wrongSlotIssueMap.value, collectCurrentWrongPositions(r));
+}
+
+function applyFirstHintPanelAdjustmentSummary(summary = {}, fallbackCount = 0) {
+  const total = Math.max(0, Number(summary.total || fallbackCount) || 0);
+  firstHintPanel.wrongCount = total;
+  firstHintPanel.sequenceCount = Math.max(0, Number(summary.sequenceCount || 0) || 0);
+  firstHintPanel.indentationCount = Math.max(0, Number(summary.indentationCount || 0) || 0);
+  firstHintPanel.headline = buildAdjustmentHeadline(total);
+  firstHintPanel.text = buildAdjustmentFeedbackText(summary, total);
+}
+
+function slotAdjustmentTags(idx) {
+  const issues = Array.isArray(wrongSlotIssueMap.value?.[String(Number(idx))])
+    ? wrongSlotIssueMap.value[String(Number(idx))]
+    : [];
+
+  return issues.map((issue) => {
+    if (issue === "indentation") {
+      return {
+        key: "indentation",
+        kind: "indentation",
+        label: "縮排需要調整",
+      };
+    }
+    return {
+      key: "sequence",
+      kind: "sequence",
+      label: "順序需要調整",
+    };
+  });
+}
+
+function hasSlotAdjustmentTags(idx) {
+  return slotAdjustmentTags(idx).length > 0;
+}
+
+// 取得該槽位要顯示的中文語意。
+function semanticTextForSlot(slot) {
+  const expectedMeaning = String(
+    slot?.expected_meaning_zh || ""
+  ).trim();
+
+  // C 策略只能顯示「該位置標準答案」的中文語意。
+  // 不能顯示學生目前拖入之錯誤 block 的語意。
+  // 這是研究設計中的固定提示，送出當下不呼叫 AI。
+  if (isCStrategy.value) {
+    return expectedMeaning;
+  }
+
+  // B 策略維持目前原始行為，不做變更。
+  return String(
+    expectedMeaning ||
+    filled[slot?.slot]?.meaning_zh ||
+    ""
+  ).trim();
+}
+
+// 中文語意顯示條件
+function shouldShowSlotSemantic(slot, idx) {
+  if (!effectiveShowSemanticZh.value) {
+    return false;
+  }
+
+  const semanticText = semanticTextForSlot(slot);
+
+  if (!semanticText) {
+    return false;
+  }
+
+  // C：尚未送出時 wrongIndices 為空，因此完全不顯示。
+  // 送出後只有錯誤格顯示。
+  // 修正成功的格子會從 wrongIndices 消失，因此提示同步消失。
+  if (isCStrategy.value) {
+    return isWrongSlot(idx);
+  }
+
+  // B：完全維持原本「有中文語意就顯示」的行為。
+  return true;
 }
 
 function isUsed(blockId) {
@@ -1036,6 +1508,11 @@ function removeFromSlot(slotKey) {
     wrongIndices.value = (wrongIndices.value || []).filter(
       (wrongIndex) => Number(wrongIndex) !== Number(idx)
     );
+    const nextIssueMap = {
+      ...(wrongSlotIssueMap.value || {}),
+    };
+    delete nextIssueMap[String(idx)];
+    wrongSlotIssueMap.value = nextIssueMap;
   }
 
   delete slotIndentLevel[String(slotKey)];
@@ -1091,6 +1568,8 @@ async function advanceTestAfterSubmit() {
 
         resetFilled();
         wrongIndices.value = [];
+        primaryWrongIndex.value = null;
+        wrongSlotIssueMap.value = {};
         result.value = null;
         state.err = "";
         await bindBlankFocusHandlers();
@@ -1642,11 +2121,33 @@ function goNextUnit() {
 function openFeedbackModal(r, taskId) {
   const parts = buildWrongFeedbackParts(r || {});
   primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
+  const flow =
+    r?.hint_flow && typeof r.hint_flow === "object"
+      ? r.hint_flow
+      : {};
+  const record =
+    flow.hint_record && typeof flow.hint_record === "object"
+      ? flow.hint_record
+      : {};
+  const issueMap = buildWrongSlotIssueMap(r || {}, flow, record);
+  if (Object.keys(issueMap).length) {
+    wrongSlotIssueMap.value = normalizeSlotIssueMap(issueMap);
+  }
+  const issueSummary = summarizeSlotIssues(
+    wrongSlotIssueMap.value,
+    collectCurrentWrongPositions(r || {})
+  );
+  const adjustmentCount =
+    issueSummary.total ||
+    collectCurrentWrongPositions(r || {}).length ||
+    Number(r?.error_count || 0) ||
+    wrongIndices.value.length ||
+    0;
   feedbackModal.open = true;
   feedbackModal.mode = "legacy";
   feedbackModal.stage = "detail";
-  feedbackModal.headline = buildFeedbackHeadline(parts);
-  feedbackModal.locationText = buildFeedbackLocation(parts);
+  feedbackModal.headline = buildAdjustmentHeadline(adjustmentCount);
+  feedbackModal.locationText = "紅框標示的程式區塊";
   feedbackModal.hintQuestion = "";
   feedbackModal.slotLabel = parts.slotLabel;
   feedbackModal.diagnosis = parts.diagnosis;
@@ -1666,6 +2167,9 @@ function openFeedbackModal(r, taskId) {
   feedbackModal.aiHint2Text = "";  // 第二次提示文字
   feedbackModal.aiHint2Meta = {};
   feedbackModal.secondHintLoading = false;
+  feedbackModal.secondHintNoticeVisible = false;
+  feedbackModal.secondHintReminderShownLogged = false;
+  feedbackModal.secondHintReminderResolved = false;
   feedbackModal.possibleCauses = Array.isArray(parts.possibleCauses) ? parts.possibleCauses : [];
   feedbackModal.actualText = String(parts.actualText || "");
   feedbackModal.expectedText = String(parts.expectedText || "");
@@ -1774,6 +2278,17 @@ function applyHintRecordToFeedbackModal(record = {}, extra = {}) {
   feedbackModal.hintLoaded = Boolean(feedbackModal.aiHint1Text);
   feedbackModal.hintLoading = false;
   feedbackModal.hintError = "";
+}
+
+function hasUnviewedSecondAiHintOpportunity(record = {}) {
+  const hintRecord = (record && typeof record === "object") ? record : {};
+  const hasFirstHint = Boolean(
+    String(hintRecord.ai_hint_1_text || feedbackModal.aiHint1Text || "").trim()
+  );
+  const hasSecondHint = Boolean(
+    String(hintRecord.ai_hint_2_text || feedbackModal.aiHint2Text || "").trim()
+  );
+  return hasFirstHint && !hasSecondHint;
 }
 
 function normalizeWrongPositions(list) {
@@ -1897,19 +2412,16 @@ function showFirstSystemHint(r, taskId) {
   const errorTypes = Array.isArray(flow.first_error_types)
     ? flow.first_error_types
     : (Array.isArray(record.first_error_types) ? record.first_error_types : []);
-  const text = String(
-    flow.first_system_hint_text
-    || record.first_system_hint_text
-    || "請先檢查紅色標記的位置，重新確認程式區塊的順序或結構。"
-  );
+  const issueSummary = applyWrongSlotIssuesFromResult(r || {}, flow, record);
   feedbackModal.mode = "first_system_hint";
   feedbackModal.open = true;
   feedbackModal.stage = "detail";
   feedbackModal.hintOpen = false;
   firstHintPanel.visible = false;
-  firstHintPanel.text = text;
-  firstHintPanel.wrongCount = positions.length || Number(r?.error_count || 0) || wrongIndices.value.length || 0;
-  firstHintPanel.headline = `第一次作答結果：共有 ${firstHintPanel.wrongCount} 格錯誤`;
+  applyFirstHintPanelAdjustmentSummary(
+    issueSummary,
+    positions.length || Number(r?.error_count || 0) || wrongIndices.value.length || 0
+  );
   firstHintPanel.wrongPositionText = formatWrongPositionText(positions.length ? positions : wrongIndices.value);
   firstHintPanel.errorTypeText = formatErrorTypeText(errorTypes, parts.diagnosis);
   firstHintPanel.hintRecord = record;
@@ -1962,22 +2474,19 @@ function showSystemRecheck(r, taskId) {
     ?? r?.error_count
     ?? positions.length
   );
+  const issueSummary = applyWrongSlotIssuesFromResult(r || {}, flow, record);
 
   firstHintPanel.visible = false;
-  firstHintPanel.wrongCount =
+  applyFirstHintPanelAdjustmentSummary(
+    issueSummary,
     Number.isFinite(wrongCount)
       ? wrongCount
-      : positions.length;
-  firstHintPanel.headline =
-    `作答結果：共有 ${firstHintPanel.wrongCount} 格錯誤`;
+      : positions.length
+  );
   firstHintPanel.wrongPositionText =
     formatWrongPositionText(positions);
   firstHintPanel.errorTypeText =
     formatErrorTypeText(errorTypes, "待調整");
-  firstHintPanel.text = String(
-    flow.current_system_feedback_text
-    || "請先檢查紅色標記的位置，重新確認程式區塊的順序或結構。"
-  );
   firstHintPanel.hintRecord = record;
 
   feedbackModal.mode = "system_recheck";
@@ -1997,9 +2506,88 @@ function showSystemRecheck(r, taskId) {
   );
 
   applyHintRecordToFeedbackModal(record, {});
+  feedbackModal.secondHintReminderShownLogged = false;
+  feedbackModal.secondHintReminderResolved = false;
+  feedbackModal.secondHintNoticeVisible = hasUnviewedSecondAiHintOpportunity(record);
   feedbackModal.mode = "system_recheck";
   feedbackModal.open = true;
   feedbackModal.hintOpen = false;
+  if (feedbackModal.secondHintNoticeVisible) {
+    void logSecondHintReminderShown("system_recheck_modal");
+  }
+}
+// c策略頁面每次答錯都呼叫這個函式
+function showFixedSemanticFeedbackModal(r, taskId) {
+  const flow =
+    r?.hint_flow && typeof r.hint_flow === "object"
+      ? r.hint_flow
+      : {};
+
+  // C 策略每次答錯都只呈現固定中文回饋。
+  // 這裡不呼叫 AI、不讀 AI hint record，也不進入 B 策略的 ai_hint_flow。
+  const positions = firstNonEmptyWrongPositions(
+    flow.current_error_positions,
+    r?.incorrect_slots,
+    r?.wrong_slots,
+    r?.wrong_indices_all,
+    r?.wrong_indices,
+    r?.indent_errors,
+    r?.wrong_index != null ? [r.wrong_index] : []
+  );
+
+  wrongIndices.value = positions;
+  primaryWrongIndex.value =
+    positions.length > 0
+      ? positions[0]
+      : null;
+
+  const errorTypes = Array.isArray(flow.current_error_types)
+    ? flow.current_error_types
+    : (Array.isArray(r?.error_types) ? r.error_types : []);
+
+  const wrongCount = Number(
+    flow.current_error_count
+    ?? r?.error_count
+    ?? positions.length
+  );
+  const attemptNo = Number(r?.attempt_no || 0);
+  const displayAttemptNo =
+    Number.isFinite(attemptNo) && attemptNo > 0
+      ? attemptNo
+      : 1;
+  const displayWrongCount =
+    Number.isFinite(wrongCount) && wrongCount > 0
+      ? wrongCount
+      : positions.length;
+  const issueSummary = applyWrongSlotIssuesFromResult(r || {}, flow, {});
+  const positionText = formatWrongPositionText(positions);
+  const errorTypeText = formatErrorTypeText(errorTypes, "結構順序錯誤");
+
+  firstHintPanel.visible = false;
+  applyFirstHintPanelAdjustmentSummary(issueSummary, displayWrongCount);
+  firstHintPanel.wrongPositionText = positionText;
+  firstHintPanel.errorTypeText = errorTypeText;
+  firstHintPanel.hintRecord = null;
+
+  feedbackModal.mode = "fixed_semantic_feedback";
+  feedbackModal.open = true;
+  feedbackModal.stage = "detail";
+  feedbackModal.hintOpen = false;
+  feedbackModal.hintRecord = null;
+  feedbackModal.hintId = "";
+  feedbackModal.aiHint1Text = "";
+  feedbackModal.aiHint2Text = "";
+  feedbackModal.taskId = String(taskId || "");
+  feedbackModal.attemptId = String(r?.attempt_id || "");
+  feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
+  feedbackModal.attemptNo = Number.isFinite(attemptNo)
+    ? attemptNo
+    : null;
+  feedbackModal.targetConcept = String(
+    r?.target_concept
+    || currentTargetConcept()
+    || ""
+  );
 }
 
 function openAiHintModalFromFlow(r, taskId) {
@@ -2028,6 +2616,7 @@ function openAiHintModalFromFlow(r, taskId) {
     positions.length > 0
       ? positions[0]
       : null;
+  applyWrongSlotIssuesFromResult(r || {}, flow, record);
 
   feedbackModal.mode = "ai_hint_flow";
   feedbackModal.open = true;
@@ -2131,10 +2720,39 @@ async function fetchHintRecord(requestedHintNo, extra = {}) {
   if (normalizedHintNo === 2 && !feedbackModal.aiHint2Text) {
     throw new Error("第二次 AI 提示產生失敗，請稍後再試。");
   }
+  if (normalizedHintNo === 2) {
+    feedbackModal.secondHintNoticeVisible = false;
+    feedbackModal.secondHintReminderResolved = true;
+  }
   return data;
 }
 
 // 「產生第二次 AI 提示」與已保存提示切換
+async function openSecondHintFromReminder(triggerMethod = "click_second_hint_reminder") {
+  if (feedbackModal.hintLoading || feedbackModal.secondHintLoading) return;
+  feedbackModal.mode = "ai_hint_flow";
+  feedbackModal.open = true;
+  feedbackModal.stage = "detail";
+  feedbackModal.hintOpen = true;
+  feedbackModal.activeAiHintNo = 2;
+  feedbackModal.hintError = "";
+  firstHintPanel.visible = false;
+
+  try {
+    await logSecondHintReminderClicked(triggerMethod);
+    feedbackModal.secondHintLoading = true;
+    await fetchHintRecord(2, {
+      trigger_method: triggerMethod,
+      button_name: "查看第二次 AI 提示",
+    });
+    feedbackModal.secondHintNoticeVisible = false;
+  } catch (err) {
+    feedbackModal.hintError = err?.message || "第二次 AI 提示載入失敗";
+  } finally {
+    feedbackModal.secondHintLoading = false;
+  }
+}
+
 async function handleAiHintAction() {
   if (feedbackModal.hintLoading || feedbackModal.secondHintLoading) return;
   if (generatedAiHintCount.value < 2 || !feedbackModal.aiHint2Text) {
@@ -2201,6 +2819,7 @@ async function returnToFixFromFirstHint() {
 }
 
 async function returnToFixFromSystemRecheck() {
+  await logSecondHintReminderIgnored("system_recheck_return_to_fix");
   await logLearningEvent("return_to_task", {
     task_id: feedbackModal.taskId || currentTaskId(),
     attempt_id: feedbackModal.attemptV2Id || null,
@@ -2220,7 +2839,34 @@ async function returnToFixFromSystemRecheck() {
   feedbackModal.mode = "legacy";
 }
 
+// 點「返回題目修正」會關閉 C 固定提示框，並寫入 return_to_task，metadata 標記
+async function returnToFixFromFixedFeedback() {
+  await logLearningEvent("return_to_task", {
+    task_id: feedbackModal.taskId || currentTaskId(),
+    attempt_id: feedbackModal.attemptV2Id || null,
+    attempt_no: feedbackModal.attemptNo,
+    target_concept: feedbackModal.targetConcept || currentTargetConcept(),
+    metadata: {
+      feedback_strategy: "C",
+      feedback_type: "fixed_semantic_feedback",
+      return_method: "fixed_semantic_feedback_modal",
+      wrong_slots: Array.isArray(wrongIndices.value)
+        ? wrongIndices.value
+            .map((value) => Number(value))
+            .filter((value) => Number.isFinite(value))
+        : [],
+      error_text: firstHintPanel.errorTypeText,
+    },
+  });
+  feedbackModal.open = false;
+  feedbackModal.mode = "legacy";
+}
+
 async function reopenAiHintFromFloating() {
+  if (hasPendingSecondAiHint.value) {
+    await openSecondHintFromReminder("click_floating_second_hint");
+    return;
+  }
   if (feedbackModal.attemptId) {
     try {
       // 提示 API 會自動判斷要回傳第一次或第二次提示，這裡不需要指定 requested_hint_no
@@ -2257,6 +2903,21 @@ function applyAiHintToFeedbackModal(data = {}) {
   feedbackModal.firstHint = String(detail?.first_hint || data?.hint || feedbackModal.firstHint || "");
   feedbackModal.secondHint = String(detail?.second_hint || feedbackModal.secondHint || "");
   const requestedHintNo = Number(data?.requested_hint_no || feedbackModal.activeAiHintNo || 1) === 2 ? 2 : 1;
+  const resolvedHintText = String(
+    data?.hint
+    || (requestedHintNo === 2 ? detail?.second_hint : detail?.first_hint)
+    || detail?.guiding_question
+    || detail?.concept_explanation
+    || detail?.concept_hint
+    || ""
+  ).trim();
+  if (resolvedHintText) {
+    if (requestedHintNo === 2) {
+      feedbackModal.aiHint2Text = resolvedHintText;
+    } else {
+      feedbackModal.aiHint1Text = resolvedHintText;
+    }
+  }
   const nextMeta = sanitizeHintMeta(data?.hint_meta);
   if (Object.keys(nextMeta).length) {
     if (requestedHintNo === 2) {
@@ -2340,16 +3001,12 @@ function currentHintMetadata(extra = {}) {
   const detail = (aiFeedbackDetail.value && typeof aiFeedbackDetail.value === "object")
     ? aiFeedbackDetail.value
     : {};
-  const safeAiFeedbackDetail = { ...detail };
+  const safeAiFeedbackDetail = sanitizeHintMeta(detail);
   delete safeAiFeedbackDetail.subtitle_excerpt;
-  delete safeAiFeedbackDetail.subtitle_scope;
   const hintNo = Number.isFinite(Number(extra.hint_no))
     ? Number(extra.hint_no)
     : currentHintNo();
   const hintMeta = activeAiHintMeta.value || {};
-  const subtitleRange = hintMeta.subtitle_range && typeof hintMeta.subtitle_range === "object"
-    ? hintMeta.subtitle_range
-    : {};
   return {
     review_type: "ai_hint",
     hint_id: feedbackModal.hintId || feedbackModal.hintRecord?.hint_id || null,
@@ -2376,11 +3033,6 @@ function currentHintMetadata(extra = {}) {
     hint_content: String(activeAiHintText.value || feedbackModal.hintQuestion || "").trim(),
     hint_level: hintMeta.hint_level ?? null,
     scope: hintMeta.scope || "",
-    concept_tag: hintMeta.concept_tag || "",
-    concept_scope: hintMeta.concept_scope || "",
-    wrong_index: hintMeta.wrong_index ?? null,
-    subtitle_range: subtitleRange,
-    subtitle_range_available: hasHintSubtitleRange(hintMeta),
     answer_leakage_check: hintMeta.answer_leakage_check || "",
     hint_source: hintMeta.hint_source || feedbackModal.source || "unknown",
     hint_loaded: Boolean(feedbackModal.hintLoaded),
@@ -2408,6 +3060,60 @@ function currentHintMetadata(extra = {}) {
     generated_at: new Date().toISOString(),
     ...extra,
   };
+}
+
+function secondHintReminderMetadata(extra = {}) {
+  return currentHintMetadata({
+    requested_hint_no: 2,
+    hint_no: 2,
+    hint_click_no: 2,
+    reminder_type: "second_ai_hint",
+    reminder_visible: Boolean(feedbackModal.secondHintNoticeVisible),
+    reminder_shown_logged: Boolean(feedbackModal.secondHintReminderShownLogged),
+    reminder_resolved: Boolean(feedbackModal.secondHintReminderResolved),
+    ...extra,
+  });
+}
+
+async function logSecondHintReminderEvent(action, extra = {}) {
+  const cleanAction = String(action || "").trim();
+  if (!cleanAction) return null;
+  return logLearningEvent(
+    `second_hint_reminder_${cleanAction}`,
+    feedbackLearningContext(secondHintReminderMetadata({
+      reminder_action: cleanAction,
+      ...extra,
+    }))
+  );
+}
+
+async function logSecondHintReminderShown(triggerMethod = "system_recheck_modal") {
+  if (!feedbackModal.secondHintNoticeVisible) return null;
+  if (feedbackModal.secondHintReminderShownLogged) return null;
+  if (feedbackModal.aiHint2Text) return null;
+  feedbackModal.secondHintReminderShownLogged = true;
+  return logSecondHintReminderEvent("shown", {
+    trigger_method: triggerMethod,
+  });
+}
+
+async function logSecondHintReminderClicked(triggerMethod = "click_result_second_hint") {
+  if (feedbackModal.secondHintReminderResolved) return null;
+  feedbackModal.secondHintReminderResolved = true;
+  return logSecondHintReminderEvent("clicked", {
+    trigger_method: triggerMethod,
+    button_name: secondHintReminderButtonLabel,
+  });
+}
+
+async function logSecondHintReminderIgnored(returnMethod = "return_to_fix") {
+  if (!feedbackModal.secondHintNoticeVisible) return null;
+  if (feedbackModal.secondHintReminderResolved) return null;
+  if (feedbackModal.aiHint2Text) return null;
+  feedbackModal.secondHintReminderResolved = true;
+  return logSecondHintReminderEvent("ignored", {
+    return_method: returnMethod,
+  });
 }
 
 async function updateReviewOpenHintLog(extra = {}) {
@@ -2463,6 +3169,9 @@ async function dismissFeedbackModal() {
     feedbackModal.open = false;
     return;
   }
+  if (feedbackModal.mode === "system_recheck") {
+    await logSecondHintReminderIgnored("system_recheck_dismiss");
+  }
   const hadOpenHint = feedbackModal.hintOpen;
   const learningContext = feedbackLearningContext(currentHintMetadata({
     close_method: "click_blank_area",
@@ -2500,6 +3209,9 @@ async function dismissFeedbackModal() {
   feedbackModal.aiHint2Text = "";
   feedbackModal.aiHint2Meta = {};
   feedbackModal.secondHintLoading = false;
+  feedbackModal.secondHintNoticeVisible = false;
+  feedbackModal.secondHintReminderShownLogged = false;
+  feedbackModal.secondHintReminderResolved = false;
   feedbackModal.errorClass = "";
   feedbackModal.reviewMode = "subtitle_alignment";
   feedbackModal.subtitleHealth = null;
@@ -2755,6 +3467,7 @@ function savePracticeState(extra = {}) {
 
       slot_indent_map: indentMap,
       wrong_indices: currentWrongIndices,
+      wrong_slot_issue_map: normalizeSlotIssueMap(wrongSlotIssueMap.value),
 
       primary_wrong_index:
         Number.isFinite(
@@ -2955,6 +3668,10 @@ function restorePracticeStateIfMatch(loadedTask) {
       ? st.wrong_indices.map((v) => Number(v)).filter((v) => Number.isFinite(v))
       : [];
     wrongIndices.value = restoredWrong;
+    const restoredIssueMap = normalizeSlotIssueMap(st.wrong_slot_issue_map);
+    wrongSlotIssueMap.value = Object.keys(restoredIssueMap).length
+      ? restoredIssueMap
+      : defaultSequenceIssueMap(restoredWrong);
 
     const restoredPrimary = Number(st.primary_wrong_index);
     if (Number.isFinite(restoredPrimary)) {
@@ -3195,6 +3912,11 @@ async function submit() {
     // 每次送出後，以本次作答的系統判定結果更新紅色標記。
     // 優先使用 incorrect_slots，包含順序錯誤與縮排錯誤。
     wrongIndices.value = collectCurrentWrongPositions(r || {});
+    wrongSlotIssueMap.value = buildWrongSlotIssueMap(
+      r || {},
+      r?.hint_flow && typeof r.hint_flow === "object" ? r.hint_flow : {},
+      {}
+    );
 
     const parts = buildWrongFeedbackParts(r || {});
     primaryWrongIndex.value = (parts.focusIndex != null ? Number(parts.focusIndex) : null);
@@ -3216,14 +3938,57 @@ async function submit() {
       // 只有答對，才清除此題的排列、縮排、紅標與修正狀態。
       // 其他尚未完成的題目仍各自保留。
       clearPracticeStateForTask(task_id);
+      wrongSlotIssueMap.value = {};
       await openSuccessModal(r);
     }
 
-  if (r?.ok && r?.is_correct === false) {
-    const flow =
-      r?.hint_flow && typeof r.hint_flow === "object"
-        ? r.hint_flow
-        : {};
+  const submitHintFlow =
+    r?.hint_flow && typeof r.hint_flow === "object"
+      ? r.hint_flow
+      : {};
+  const submitFeedbackStrategy = String(
+    r?.feedback_strategy ||
+    submitHintFlow?.feedback_strategy ||
+    feedbackStrategy.value ||
+    "B"
+  ).trim().toUpperCase();
+
+  // C 策略：錯誤位置與固定中文語意直接顯示在題目槽位。
+  // 此研究條件不顯示第一次錯誤 Modal，也不開啟 AI Modal。
+  if (
+    r?.ok &&
+    r?.is_correct === false &&
+    (
+      submitFeedbackStrategy === "C" ||
+      submitHintFlow?.type === "fixed_semantic_feedback"
+    )
+  ) {
+    // 此時 wrongIndices 已由後端結果更新。
+    // C 策略每次答錯都顯示固定回饋 modal，並保留錯誤格紅色標記。
+    showFixedSemanticFeedbackModal(r, task_id);
+    return;
+  }
+
+  const usesAiHintFlow = ["A", "B"].includes(submitFeedbackStrategy);
+
+  // A 策略未正式接上反思題前，不借用 B 策略的 AI modal。
+  // 這樣可以確保 A/B/C 三組研究條件不會混在一起。
+  if (
+    r?.ok &&
+    r?.is_correct === false &&
+    !usesAiHintFlow
+  ) {
+    feedbackModal.open = false;
+    return;
+  }
+
+  // B 策略：維持既有「第二次錯誤後 AI 提示」流程。
+  if (
+    r?.ok &&
+    r?.is_correct === false &&
+    usesAiHintFlow
+  ) {
+    const flow = submitHintFlow;
 
     const attemptNo = Number(r?.attempt_no || 0);
     const wrongAttemptCount = Number(
@@ -3231,6 +3996,10 @@ async function submit() {
       ?? r?.wrong_attempt_count
       ?? 0
     );
+    const aiHintRecoveryNeeded =
+      flow.type === "system_recheck" &&
+      flow.existing_ai_hint_available !== true &&
+      (wrongAttemptCount >= 2 || attemptNo >= 2);
 
     // 第二次錯誤：系統先重新判斷位置，再開啟 AI 提示。
     if (
@@ -3238,6 +4007,7 @@ async function submit() {
       || flow.auto_open_ai === true
       || wrongAttemptCount === 2
       || attemptNo === 2
+      || aiHintRecoveryNeeded
     ) {
       openAiHintModalFromFlow(r, task_id);
       return;
@@ -3299,7 +4069,23 @@ function normalizeTaskPayload(apiJson) {
     }
   }
 
-  const hideSemanticZh = !!t.hide_semantic_zh;
+  const payloadFeedbackStrategy = String(
+    t.feedback_strategy || "B"
+  ).trim().toUpperCase();
+
+  // 後端會負責 Z 分配並寫入 A/B/C。
+  // 這裡保留原始策略值，避免未來 A 策略被前端誤改成 B。
+  // 目前只有 C 會切換固定中文語意回饋；A 尚未實作時暫走既有 B 流程。
+  t.feedback_strategy = ["A", "B", "C"].includes(payloadFeedbackStrategy)
+    ? payloadFeedbackStrategy
+    : "B";
+
+  // B 維持老師原本 hide_semantic_zh 設定。
+  // C 必須保留中文語意資料，但仍只在錯誤格顯示。
+  const hideSemanticZh =
+    t.feedback_strategy === "C"
+      ? false
+      : !!t.hide_semantic_zh;
 
   let pool = Array.isArray(t.pool) ? t.pool : [];
   const rawDist = Array.isArray(t.distractor_blocks) ? t.distractor_blocks : [];
@@ -3368,7 +4154,15 @@ function normalizeTaskPayload(apiJson) {
 
 async function loadPersistedHintState() {
   const taskId = currentTaskId();
-  if (!taskId || isTestMode.value) return;
+
+  // C 策略不使用 AI 提示，也不應載入過去 B 策略留下的 hint record。
+  if (
+    !taskId ||
+    isTestMode.value ||
+    isCStrategy.value
+  ) {
+    return;
+  }
   try {
     const res = await fetch(`${API_BASE}/api/parsons/hint_state?task_id=${encodeURIComponent(taskId)}`, {
       headers: authHeaders(),
@@ -3457,7 +4251,11 @@ async function loadTask() {
     // 練習模式
     const level = route.query.level ? String(route.query.level) : "L1";
     const url = `${API_BASE}/api/parsons/task?video_id=${encodeURIComponent(String(videoId.value || ""))}&level=${encodeURIComponent(level)}`;
-    const res = await fetch(url);
+    // 載入 Parsons 題目時必須帶登入 token。
+    // 後端會用目前登入學生的 users.feedback_strategy 判斷要走 B 或 C 策略。
+    const res = await fetch(url, {
+      headers: authHeaders(),
+    });
 
     if (!res.ok) {
       state.noTask = true;
@@ -3474,6 +4272,18 @@ async function loadTask() {
     poolBlocks.value = norm.pool;
     teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
     templateSlots.value = norm.slots;
+
+    // C 策略不得保留上一個 B 題目的 AI 狀態
+    if (isCStrategy.value) {
+      firstHintPanel.visible = false;
+      feedbackModal.open = false;
+      feedbackModal.hintRecord = null;
+      feedbackModal.hintId = "";
+      feedbackModal.aiHint1Text = "";
+      feedbackModal.aiHint1Meta = {};
+      feedbackModal.aiHint2Text = "";
+      feedbackModal.aiHint2Meta = {};
+    }
 
     const restored = restorePracticeStateIfMatch(task.value);
     await loadPersistedHintState();
@@ -3709,6 +4519,38 @@ watch(
   color: #5b4105;
 }
 
+.slot-error-tags{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.slot-error-tag{
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.25;
+  border: 1px solid transparent;
+}
+
+.slot-error-tag.sequence{
+  color: #7f1d1d;
+  background: #fee2e2;
+  border-color: #fecaca;
+}
+
+.slot-error-tag.indentation{
+  color: #7c2d12;
+  background: #ffedd5;
+  border-color: #fed7aa;
+}
+
 .blank{
   position: relative;
   border: 2px dashed #8da2b8;
@@ -3759,6 +4601,22 @@ watch(
 .cloze-row.affected .blank{
   border-color: var(--danger) !important;
   box-shadow: 0 0 0 2px rgba(185, 28, 28, .12);
+}
+
+/* C 策略固定提示樣式：
+   答錯後只在錯誤格顯示題目預先存好的 expected_meaning_zh。
+   這不是 AI 生成提示，所以只用紅色語意條與紅色虛線框提醒學生檢查。 */
+.cloze-row.c-wrong .hint{
+  background: linear-gradient(90deg, #fecaca 0%, #fda4af 100%);
+  color: #6b1f1f;
+  border-radius: 10px;
+}
+
+.cloze-row.c-wrong .blank{
+  border-style: dashed !important;
+  border-color: #dc2626 !important;
+  background: #fffafa;
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, .12);
 }
 
 .hint-affected-icon{
@@ -3862,6 +4720,48 @@ watch(
   color: #1f2937;
 }
 
+.second-hint-reminder{
+  max-width: 980px;
+  margin: 14px auto 0;
+  padding: 14px 16px;
+  border: 1px solid #bfdbfe;
+  border-radius: 12px;
+  background: #eff6ff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.1);
+}
+
+.second-hint-reminder.in-modal{
+  max-width: none;
+  margin: 12px 0 0;
+}
+
+.second-hint-reminder-copy{
+  min-width: 0;
+}
+
+.second-hint-reminder-title{
+  color: #1d4ed8;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.second-hint-reminder-text{
+  margin-top: 4px;
+  color: #334155;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.second-hint-reminder-btn{
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .floating-ai-hint{
   position: fixed;
   right: 22px;
@@ -3875,6 +4775,30 @@ watch(
   font-weight: 900;
   box-shadow: 0 14px 30px rgba(37, 99, 235, 0.25);
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0;
+}
+
+.floating-ai-hint-label{
+  font-size: 14px;
+  line-height: 1;
+}
+
+.floating-ai-hint-badge{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.95);
 }
 
 .fb-modal-backdrop{
@@ -4023,6 +4947,16 @@ watch(
 .first-error-section{
   border-color: #fecaca;
   background: #fffafa;
+}
+
+.fixed-feedback-section{
+  border-color: #fecaca;
+  background: #fffafa;
+}
+
+.fixed-feedback-section .first-hint-meta span{
+  background: #fee2e2;
+  color: #7f1d1d;
 }
 
 .first-hint-meta.in-modal{

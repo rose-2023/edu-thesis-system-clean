@@ -110,7 +110,7 @@ def enforce_parsons_session():
         subpath.startswith("/fixed_task/")
         or subpath.startswith("/test/cycle/")
         or subpath == "/test/export_csv"
-        or subpath in {"/publish", "/regenerate"}
+        or subpath in {"/publish", "/regenerate", "/hint_library"}
     ):
         return active_session_guard({"teacher", "admin"})
     return None
@@ -295,6 +295,7 @@ def ensure_test_indexes():
 # Parsons attempts v2 standardized write helpers
 _PARSONS_ATTEMPTS_V2_INDEX_READY = False
 _PARSONS_HINT_RECORD_INDEX_READY = False
+_PARSONS_HINT_LIBRARY_INDEX_READY = False
 _PARSONS_ATTEMPTS_V2_TIMEZONE = "Asia/Taipei"
 _PARSONS_TEST_STUDENT_ID = "11461127"
 _PARSONS_HINT_PROMPT_VERSION = "srt_aggregated_all_errors_v2_similarity_checked"
@@ -361,23 +362,67 @@ def ensure_parsons_attempts_v2_indexes():
 
 # 防止提示紀錄重複建立
 def ensure_parsons_hint_record_indexes():
-    """Create indexes for per-student per-task Parsons hint state."""
+    """Create indexes for per-student per-task-per-round Parsons hint state."""
     global _PARSONS_HINT_RECORD_INDEX_READY
     if _PARSONS_HINT_RECORD_INDEX_READY:
         return
     try:
+        try:
+            info = db.parsons_hint_records.index_information()
+            legacy_unique = info.get("student_task_unique") or {}
+            if legacy_unique.get("unique"):
+                db.parsons_hint_records.drop_index("student_task_unique")
+        except Exception as e:
+            print(f"[parsons_hint_records] legacy unique index drop skipped: {e}")
+        db.parsons_hint_records.update_many(
+            {"task_attempt_session": {"$exists": False}},
+            {"$set": {"task_attempt_session": 1}},
+        )
         db.parsons_hint_records.create_index(
-            [("student_id", 1), ("task_id", 1)],
-            name="student_task_unique",
+            [("student_id", 1), ("task_id", 1), ("task_attempt_session", 1)],
+            name="student_task_session_unique",
             unique=True,
         )
         db.parsons_hint_records.create_index([("student_id", 1)], name="student_id_1")
         db.parsons_hint_records.create_index([("task_id", 1)], name="task_id_1")
+        db.parsons_hint_records.create_index([("task_attempt_session", 1)], name="task_attempt_session_1")
         db.parsons_hint_records.create_index([("hint_id", 1)], name="hint_id_1")
         db.parsons_hint_records.create_index([("updated_at", -1)], name="updated_at_-1")
         _PARSONS_HINT_RECORD_INDEX_READY = True
     except Exception as e:
         print(f"[parsons_hint_records] index ensure failed: {e}")
+
+# ========================
+# 保存可重用的 hint_library
+def ensure_hint_library_indexes():
+    """Create indexes for reusable Parsons hint templates."""
+    global _PARSONS_HINT_LIBRARY_INDEX_READY
+    if _PARSONS_HINT_LIBRARY_INDEX_READY:
+        return
+    try:
+        db.hint_library.create_index(
+            [("hint_key", 1), ("version", -1)],
+            name="hint_key_version_1",
+        )
+        db.hint_library.create_index(
+            [
+                ("concept_tag", 1),
+                ("error_type", 1),
+                ("hint_level", 1),
+                ("scope", 1),
+                ("language", 1),
+                ("is_active", 1),
+            ],
+            name="concept_error_level_scope_lang_active_1",
+        )
+        db.hint_library.create_index(
+            [("task_scope", 1), ("task_family", 1), ("is_active", 1)],
+            name="task_scope_family_active_1",
+        )
+        db.hint_library.create_index([("updated_at", -1)], name="updated_at_-1")
+        _PARSONS_HINT_LIBRARY_INDEX_READY = True
+    except Exception as e:
+        print(f"[hint_library] index ensure failed: {e}")
 
 
 def _clean_string(value):
@@ -441,11 +486,11 @@ def _system_recheck_text(wrong_slots, error_types, attempt_no=None):
         labels.append("縮排錯誤")
     label_text = "、".join(labels) if labels else "待調整"
     count = len(positions)
-    attempt_label = f"第 {int(attempt_no)} 次作答" if attempt_no else "本次作答"
+    # attempt_label = f"第 {int(attempt_no)} 次作答" if attempt_no else "本次作答"
     return (
-        f"{attempt_label}目前仍有 {count} 格需要調整。"
+        f"目前仍有 {count} 格需要調整。"
         f"錯誤位置為{position_text}（{label_text}）。"
-        "請依照紅色標記重新確認程式區塊的順序與縮排。"
+        # "請依照紅色標記重新確認程式區塊的順序與縮排。"
     )
 
 # parsons_hint_records
@@ -498,14 +543,29 @@ def _empty_hint_record(student_id, task_id, group_type=None, task_attempt_sessio
     }
 
 
-def _get_hint_record(student_id, task_id):
+def _hint_session_no(value, default=1):
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 1 else default
+    except Exception:
+        return default
+
+
+def _get_hint_record(student_id, task_id, task_attempt_session=None):
     if not student_id or not task_id:
         return None
     ensure_parsons_hint_record_indexes()
-    return db.parsons_hint_records.find_one({
+    query = {
         "student_id": str(student_id),
         "task_id": str(task_id),
-    })
+    }
+    if task_attempt_session is not None:
+        query["task_attempt_session"] = _hint_session_no(task_attempt_session)
+        return db.parsons_hint_records.find_one(query)
+    return db.parsons_hint_records.find_one(
+        query,
+        sort=[("task_attempt_session", -1), ("updated_at", -1), ("_id", -1)],
+    )
 
 
 def _set_hint_record(student_id, task_id, set_fields=None, set_on_insert=None, inc_fields=None):
@@ -513,15 +573,23 @@ def _set_hint_record(student_id, task_id, set_fields=None, set_on_insert=None, i
         return None
     ensure_parsons_hint_record_indexes()
     now = now_utc()
+    set_fields = set_fields or {}
+    set_on_insert = set_on_insert or {}
+    session_no = _hint_session_no(
+        set_fields.get("task_attempt_session")
+        or set_on_insert.get("task_attempt_session")
+        or 1
+    )
     set_payload = {
         **(set_fields or {}),
+        "task_attempt_session": session_no,
         "updated_at": now,
         "updated_at_utc": now,
         "updated_at_taiwan": _taiwan_time_string(now),
         "timezone": "Asia/Taipei",
     }
     insert_payload = {
-        **_empty_hint_record(student_id, task_id),
+        **_empty_hint_record(student_id, task_id, task_attempt_session=session_no),
         **(set_on_insert or {}),
     }
     for key in set_payload:
@@ -534,19 +602,24 @@ def _set_hint_record(student_id, task_id, set_fields=None, set_on_insert=None, i
     }
     if inc_fields:
         update["$inc"] = inc_fields
+    query = {
+        "student_id": str(student_id),
+        "task_id": str(task_id),
+        "task_attempt_session": session_no,
+    }
     try:
         db.parsons_hint_records.update_one(
-            {"student_id": str(student_id), "task_id": str(task_id)},
+            query,
             update,
             upsert=True,
         )
     except DuplicateKeyError:
         db.parsons_hint_records.update_one(
-            {"student_id": str(student_id), "task_id": str(task_id)},
+            query,
             update,
             upsert=True,
         )
-    return _get_hint_record(student_id, task_id)
+    return _get_hint_record(student_id, task_id, session_no)
 
 
 def _ensure_first_hint_record(
@@ -566,7 +639,7 @@ def _ensure_first_hint_record(
     except Exception:
         session_no = 1
 
-    record = _get_hint_record(student_id, task_id)
+    record = _get_hint_record(student_id, task_id, session_no)
     # 提示限制以 student_id + task_id 為單位。重新整理、退出或重新進入
     # 不能因 task_attempt_session 變動而清掉已產生的 AI 提示。
     if record and record.get("first_system_hint_text"):
@@ -758,6 +831,469 @@ def _attempt_wrong_positions_for_hint(att):
         output.append(number)
     return output
 
+def _hint_library_error_type(value):
+    raw = str(value or "").strip().lower()
+    mapping = {
+        "sequence_error": "order",
+        "order_error": "order",
+        "order": "order",
+        "indentation_error": "indentation",
+        "indentation": "indentation",
+        "condition": "condition",
+        "calculation": "calculation",
+        "structure": "structure",
+        "logic": "logic",
+    }
+    return mapping.get(raw, raw or "unknown")
+
+
+def _hint_library_level(value=None, hint_key=None):
+    key = str(hint_key or "").strip().lower()
+    if "level_2" in key or key.endswith("|2"):
+        return 2
+    if "level_1" in key or key.endswith("|1"):
+        return 1
+    try:
+        return 2 if int(value or 1) == 2 else 1
+    except Exception:
+        return 1
+
+
+def _hint_library_context_from_detail(aggregate_detail, level):
+    detail = aggregate_detail if isinstance(aggregate_detail, dict) else {}
+    hint_level = _hint_library_level(level)
+    scope = "narrow" if hint_level == 2 else "broad"
+
+    concept_tag = ""
+    for item in (detail.get("concept_tags") or []):
+        concept_tag = normalize_concept_name(item)
+        if concept_tag:
+            break
+    if not concept_tag:
+        for item in (detail.get("error_concepts") or []):
+            if not isinstance(item, dict):
+                continue
+            concept_tag = normalize_concept_name(item.get("concept_tag") or "")
+            if concept_tag:
+                break
+    concept_tag = concept_tag or "unknown"
+
+    error_type = ""
+    for concept in (detail.get("error_concepts") or []):
+        if not isinstance(concept, dict):
+            continue
+        for candidate in (concept.get("error_types") or []):
+            error_type = _hint_library_error_type(candidate)
+            if error_type and error_type != "unknown":
+                break
+        if error_type and error_type != "unknown":
+            break
+    if not error_type or error_type == "unknown":
+        for slot in (detail.get("wrong_slot_details") or []):
+            if not isinstance(slot, dict):
+                continue
+            for candidate in (slot.get("error_types") or []):
+                error_type = _hint_library_error_type(candidate)
+                if error_type and error_type != "unknown":
+                    break
+            if error_type and error_type != "unknown":
+                break
+    error_type = error_type or "unknown"
+
+    return {
+        "concept_tag": concept_tag,
+        "error_type": error_type,
+        "hint_level": hint_level,
+        "scope": scope,
+        "hint_key": f"{concept_tag}|{error_type}|level_{hint_level}",
+    }
+
+
+def _hint_library_task_family(task):
+    doc = task if isinstance(task, dict) else {}
+    return _clean_string(
+        doc.get("task_family")
+        or doc.get("family")
+        or doc.get("target_concept")
+    )
+
+
+def _hint_library_concept_aliases(concept_tag):
+    tag = str(concept_tag or "").strip()
+    normalized = normalize_concept_name(tag)
+    aliases = [tag, normalized]
+    loop_tags = {
+        "for_loop",
+        "while_loop",
+        "loop",
+        "loops",
+        "loop_count_control",
+        "loop_reverse_range",
+        "nested_loop_structure",
+        "star_formula_2i_minus_1",
+        "space_formula_n_minus_i",
+    }
+    branch_tags = {
+        "if",
+        "if_else",
+        "condition",
+        "branch",
+        "if_condition_logic",
+        "if_branch_order",
+        "edge_case_condition",
+    }
+    io_tags = {
+        "input",
+        "output",
+        "print",
+        "input_int_cast",
+        "print_separator",
+    }
+    syntax_tags = {"syntax", "python_syntax", "def", "return", "call", "operator"}
+    if normalized in loop_tags or tag in loop_tags:
+        aliases.extend(["for_loop", "loop", "loop_count_control"])
+    elif normalized in branch_tags or tag in branch_tags:
+        aliases.extend(["if", "condition", "if_condition_logic"])
+    elif normalized in io_tags or tag in io_tags:
+        aliases.extend(["input_output", "io", "input_int_cast", "print_separator"])
+    elif normalized in syntax_tags or tag in syntax_tags:
+        aliases.extend(["syntax", "python_syntax"])
+    return [
+        item
+        for item in dict.fromkeys(str(alias or "").strip() for alias in aliases)
+        if item
+    ]
+
+
+def _find_hint_library_entry(aggregate_detail, task, level):
+    ensure_hint_library_indexes()
+    ctx = _hint_library_context_from_detail(aggregate_detail, level)
+    task_family = _hint_library_task_family(task)
+    concept_aliases = _hint_library_concept_aliases(ctx.get("concept_tag"))
+    concept_filter = {"$in": concept_aliases} if concept_aliases else ctx["concept_tag"]
+    hint_keys = [
+        f"{alias}|{ctx['error_type']}|level_{ctx['hint_level']}"
+        for alias in concept_aliases
+    ] or [ctx["hint_key"]]
+    base = {
+        "is_active": True,
+        "quality_status": "passed",
+        "answer_leakage_check": "passed",
+        "language": "zh-TW",
+        "hint_level": ctx["hint_level"],
+    }
+    queries = [{**base, "hint_key": {"$in": hint_keys}}]
+    if task_family:
+        queries.append({
+            **base,
+            "concept_tag": concept_filter,
+            "error_type": ctx["error_type"],
+            "task_scope": "task_family",
+            "task_family": task_family,
+        })
+    queries.extend([
+        {
+            **base,
+            "concept_tag": concept_filter,
+            "error_type": ctx["error_type"],
+            "scope": ctx["scope"],
+            "task_scope": "concept",
+        },
+        {
+            **base,
+            "concept_tag": concept_filter,
+            "error_type": ctx["error_type"],
+            "scope": ctx["scope"],
+        },
+    ])
+
+    for query in queries:
+        try:
+            doc = db.hint_library.find_one(
+                query,
+                sort=[("version", -1), ("updated_at", -1), ("_id", -1)],
+            )
+        except Exception as exc:
+            print("[hint_library] lookup failed:", repr(exc))
+            return None, ctx
+        if doc and str(doc.get("hint_template") or "").strip():
+            return doc, ctx
+    return None, ctx
+
+
+def _mark_hint_library_used(doc):
+    if not isinstance(doc, dict) or doc.get("_id") is None:
+        return
+    now = now_utc()
+    try:
+        db.hint_library.update_one(
+            {"_id": doc["_id"]},
+            {
+                "$inc": {"usage_count": 1},
+                "$set": {"last_used_at": now, "updated_at": now},
+            },
+        )
+    except Exception as exc:
+        print("[hint_library] usage update failed:", repr(exc))
+
+
+def _hint_library_public_fields(doc, ctx):
+    if not isinstance(doc, dict):
+        return {}
+    context = ctx if isinstance(ctx, dict) else {}
+    try:
+        version = int(doc.get("version") or 1)
+    except Exception:
+        version = 1
+    return {
+        "hint_library_id": str(doc.get("_id") or ""),
+        "hint_library_key": str(doc.get("hint_key") or context.get("hint_key") or "").strip(),
+        "hint_library_version": version,
+        "hint_library_concept_tag": str(doc.get("concept_tag") or context.get("concept_tag") or "").strip(),
+        "hint_library_error_type": str(doc.get("error_type") or context.get("error_type") or "").strip(),
+        "hint_library_task_scope": str(doc.get("task_scope") or "").strip(),
+        "hint_library_task_family": doc.get("task_family"),
+        "source_model": doc.get("source_model"),
+        "source_prompt_version": doc.get("source_prompt_version"),
+        "source_hint_id": doc.get("source_hint_id"),
+        "source_task_id": doc.get("source_task_id"),
+    }
+
+
+def _hint_library_status_fields(ctx, status, reason=None):
+    context = ctx if isinstance(ctx, dict) else {}
+    return {
+        "hint_library_status": str(status or "").strip() or "unknown",
+        "hint_library_skip_reason": (
+            str(reason or "").strip()
+            if reason
+            else None
+        ),
+        "hint_library_lookup_key": str(context.get("hint_key") or "").strip(),
+        "hint_library_concept_tag": str(context.get("concept_tag") or "").strip() or None,
+        "hint_library_error_type": str(context.get("error_type") or "").strip() or None,
+        "hint_library_level": context.get("hint_level"),
+        "hint_library_scope": str(context.get("scope") or "").strip() or None,
+    }
+
+
+def _hint_library_nonnegative_int(value, default=0):
+    try:
+        number = int(value)
+    except Exception:
+        return default
+    return max(0, number)
+
+
+def _hint_library_bool(value, default=True):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text or text == "none":
+        return default
+    if text in {"1", "true", "yes", "y", "active"}:
+        return True
+    if text in {"0", "false", "no", "n", "inactive"}:
+        return False
+    return default
+
+
+def _hint_library_date(value, default=None):
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text or text.lower() == "mongodb date":
+        return default
+    try:
+        return _parse_attempt_v2_datetime(text) or default
+    except Exception:
+        return default
+
+
+def _build_hint_library_upsert_doc(payload):
+    data = payload if isinstance(payload, dict) else {}
+    now = now_utc()
+    hint_level = _hint_library_level(
+        data.get("hint_level"),
+        data.get("hint_key"),
+    )
+
+    concept_tag = str(data.get("concept_tag") or "").strip()
+    normalized_concept_tag = normalize_concept_name(concept_tag)
+    error_type = _hint_library_error_type(data.get("error_type") or "")
+    scope = str(
+        data.get("scope") or ("narrow" if hint_level == 2 else "broad")
+    ).strip().lower()
+    if scope not in {"broad", "narrow"}:
+        scope = "narrow" if hint_level == 2 else "broad"
+
+    hint_key = str(data.get("hint_key") or "").strip()
+    if not hint_key:
+        hint_key = f"{concept_tag or 'unknown'}|{error_type}|level_{hint_level}"
+
+    hint_template = str(data.get("hint_template") or "").strip()
+    if not concept_tag:
+        raise ValueError("concept_tag is required")
+    if not error_type or error_type == "unknown":
+        raise ValueError("error_type is required")
+    if not hint_template:
+        raise ValueError("hint_template is required")
+    if not normalized_concept_tag:
+        normalized_concept_tag = concept_tag
+
+    try:
+        version = max(1, int(data.get("version") or 1))
+    except Exception:
+        version = 1
+    try:
+        schema_version = max(1, int(data.get("schema_version") or 1))
+    except Exception:
+        schema_version = 1
+
+    return {
+        "schema_version": schema_version,
+        "hint_key": hint_key,
+        "version": version,
+        "concept_tag": concept_tag,
+        "error_type": error_type,
+        "hint_level": hint_level,
+        "scope": scope,
+        "task_scope": str(data.get("task_scope") or "concept").strip() or "concept",
+        "task_family": _clean_string(data.get("task_family")),
+        "language": str(data.get("language") or "zh-TW").strip() or "zh-TW",
+        "hint_template": hint_template,
+        "hint_source": str(data.get("hint_source") or "ai_generated").strip() or "ai_generated",
+        "quality_status": str(data.get("quality_status") or "passed").strip() or "passed",
+        "answer_leakage_check": str(data.get("answer_leakage_check") or "passed").strip() or "passed",
+        "usage_count": _hint_library_nonnegative_int(data.get("usage_count"), 0),
+        "evaluated_count": _hint_library_nonnegative_int(data.get("evaluated_count"), 0),
+        "success_count": _hint_library_nonnegative_int(data.get("success_count"), 0),
+        "last_used_at": _hint_library_date(data.get("last_used_at")),
+        "source_prompt_version": str(
+            data.get("source_prompt_version") or _PARSONS_HINT_PROMPT_VERSION
+        ).strip(),
+        "source_model": str(data.get("source_model") or _model_for_feedback()).strip(),
+        "source_hint_id": _clean_string(data.get("source_hint_id")),
+        "source_task_id": _clean_string(data.get("source_task_id")),
+        "is_active": _hint_library_bool(data.get("is_active", True), True),
+        "created_at": _hint_library_date(data.get("created_at"), now),
+        "updated_at": _hint_library_date(data.get("updated_at"), now),
+    }
+
+
+_HINT_LIBRARY_AUTO_SAVE_QUALITY_STATUSES = {
+    "first_hint_accepted",
+    "second_hint_depth_check_passed",
+    "second_hint_without_first_hint",
+}
+
+def _auto_save_generated_hint_to_library(
+    aggregate_detail,
+    task,
+    level,
+    hint_text,
+    *,
+    source,
+    quality_status,
+    leakage_status,
+):
+    """Persist a safe AI-generated hint as a reusable concept/error template."""
+    ctx = _hint_library_context_from_detail(aggregate_detail, level)
+    status_context = _hint_library_status_fields(ctx, "skipped")
+
+    if str(source or "").strip() != "ai_srt_aggregated":
+        status_context["hint_library_skip_reason"] = "not_ai_generated"
+        return status_context
+    if str(leakage_status or "").strip() != "passed":
+        status_context["hint_library_skip_reason"] = "answer_leakage_not_passed"
+        return status_context
+    if str(quality_status or "").strip() not in _HINT_LIBRARY_AUTO_SAVE_QUALITY_STATUSES:
+        status_context["hint_library_skip_reason"] = "quality_status_not_auto_saved"
+        return status_context
+
+    hint_template = str(hint_text or "").strip()
+    if not hint_template:
+        status_context["hint_library_skip_reason"] = "empty_hint_template"
+        return status_context
+
+    concept_tag = str(ctx.get("concept_tag") or "").strip()
+    error_type = str(ctx.get("error_type") or "").strip()
+    if not concept_tag or concept_tag == "unknown":
+        status_context["hint_library_skip_reason"] = "unknown_concept_tag"
+        return status_context
+    if not error_type or error_type == "unknown":
+        status_context["hint_library_skip_reason"] = "unknown_error_type"
+        return status_context
+
+    task_doc = task if isinstance(task, dict) else {}
+    source_task_id = _clean_string(
+        task_doc.get("task_id")
+        or task_doc.get("id")
+        or str(task_doc.get("_id") or "")
+    )
+    now = now_utc()
+    try:
+        doc = _build_hint_library_upsert_doc({
+            "schema_version": 1,
+            "hint_key": ctx.get("hint_key"),
+            "version": 1,
+            "concept_tag": concept_tag,
+            "error_type": error_type,
+            "hint_level": ctx.get("hint_level"),
+            "scope": ctx.get("scope"),
+            "task_scope": "concept",
+            "task_family": None,
+            "language": "zh-TW",
+            "hint_template": hint_template,
+            "hint_source": "ai_generated",
+            "quality_status": "passed",
+            "answer_leakage_check": "passed",
+            "usage_count": 1,
+            "evaluated_count": 0,
+            "success_count": 0,
+            "last_used_at": now,
+            "source_prompt_version": _PARSONS_HINT_PROMPT_VERSION,
+            "source_model": _model_for_feedback(),
+            "source_hint_id": None,
+            "source_task_id": source_task_id,
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        })
+    except Exception as exc:
+        print("[hint_library] auto-save payload failed:", repr(exc))
+        status_context["hint_library_skip_reason"] = "payload_build_failed"
+        return status_context
+
+    try:
+        ensure_hint_library_indexes()
+        result = db.hint_library.update_one(
+            {
+                "hint_key": doc["hint_key"],
+                "version": doc["version"],
+            },
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+        if result.upserted_id:
+            saved = db.hint_library.find_one({"_id": result.upserted_id})
+            fields = _hint_library_public_fields(saved, ctx) if saved else {}
+            fields.update(_hint_library_status_fields(ctx, "auto_saved"))
+            return fields
+        saved = db.hint_library.find_one(
+            {
+                "hint_key": doc["hint_key"],
+                "version": doc["version"],
+            }
+        )
+        fields = _hint_library_public_fields(saved, ctx) if saved else {}
+        fields.update(_hint_library_status_fields(ctx, "already_exists"))
+        return fields
+    except Exception as exc:
+        print("[hint_library] auto-save write failed:", repr(exc))
+        status_context["hint_library_skip_reason"] = "write_failed"
+        return status_context
+
 
 def _attempt_primary_wrong_index_for_hint(att):
     positions = _attempt_wrong_positions_for_hint(att)
@@ -880,7 +1416,7 @@ def _compact_subtitle_basis(value, fallback=""):
         return text
     return text[:180].rstrip("，。；;,.!?！？ ") + "..."
 
-
+# 錯誤格的公開資訊整理
 def _public_wrong_slot_details(slot_contexts):
     output = []
     for item in (slot_contexts or []):
@@ -899,7 +1435,7 @@ def _public_wrong_slot_details(slot_contexts):
             "concept_tag": normalize_concept_name(item.get("concept_tag") or ""),
             "concept_scope": str(item.get("concept_scope") or "").strip(),
         })
-    return sorted(output)
+    return sorted(output, key=lambda item: (int(item.get("slot_index") or 0), item.get("slot_label") or ""))
 
 
 def _public_subtitle_ranges(ranges):
@@ -1101,6 +1637,30 @@ def _build_ai_hint_meta_from_detail(detail, ctx, *, wrong_slots=None, requested_
         "hint_source": str(detail.get("hint_source") or "system_fallback").strip() or "system_fallback",
         "answer_leakage_check": str(detail.get("answer_leakage_check") or "unknown").strip() or "unknown",
         "hint_quality_status": str(detail.get("hint_quality_status") or "not_checked").strip() or "not_checked",
+        "hint_library_id": str(detail.get("hint_library_id") or "").strip() or None,
+        "hint_library_key": str(detail.get("hint_library_key") or "").strip() or None,
+        "hint_library_version": (
+            int(detail.get("hint_library_version"))
+            if str(detail.get("hint_library_version") or "").strip().isdigit()
+            else None
+        ),
+        "hint_library_concept_tag": str(detail.get("hint_library_concept_tag") or "").strip() or None,
+        "hint_library_error_type": str(detail.get("hint_library_error_type") or "").strip() or None,
+        "hint_library_task_scope": str(detail.get("hint_library_task_scope") or "").strip() or None,
+        "hint_library_task_family": detail.get("hint_library_task_family"),
+        "hint_library_status": str(detail.get("hint_library_status") or "").strip() or None,
+        "hint_library_skip_reason": str(detail.get("hint_library_skip_reason") or "").strip() or None,
+        "hint_library_lookup_key": str(detail.get("hint_library_lookup_key") or "").strip() or None,
+        "hint_library_level": (
+            int(detail.get("hint_library_level"))
+            if str(detail.get("hint_library_level") or "").strip().isdigit()
+            else None
+        ),
+        "hint_library_scope": str(detail.get("hint_library_scope") or "").strip() or None,
+        "source_model": str(detail.get("source_model") or "").strip() or None,
+        "source_prompt_version": str(detail.get("source_prompt_version") or "").strip() or None,
+        "source_hint_id": str(detail.get("source_hint_id") or "").strip() or None,
+        "source_task_id": str(detail.get("source_task_id") or "").strip() or None,
         "second_hint_similarity": _hint_float_or_none(detail.get("second_hint_similarity")),
         "second_hint_similarity_threshold": (
             _hint_float_or_none(detail.get("second_hint_similarity_threshold"))
@@ -2332,7 +2892,7 @@ def _build_parsons_attempt_v2_doc(
 
     hint_record_before_submit = None
     if activity == "practice" and sid and tid:
-        hint_record_before_submit = _get_hint_record(sid, tid)
+        hint_record_before_submit = _get_hint_record(sid, tid, task_attempt_session)
 
     ai_hint_generation_count_before_submit = int(
         (hint_record_before_submit or {}).get("ai_hint_generation_count")
@@ -4403,8 +4963,8 @@ def is_pretest_open(test_cycle_id: str) -> bool:
     test_cycle_id = (test_cycle_id or "default").strip() or "default"
     doc = db.test_control.find_one({"_id": f"pre_open:{test_cycle_id}"})
     if not doc:
-        return True  # ✅ 預設開放前測
-    return bool(doc.get("pre_open", True))
+        return False
+    return bool(doc.get("pre_open", False))
 
 # 前後測開放判斷
 def _test_question_collection_name(test_role: str):
@@ -4583,6 +5143,10 @@ def get_test_task():
         return jsonify({"ok": False, "message": "invalid test_role"}), 400
     if not test_cycle_id:
         return jsonify({"ok": False, "message": "missing test_cycle_id"}), 400
+    if test_role == "pre" and not is_pretest_open(test_cycle_id):
+        return jsonify({"ok": False, "message": "pretest not open"}), 403
+    if test_role == "post" and not is_posttest_open(test_cycle_id):
+        return jsonify({"ok": False, "message": "posttest not open"}), 403
 
     requested_index = request.args.get("next_index") or request.args.get("index") or 1
     try:
@@ -4657,6 +5221,8 @@ def submit_test_answer():
     if test_role not in ("pre", "post"):
         return jsonify({"ok": False, "message": "invalid test_role"}), 400
 
+    if test_role == "pre" and not is_pretest_open(test_cycle_id):
+        return jsonify({"ok": False, "message": "pretest not open"}), 403
     if test_role == "post" and not is_posttest_open(test_cycle_id):
         return jsonify({"ok": False, "message": "posttest not open"}), 403
 
@@ -7713,23 +8279,31 @@ def submit_answer():
     ):
         attempt_doc[_field] = v2_doc.get(_field)
 
-    ins = db.parsons_attempts.insert_one(attempt_doc)
-    attempt_id = str(ins.inserted_id)
-
+    legacy_attempt_oid = attempt_doc.get("_id")
+    if not isinstance(legacy_attempt_oid, ObjectId):
+        legacy_attempt_oid = ObjectId()
+    attempt_doc["_id"] = legacy_attempt_oid
+    attempt_id = str(legacy_attempt_oid)
+    v2_ins = None
     try:
         v2_doc["legacy_attempt_id"] = attempt_id
         v2_ins = db.parsons_attempts_v2.insert_one(v2_doc)
         v2_attempt_id = str(v2_ins.inserted_id)
-        db.parsons_attempts.update_one(
-            {"_id": ins.inserted_id},
-            {"$set": {
-                "attempt_v2_id": v2_attempt_id,
-                "task_attempt_session": v2_doc.get("task_attempt_session"),
-                "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
-            }},
-        )
     except Exception as e:
         return jsonify({"ok": False, "message": "parsons_attempts_v2 write failed", "detail": str(e)}), 500
+
+    attempt_doc["attempt_v2_id"] = v2_attempt_id
+    attempt_doc["task_attempt_session"] = v2_doc.get("task_attempt_session")
+    attempt_doc["attempt_sequence_no"] = v2_doc.get("attempt_sequence_no")
+    try:
+        db.parsons_attempts.insert_one(attempt_doc)
+    except Exception as e:
+        try:
+            if v2_ins is not None:
+                db.parsons_attempts_v2.delete_one({"_id": v2_ins.inserted_id})
+        except Exception as rollback_error:
+            print("[parsons submit] v2 rollback after legacy write failure failed:", repr(rollback_error))
+        return jsonify({"ok": False, "message": "parsons_attempts legacy write failed", "detail": str(e)}), 500
 
     write_learning_log_safely({
         "session_id": data.get("session_id"),
@@ -7866,7 +8440,7 @@ def submit_answer():
     hint_flow = None
     wrong_attempt_count = 0
     attempt_for_hint = dict(attempt_doc)
-    attempt_for_hint["_id"] = ins.inserted_id
+    attempt_for_hint["_id"] = legacy_attempt_oid
     attempt_for_hint["attempt_v2_id"] = v2_attempt_id
     attempt_for_hint["task_attempt_session"] = v2_doc.get("task_attempt_session")
     repeated_error = bool(v2_doc.get("repeated_error"))
@@ -7928,7 +8502,7 @@ def submit_answer():
                 "latest_error_positions": _int_list(v2_wrong_slots),
                 "latest_error_types": v2_error_types,
                 "latest_error_count": int(v2_doc.get("error_count") or len(_int_list(v2_wrong_slots))),
-                "last_attempt_id": str(ins.inserted_id),
+                "last_attempt_id": str(legacy_attempt_oid),
                 "latest_attempt_v2_id": v2_attempt_id,
             },
         ) or first_record
@@ -7983,7 +8557,7 @@ def submit_answer():
                         "latest_error_positions": _int_list(v2_wrong_slots),
                         "latest_error_types": v2_error_types,
                         "latest_error_count": int(v2_doc.get("error_count") or len(_int_list(v2_wrong_slots))),
-                        "last_attempt_id": str(ins.inserted_id),
+                        "last_attempt_id": str(legacy_attempt_oid),
                         "latest_attempt_v2_id": v2_attempt_id,
                     },
                 ) or current_record
@@ -8070,7 +8644,11 @@ def submit_answer():
                 },
             })
     else:
-        existing_hint_record = _get_hint_record(student_id, task_id)
+        existing_hint_record = _get_hint_record(
+            student_id,
+            task_id,
+            v2_doc.get("task_attempt_session"),
+        )
         if existing_hint_record and int(existing_hint_record.get("ai_hint_view_count") or 0) > 0:
             write_learning_log_safely({
                 "session_id": data.get("session_id"),
@@ -8104,7 +8682,7 @@ def submit_answer():
     if not is_correct and not review_video_on_submit:
         try:
             db.parsons_attempts.update_one(
-                {"_id": ins.inserted_id},
+                {"_id": legacy_attempt_oid},
                 {"$set": {
                     "wrong_type": slot_wrong_type,
                     "concept_tag": slot_concept_tag,
@@ -9028,7 +9606,7 @@ def submit_answer():
         if video_review_enabled:
             try:
                 db.parsons_attempts.update_one(
-                    {"_id": ins.inserted_id},
+                    {"_id": legacy_attempt_oid},
                     {"$set": {
                         "segment_source": segment_source,
                         "segment_concept": segment_concept,
@@ -9981,7 +10559,10 @@ def _generate_ai_hint_payload(att, task, requested_hint_no):
         try:
             student_id = str(att.get("student_id") or current_student_id() or "").strip()
             task_id = str(att.get("task_id") or "").strip()
-            record = _get_hint_record(student_id, task_id) if student_id and task_id else None
+            record = (
+                _get_hint_record(student_id, task_id, att.get("task_attempt_session"))
+                if student_id and task_id else None
+            )
             first_hint = str((record or {}).get("ai_hint_1_text") or "").strip()
         except Exception:
             first_hint = ""
@@ -9996,7 +10577,6 @@ def _generate_ai_hint_payload(att, task, requested_hint_no):
         for item in _collect_all_wrong_slot_contexts(att, task)
         if isinstance(item, dict)
     )
-
     hint = fallback_hint
     guiding_question = ""
     subtitle_basis = str(aggregate_detail.get("subtitle_basis") or "").strip()
@@ -10005,8 +10585,34 @@ def _generate_ai_hint_payload(att, task, requested_hint_no):
     quality_status = "ai_disabled_fallback"
     second_hint_similarity = None
     second_hint_similarity_threshold = 0.72
+    hint_library_fields = {}
 
-    if ai_enabled():
+    hint_library_doc, hint_library_ctx = _find_hint_library_entry(
+        aggregate_detail,
+        task,
+        level,
+    )
+    if hint_library_doc:
+        hint = str(hint_library_doc.get("hint_template") or "").strip() or fallback_hint
+        hint_library_fields = _hint_library_public_fields(
+            hint_library_doc,
+            hint_library_ctx,
+        )
+        hint_library_fields.update(
+            _hint_library_status_fields(hint_library_ctx, "hit")
+        )
+        source = "hint_library"
+        quality_status = str(
+            hint_library_doc.get("quality_status") or "passed"
+        ).strip() or "passed"
+        leakage_status = str(
+            hint_library_doc.get("answer_leakage_check") or "passed"
+        ).strip() or "passed"
+        if level == 2:
+            guiding_question = hint
+        _mark_hint_library_used(hint_library_doc)
+
+    if (not hint_library_doc) and ai_enabled():
         prompt_payload = {
             "hint_level": level,
             "scope": "narrow" if level == 2 else "broad",
@@ -10062,6 +10668,7 @@ level = {level}
             ) or {}
             candidate = str(data.get("hint_text") or "").strip()
 
+            # 檢查是否有洩漏答案或不合法的提示
             if not candidate:
                 hint = fallback_hint
                 leakage_status = "empty_candidate_fallback"
@@ -10072,6 +10679,7 @@ level = {level}
                 candidate,
                 expected_for_leakage,
             ):
+                # answer leakage fallback
                 hint = fallback_hint
                 leakage_status = "rejected_fallback_used"
                 quality_status = "answer_leakage_fallback"
@@ -10117,6 +10725,19 @@ level = {level}
             quality_status = "ai_error_fallback_safe"
             source = "system_fallback"
 
+    if not hint_library_doc:
+        auto_saved_hint_library_fields = _auto_save_generated_hint_to_library(
+            aggregate_detail,
+            task,
+            level,
+            hint,
+            source=source,
+            quality_status=quality_status,
+            leakage_status=leakage_status,
+        )
+        if auto_saved_hint_library_fields:
+            hint_library_fields = auto_saved_hint_library_fields
+
     concept_scope = "、".join(aggregate_detail.get("concept_scopes") or []) or "程式流程與區塊順序"
     ai_feedback_detail = {
         "feedback_type": "progressive_srt_aggregated_hint",
@@ -10142,6 +10763,7 @@ level = {level}
         "second_hint": hint if level == 2 else "",
         "subtitle_basis": subtitle_basis,
         "answer_leakage_check": leakage_status,
+        **hint_library_fields,
         **aggregate_detail,
     }
     ai_diagnosis_summary = (
@@ -10250,6 +10872,57 @@ def _prepare_ai_hint_record(att, task, *, requested_hint_no=1, force=False, coun
         "hint_meta": existing_meta,
         "source": "cache" if existing_hint else "system",
     }
+    if existing_hint and not existing_meta.get("hint_library_status"):
+        cached_detail = (
+            (record or {}).get("last_ai_feedback_detail")
+            if isinstance((record or {}).get("last_ai_feedback_detail"), dict)
+            else {}
+        )
+        cached_source = str(
+            cached_detail.get("hint_source")
+            or existing_meta.get("hint_source")
+            or payload.get("source")
+            or "cache"
+        ).strip()
+        cached_quality_status = str(
+            cached_detail.get("hint_quality_status")
+            or existing_meta.get("hint_quality_status")
+            or "cached_hint_without_quality_status"
+        ).strip()
+        cached_leakage_status = str(
+            cached_detail.get("answer_leakage_check")
+            or existing_meta.get("answer_leakage_check")
+            or "unknown"
+        ).strip()
+        cached_aggregate = _build_aggregated_hint_detail(
+            att,
+            task,
+            requested_hint_no,
+        )
+        cached_library_fields = _auto_save_generated_hint_to_library(
+            cached_aggregate,
+            task,
+            requested_hint_no,
+            existing_hint,
+            source=cached_source,
+            quality_status=cached_quality_status,
+            leakage_status=cached_leakage_status,
+        )
+        if cached_library_fields:
+            payload["ai_feedback_detail"] = {
+                **cached_aggregate,
+                **cached_detail,
+                **cached_library_fields,
+                "hint_source": cached_source,
+                "hint_quality_status": cached_quality_status,
+                "answer_leakage_check": cached_leakage_status,
+            }
+            payload["hint_meta"] = _build_ai_hint_meta_for_attempt(
+                att,
+                task,
+                requested_hint_no,
+                detail=payload["ai_feedback_detail"],
+            )
 
     generated = False
     if force or not existing_hint:
@@ -10367,7 +11040,7 @@ def get_parsons_hint_state():
     else:
         current_session = 1
 
-    record = _get_hint_record(student_id, task_id)
+    record = _get_hint_record(student_id, task_id, current_session)
 
     return jsonify({
         "ok": True,
@@ -10377,6 +11050,63 @@ def get_parsons_hint_state():
     })
 
 # 產生或取得指定的第一次／第二次 AI 提示
+@parsons_bp.route("/hint_library", methods=["POST", "OPTIONS"])
+def upsert_hint_library_entry():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    try:
+        doc = _build_hint_library_upsert_doc(data)
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "message": str(exc),
+        }), 400
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "message": "hint_library payload invalid",
+            "detail": str(exc),
+        }), 400
+
+    ensure_hint_library_indexes()
+    key = {
+        "hint_key": doc["hint_key"],
+        "version": doc["version"],
+    }
+    set_fields = dict(doc)
+    created_at = set_fields.pop("created_at", now_utc())
+
+    try:
+        result = db.hint_library.update_one(
+            key,
+            {
+                "$set": set_fields,
+                "$setOnInsert": {"created_at": created_at},
+            },
+            upsert=True,
+        )
+        saved = db.hint_library.find_one(key, {"_id": 1})
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "message": "hint_library write failed",
+            "detail": str(exc),
+        }), 500
+
+    return jsonify({
+        "ok": True,
+        "data_source": "hint_library",
+        "hint_key": doc["hint_key"],
+        "version": doc["version"],
+        "upserted": bool(result.upserted_id),
+        "matched_count": int(result.matched_count or 0),
+        "modified_count": int(result.modified_count or 0),
+        "hint_library_id": str((saved or {}).get("_id") or result.upserted_id or ""),
+    })
+
+
 @parsons_bp.route("/hint", methods=["POST", "OPTIONS"])
 def generate_parsons_hint():
     if request.method == "OPTIONS":
@@ -10467,6 +11197,7 @@ def generate_parsons_hint():
         existing_fallback_record = _get_hint_record(
             fallback_student_id,
             task_id_for_record,
+            att.get("task_attempt_session"),
         )
         fallback_text_field = (
             "ai_hint_2_text"
@@ -10744,7 +11475,11 @@ def review_choice():
             },
         })
 
-        hint_record = _get_hint_record(student_id, str(data.get("task_id") or task_id_f or "").strip())
+        hint_record = _get_hint_record(
+            student_id,
+            str(data.get("task_id") or task_id_f or "").strip(),
+            att.get("task_attempt_session") or data.get("task_attempt_session"),
+        )
         hint_meta = data.get("hint_meta") if isinstance(data.get("hint_meta"), dict) else {}
         if not hint_meta:
             hint_meta = data.get("ai_hint_2_meta") if int(hint_no or 1) == 2 else data.get("ai_hint_1_meta")
@@ -12650,17 +13385,15 @@ def _get_wrong_slots_and_core_compare(task_doc: dict, student_order: list, answe
 
     first_error_type = None
     if indent_errors:
-        wrong_slots = [min(indent_errors)]
         first_error_type = "indentation"
     elif control_slots:
-        wrong_slots = [min(control_slots)]
         first_error_type = "condition"
     elif semantic_slots:
-        wrong_slots = [min(semantic_slots)]
         first_error_type = "calculation"
     elif main_slots:
-        wrong_slots = [min(main_slots)]
         first_error_type = "structure"
+
+    wrong_slots = sorted(set(wrong_slots))
 
     extra_wrong = max(0, len(student_order or []) - len(expected_ids))
     is_correct = (len(wrong_slots) == 0 and extra_wrong == 0)

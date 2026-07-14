@@ -20,7 +20,7 @@
             type="text"
             inputmode="numeric"
             autocomplete="username"
-            placeholder="例如：11461102"
+            placeholder="請輸入學號"
             :disabled="loading"
           />
         </div>
@@ -135,7 +135,7 @@ async function login() {
 
     const role = res.data?.role || "student";
 
-    // ✅ 只導一次：老師→admin dashboard；學生→（先檢查是否要前測）→home/precheck
+    // ✅ 只導一次：老師→admin dashboard；學生→先回 home，若前測真的開啟再由 helper 轉走
     if (role === "teacher" || role === "admin") {
       router.replace("/admin/dashboard");
     } else {
@@ -143,8 +143,8 @@ async function login() {
       const redirected = await maybeRedirectToPretest(sid); // [新增]
       if (redirected) return; // [新增]
 
-      // [修改] 原本固定 /precheck：你可以選擇要 /home 或 /precheck
-      router.replace("/precheck"); // [修改]
+      // 前測關閉時直接進學生首頁
+      router.replace("/home");
     }
   } catch (e) {
     // ✅ 教學重點：把常見錯誤變成「人看得懂」的訊息

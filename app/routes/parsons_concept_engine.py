@@ -497,6 +497,72 @@ def build_template_solution(concept: str) -> Optional[Dict[str, Any]]:
             ],
         }
 
+    if concept == "list_basic":
+        return {
+            "solution_lines": [
+                "items = []",
+                "for i in range(3):",
+                "    item = int(input())",
+                "    items.append(item)",
+                "for item in items:",
+                "    print(item)",
+            ],
+            "template_slots": [
+                {"slot": "0", "label": "建立空串列 items"},
+                {"slot": "1", "label": "使用 for 迴圈控制輸入三筆資料"},
+                {"slot": "2", "label": "讀入一筆資料"},
+                {"slot": "3", "label": "把資料加入串列"},
+                {"slot": "4", "label": "走訪串列中的每個元素"},
+                {"slot": "5", "label": "逐一輸出串列元素"},
+            ],
+        }
+
+    if concept == "list_sum":
+        return {
+            "solution_lines": [
+                "scores = []",
+                "for i in range(3):",
+                "    score = int(input())",
+                "    scores.append(score)",
+                "total = 0",
+                "for score in scores:",
+                "    total += score",
+                "print(total)",
+            ],
+            "template_slots": [
+                {"slot": "0", "label": "建立空串列 scores"},
+                {"slot": "1", "label": "使用 for 迴圈控制輸入三筆成績"},
+                {"slot": "2", "label": "讀入一筆成績"},
+                {"slot": "3", "label": "把成績加入串列"},
+                {"slot": "4", "label": "建立累加變數 total"},
+                {"slot": "5", "label": "走訪串列中的每筆成績"},
+                {"slot": "6", "label": "把成績累加到 total"},
+                {"slot": "7", "label": "輸出總和"},
+            ],
+        }
+
+    if concept == "list_filter":
+        return {
+            "solution_lines": [
+                "numbers = []",
+                "for i in range(3):",
+                "    n = int(input())",
+                "    numbers.append(n)",
+                "for n in numbers:",
+                "    if n % 2 == 0:",
+                "        print(n)",
+            ],
+            "template_slots": [
+                {"slot": "0", "label": "建立空串列 numbers"},
+                {"slot": "1", "label": "使用 for 迴圈控制輸入三個數字"},
+                {"slot": "2", "label": "讀入一個整數"},
+                {"slot": "3", "label": "把整數加入串列"},
+                {"slot": "4", "label": "走訪串列中的每個數字"},
+                {"slot": "5", "label": "判斷數字是否為偶數"},
+                {"slot": "6", "label": "輸出符合條件的數字"},
+            ],
+        }
+
     if concept == "function_return":
         return {
             "solution_lines": [

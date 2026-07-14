@@ -151,17 +151,6 @@ def infer_indentation_from_lines(lines):
     return out
 
 
-def indentation_by_block(order, indentation):
-    result = {}
-    values = indentation if isinstance(indentation, list) else []
-    for index, block_id in enumerate(order or []):
-        key = normalize_id(block_id)
-        if not key:
-            continue
-        result[key] = values[index] if index < len(values) else None
-    return result
-
-
 def normalize_list(value):
     if isinstance(value, list):
         return value
@@ -276,7 +265,6 @@ def build_update(attempt, question_context):
         "answer_block_ids": submitted_order,
         "submitted_order": submitted_order,
         "submitted_indentation": submitted_indentation,
-        "submitted_indentation_by_block": indentation_by_block(submitted_order, submitted_indentation),
         "submitted_blocks": submitted_blocks,
         "correct_answer": (question_context or {}).get("correct_answer"),
         "expected_order": expected_order,
@@ -286,11 +274,12 @@ def build_update(attempt, question_context):
         "wrong_indices_all": sequence_slots,
         "id_mismatch_indices": sequence_slots,
         "indent_errors": indent_errors,
-        "wrong_slots": sequence_slots,
+        "incorrect_slots": sorted(set(sequence_slots + indent_errors)),
+        "sequence_slots": sequence_slots,
+        "indentation_slots": indent_errors,
         "error_count": len(set(sequence_slots + indent_errors)),
         "error_types": error_types,
         "error_details": error_details,
-        "error_concept": target_concept,
         "repeated_error_types": [],
         "repeated_error_count": 0,
         "repeated_error_basis": "same_task_same_error_type",
@@ -310,6 +299,9 @@ def build_update(attempt, question_context):
         "$unset": {
             "test_task_id": "",
             "source_task_id": "",
+            "submitted_indentation_by_block": "",
+            "wrong_slots": "",
+            "error_concept": "",
         },
     }
 
@@ -337,7 +329,7 @@ def main():
             {"submitted_blocks": {"$exists": False}},
             {"correct_answer": {"$exists": False}},
             {"error_types": {"$exists": False}},
-            {"wrong_slots": {"$exists": False}},
+            {"incorrect_slots": {"$exists": False}},
         ]
     }
 

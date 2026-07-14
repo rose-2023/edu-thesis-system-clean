@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import re  # [新增] 用於 version 遞增解析
 from bson import ObjectId
 from ..db import db
+from ..unit_labels import unit_label_map, save_unit_label
 
 teacher_t5_bp = Blueprint("teacher_t5", __name__)
 
@@ -49,6 +50,92 @@ def _is_soft_deleted(video_doc: dict) -> bool:
     return (v1 in true_like) or (v2 in true_like)
 
 
+def _clean_text(value, max_len=8000, strip=False):
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if strip:
+        text = text.strip()
+    if len(text) > max_len:
+        text = text[:max_len]
+    return text
+
+
+def _block_id(block, fallback):
+    if isinstance(block, dict):
+        raw = block.get("id", block.get("_id", fallback))
+    else:
+        raw = fallback
+    raw = str(raw or fallback).strip()
+    return raw or str(fallback)
+
+
+def _merge_block_edits(existing_blocks, incoming_blocks):
+    if not isinstance(incoming_blocks, list):
+        return None
+
+    existing_blocks = existing_blocks if isinstance(existing_blocks, list) else []
+    existing_by_id = {}
+    for idx, block in enumerate(existing_blocks):
+        if not isinstance(block, dict):
+            continue
+        bid = _block_id(block, f"b{idx}")
+        existing_by_id[bid] = dict(block)
+
+    merged = []
+    for idx, raw in enumerate(incoming_blocks):
+        if not isinstance(raw, dict):
+            continue
+        bid = _block_id(raw, f"b{idx}")
+        block = dict(existing_by_id.get(bid, {}))
+        block["id"] = bid
+
+        if any(k in raw for k in ("text", "code", "line")):
+            block["text"] = _clean_text(
+                raw.get("text", raw.get("code", raw.get("line", ""))),
+                max_len=2000,
+                strip=False,
+            )
+
+        if any(k in raw for k in ("meaning_zh", "semantic_zh", "semantic", "zh")):
+            meaning = _clean_text(
+                raw.get("meaning_zh", raw.get("semantic_zh", raw.get("semantic", raw.get("zh", "")))),
+                max_len=2000,
+                strip=True,
+            )
+            block["meaning_zh"] = meaning
+            block["semantic_zh"] = meaning
+
+        if "indent" in raw:
+            try:
+                block["indent"] = max(0, int(raw.get("indent") or 0))
+            except Exception:
+                block["indent"] = 0
+
+        if "enabled" in raw:
+            block["enabled"] = bool(raw.get("enabled"))
+
+        merged.append(block)
+
+    return merged
+
+
+def _normalize_solution_order(value):
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        text = _clean_text(value, max_len=2000, strip=True)
+        raw_items = re.split(r"\s*(?:->|=>|,|;|\||/|\n|\t|\s+)\s*", text)
+    out = []
+    seen = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 # =========================
 # A. units / videos / video_info
 # =========================
@@ -61,10 +148,107 @@ def units():
     )
     units_list = [u for u in units_list if u]
     units_list.sort()
+    labels = unit_label_map(units_list)
 
     return jsonify({
         "ok": True,
-        "items": [{"id": u, "name": u} for u in units_list]
+        "items": [
+            {
+                "id": u,
+                "name": labels.get(u) or u,
+                "raw_name": u,
+                "unit_label": labels.get(u) or u,
+            }
+            for u in units_list
+        ]
+    })
+
+
+@teacher_t5_bp.patch("/unit_label")
+def update_unit_label():
+    body = request.get_json(silent=True) or {}
+    unit_id = (body.get("unit_id") or body.get("unit") or "").strip()
+    label = (body.get("label") or body.get("name") or "").strip()
+    if not unit_id:
+        return jsonify({"ok": False, "error": "missing unit_id"}), 400
+    if not label:
+        return jsonify({"ok": False, "error": "missing label"}), 400
+    try:
+        saved = save_unit_label(unit_id, label, updated_by="teacher_t5")
+        return jsonify({"ok": True, **saved})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _test_control_doc_id(test_role, test_cycle_id):
+    role = str(test_role or "").strip().lower()
+    if role in ("pre", "pretest"):
+        return "pre", "pre_open", f"pre_open:{test_cycle_id}"
+    return "post", "post_open", f"post_open:{test_cycle_id}"
+
+
+def _set_test_control(test_cycle_id, test_role, is_open):
+    test_cycle_id = str(test_cycle_id or "default").strip() or "default"
+    role, field, doc_id = _test_control_doc_id(test_role, test_cycle_id)
+    doc = db.test_control.find_one({"_id": doc_id}) or {}
+    now = _utc_now()
+    update = {
+        "test_cycle_id": test_cycle_id,
+        "test_role": role,
+        field: bool(is_open),
+        "updated_at": now,
+    }
+    if is_open:
+        if not doc.get("open_at"):
+            update["open_at"] = now
+        update["close_at"] = None
+    else:
+        update["close_at"] = now
+    db.test_control.update_one({"_id": doc_id}, {"$set": update}, upsert=True)
+    return db.test_control.find_one({"_id": doc_id}) or {}
+
+
+@teacher_t5_bp.get("/test_control")
+def get_test_control():
+    test_cycle_id = (request.args.get("test_cycle_id") or "default").strip() or "default"
+    pre_doc = db.test_control.find_one({"_id": f"pre_open:{test_cycle_id}"}) or {}
+    post_doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+    return jsonify({
+        "ok": True,
+        "test_cycle_id": test_cycle_id,
+        "pre_open": bool(pre_doc.get("pre_open", False)),
+        "post_open": bool(post_doc.get("post_open", False)),
+        "pre_updated_at": _safe_iso(pre_doc.get("updated_at")),
+        "post_updated_at": _safe_iso(post_doc.get("updated_at")),
+    })
+
+
+@teacher_t5_bp.post("/test_control")
+def update_test_control():
+    body = request.get_json(silent=True) or {}
+    test_cycle_id = (body.get("test_cycle_id") or "default").strip() or "default"
+    role = (body.get("test_role") or body.get("role") or "").strip().lower()
+
+    if "pre_open" in body:
+        role = "pre"
+        is_open = bool(body.get("pre_open"))
+    elif "post_open" in body:
+        role = "post"
+        is_open = bool(body.get("post_open"))
+    else:
+        is_open = bool(body.get("open"))
+
+    if role not in ("pre", "pretest", "post", "posttest"):
+        return jsonify({"ok": False, "error": "invalid test_role"}), 400
+
+    _set_test_control(test_cycle_id, role, is_open)
+    pre_doc = db.test_control.find_one({"_id": f"pre_open:{test_cycle_id}"}) or {}
+    post_doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+    return jsonify({
+        "ok": True,
+        "test_cycle_id": test_cycle_id,
+        "pre_open": bool(pre_doc.get("pre_open", False)),
+        "post_open": bool(post_doc.get("post_open", False)),
     })
 
 
@@ -429,7 +613,7 @@ def get_question():
 # =========================
 # Save review (tags/note + distractor keep)
 # POST /question/review_save
-# body: {task_id, review_tags, review_note, distractor_keep: {blockId: true/false}}
+# body: {task_id, review_tags, review_note, distractor_keep, question_prompt, solution_blocks, distractor_blocks, solution_order}
 # =========================
 @teacher_t5_bp.post("/question/review_save")
 def review_save():
@@ -446,6 +630,11 @@ def review_save():
     review_note = body.get("review_note") or ""
     distractor_keep = body.get("distractor_keep") or {}
     hide_semantic_zh = body.get("hide_semantic_zh", None)
+    has_prompt_edit = "question_prompt" in body or "prompt" in body
+    prompt_edit = body.get("question_prompt", body.get("prompt", None))
+    solution_order_edit = body.get("solution_order", None)
+    if solution_order_edit is None:
+        solution_order_edit = body.get("solution_order_text", None)
 
     # 1) 存老師審核欄位（不改 schema：只是加/更新欄位）
     update_doc = {
@@ -454,9 +643,35 @@ def review_save():
         "updated_at": _utc_now(),
     }
 
-    # 2) 套用干擾保留/移除（不改 schema：在 distractor_blocks 內加 enabled）
-    #    - 你前端用 ✅/❌ 決定學生端要不要看到
-    dblocks = t.get("distractor_blocks", []) or []
+    if has_prompt_edit:
+        prompt = _clean_text(prompt_edit, max_len=4000, strip=True)
+        question = dict(t.get("question") or {}) if isinstance(t.get("question"), dict) else {}
+        question["prompt"] = prompt
+        update_doc["question"] = question
+        update_doc["prompt"] = prompt
+        update_doc["question_text"] = prompt
+
+    solution_blocks = _merge_block_edits(
+        t.get("solution_blocks", []) or t.get("blocks", []) or [],
+        body.get("solution_blocks"),
+    )
+    if solution_blocks is not None:
+        update_doc["solution_blocks"] = solution_blocks
+        update_doc["blocks"] = solution_blocks
+
+    if solution_order_edit is not None:
+        solution_order = _normalize_solution_order(solution_order_edit)
+        if solution_order:
+            update_doc["solution_order"] = solution_order
+            update_doc["solution_ids"] = solution_order
+
+    # Apply teacher edits and visibility flags to distractor blocks.
+    dblocks = _merge_block_edits(
+        t.get("distractor_blocks", []) or t.get("distractors", []) or [],
+        body.get("distractor_blocks"),
+    )
+    if dblocks is None:
+        dblocks = t.get("distractor_blocks", []) or []
     if isinstance(dblocks, list) and dblocks:
         for b in dblocks:
             bid = str(b.get("id") or b.get("_id") or "")
@@ -465,6 +680,12 @@ def review_save():
             if bid in distractor_keep:
                 b["enabled"] = bool(distractor_keep.get(bid))
         update_doc["distractor_blocks"] = dblocks
+        update_doc["distractors"] = dblocks
+
+    if solution_blocks is not None or isinstance(body.get("distractor_blocks"), list) or bool(distractor_keep):
+        pool_solution_blocks = solution_blocks if solution_blocks is not None else (t.get("solution_blocks", []) or t.get("blocks", []) or [])
+        pool_distractor_blocks = dblocks if isinstance(dblocks, list) else (t.get("distractor_blocks", []) or t.get("distractors", []) or [])
+        update_doc["pool"] = list(pool_solution_blocks or []) + list(pool_distractor_blocks or [])
 
     # 3) 中文語意提示顯示設定（老師端/學生端共用）
     if hide_semantic_zh is not None:

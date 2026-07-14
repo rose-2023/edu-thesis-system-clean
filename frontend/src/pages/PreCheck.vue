@@ -28,8 +28,8 @@ onMounted(async () => {
     const res = await fetch(url) // [修改]
     const data = await res.json()
 
-    // [新增] 若後端有回 pre_open，就尊重是否開放；沒有就當作開放
-    const preOpen = (typeof data?.pre_open === "boolean") ? data.pre_open : true // [新增]
+    // [新增] 若後端有回 pre_open，就尊重是否開放；沒有就視為未開放
+    const preOpen = (typeof data?.pre_open === "boolean") ? data.pre_open : false // [新增]
 
     // ✅ 後端回傳欄位：pre_done / post_done / post_open（你已驗證過）
     if (data?.ok && data?.pre_done) {

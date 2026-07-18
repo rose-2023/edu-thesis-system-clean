@@ -2,9 +2,9 @@
   <div class="page">
     <div class="card">
       <div class="header">
-        <div class="logo" aria-hidden="true">🧪</div>
+        <div class="logo" aria-hidden="true"><img src="/video icon.png" alt="Video Parsons Logo" id="icon"></div>
         <div>
-          <h1>影音學習平台</h1>
+          <h1>Video 程式學習平台</h1>
           <p>請使用學號與密碼登入</p>
         </div>
       </div>
@@ -210,7 +210,10 @@ onMounted(async () => {
   place-items: center;
   font-size: 22px;
 }
-
+#icon {
+  width: 32px;
+  height: 32px;
+}
 h1 {
   margin: 0;
   font-size: 20px;

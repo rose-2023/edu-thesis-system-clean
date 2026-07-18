@@ -162,7 +162,7 @@
 import { ref, computed, onMounted } from "vue";
 
 // [新增] 統一後端 API Base（避免打到 Vite 5173 回傳 index.html 造成 JSON/CSV 解析錯誤）
-const API_BASE = (import.meta?.env?.VITE_API_BASE || "http://127.0.0.1:5000").replace(/\/$/, ""); // [新增]
+const API_BASE = (import.meta?.env?.VITE_API_BASE || "").replace(/\/$/, ""); // [新增]
 
 const loading = ref(false);
 const errorMsg = ref("");

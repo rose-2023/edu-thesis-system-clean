@@ -2,12 +2,17 @@ import re
 from urllib.parse import urlparse
 
 
+DEFAULT_AVATAR_KEY = "default_person"
+DEFAULT_AVATAR_SRC = "/static/avatars/person_edit.svg"
+DEFAULT_AVATAR_STYLE = "neutral-person"
+
+
 def _relative_avatar_src(value, avatar_type=None):
     text = str(value or "").strip()
     if not text:
         return None
     if str(avatar_type or "").strip() == "emoji" or text in {"👨", "👩"}:
-        return text
+        return DEFAULT_AVATAR_SRC
 
     if text.startswith(("http://", "https://")):
         text = urlparse(text).path
@@ -24,4 +29,4 @@ def resolve_avatar_src(document):
         resolved = _relative_avatar_src(data.get(field), avatar_type)
         if resolved is not None:
             return resolved
-    return None
+    return DEFAULT_AVATAR_SRC

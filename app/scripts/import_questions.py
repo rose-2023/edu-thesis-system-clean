@@ -6,6 +6,9 @@ MONGO_URI = "mongodb://127.0.0.1:27017"
 DB_NAME = "thesis_system"
 JSON_PATH = "app/scripts/pre_questions_u1.json"
 
+'''
+匯入題目資料
+'''
 def main():
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]

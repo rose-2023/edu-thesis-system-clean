@@ -2,7 +2,7 @@ import json
 import urllib.request
 import urllib.error
 
-URL = "http://127.0.0.1:5000/api/auth/login"
+URL = "/api/auth/login"
 payload = {"student_id": "admin", "password": "admin123"}
 data = json.dumps(payload).encode('utf-8')
 req = urllib.request.Request(URL, data=data, headers={"Content-Type": "application/json"}, method='POST')

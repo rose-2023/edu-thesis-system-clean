@@ -5,10 +5,40 @@
 
     <!-- ===== Main ===== -->
     <main class="main">
-      <h1 class="title">AI 代理 Parsons 題目生成紀錄</h1>
+      <section class="page-hero" aria-labelledby="page-title">
+        <div class="hero-copy">
+          <div class="hero-eyebrow">TEACHER WORKSPACE</div>
+          <h1 id="page-title" class="title">AI Parsons 題目管理</h1>
+          <p class="hero-description">選擇教學影片、審核 AI 生成題目，並統一管理前後測發布狀態。</p>
+        </div>
+
+        <div class="hero-stats" aria-label="目前設定摘要">
+          <div class="hero-stat">
+            <span class="hero-stat-label">單元</span>
+            <strong>{{ selectedUnit ? '已選擇' : '待選擇' }}</strong>
+          </div>
+          <div class="hero-stat">
+            <span class="hero-stat-label">影片</span>
+            <strong>{{ selectedVideo ? '已選擇' : '待選擇' }}</strong>
+          </div>
+          <div class="hero-stat hero-stat-accent">
+            <span class="hero-stat-label">題目版本</span>
+            <strong>{{ questions.length }} 筆</strong>
+          </div>
+        </div>
+      </section>
 
       <!-- 測驗開放控制 -->
-      <div class="posttest-bar">
+      <section class="assessment-panel" aria-label="測驗發布控制">
+        <div class="assessment-panel-head">
+          <div>
+            <span class="section-kicker">測驗控制</span>
+            <h2>前後測發布狀態</h2>
+          </div>
+          <p>發布前請先確認測驗題目與開放時程。</p>
+        </div>
+
+        <div class="posttest-bar">
         <div class="test-control-group">
           <div class="posttest-left">
             <span class="posttest-label">前測狀態：</span>
@@ -47,28 +77,39 @@
           </div>
         </div>
       </div>
+      </section>
+
       <section class="grid">
         <!-- A -->
-        <div class="card">
-          <h2 class="card-title">A. 影片與字幕資訊</h2>
+        <div class="card card-wide source-card">
+          <div class="section-head">
+            <div class="section-icon" aria-hidden="true">01</div>
+            <div>
+              <span class="section-kicker">題目來源</span>
+              <h2 class="card-title">選擇單元與教學影片</h2>
+              <p class="section-description">先指定 AI 生題所依據的單元、影片與字幕版本。</p>
+            </div>
+          </div>
 
           <div class="row2">
             <div class="field">
               <label>單元</label>
               <select v-model="selectedUnit" :disabled="loading.units">
-                <option value="">請選擇</option>
+                <option value="">請選擇單元</option>
                 <option v-for="u in units" :key="u.id" :value="u.id">
                   {{ u.name }}（{{ u.raw_name || u.id }}）
                 </option>
               </select>
+              <p class="field-help">選擇後會載入該單元可用的教學影片。</p>
             </div>
 
             <div class="field">
               <label>影片標題</label>
               <select v-model="selectedVideo" :disabled="!selectedUnit || loading.videos">
-                <option value="">請選擇</option>
+                <option value="">請選擇影片</option>
                 <option v-for="v in videos" :key="v.id" :value="v.id">{{ v.title }}</option>
               </select>
+              <p class="field-help">題目版本與字幕資訊會依目前影片更新。</p>
             </div>
           </div>
 
@@ -91,7 +132,7 @@
             </div>
           </div>
 
-          <div class="row2 info">
+          <div class="row2 info source-info-grid">
             <div class="kv">
               <span class="k">影片狀態：</span>
               <span class="chip" :class="videoInfo.enabled ? 'chip-ok' : 'chip-off'">
@@ -109,7 +150,7 @@
             </div>
           </div>
 
-          <div class="row2 info">
+          <div class="row2 info source-info-grid">
             <div class="kv"><span class="k">來源：</span>{{ videoInfo.source || "—" }}</div>
             <div class="kv">
               <span class="k">字幕版本：</span>
@@ -119,7 +160,7 @@
             </div>
           </div>
 
-          <div class="row2 info">
+          <div class="row2 info source-info-grid">
             <div class="kv"><span class="k">影片時間：</span>{{ videoInfo.duration || "—" }}</div>
             <div class="actions">
               <button class="btn warn" @click="deleteSelectedVideo" :disabled="!selectedVideo">刪除此影片</button>
@@ -178,8 +219,21 @@
         </div> -->
 
         <!-- D -->
-        <div class="card">
-          <h2 class="card-title">D. 題目內容預覽與審核</h2>
+        <div class="card card-wide questions-card">
+          <div class="section-head section-head-spread">
+            <div class="section-head-main">
+              <div class="section-icon" aria-hidden="true">02</div>
+              <div>
+                <span class="section-kicker">版本管理</span>
+                <h2 class="card-title">題目內容預覽與審核</h2>
+                <p class="section-description">檢視 AI 題與固定題，完成預覽、編輯、發布或重新生成。</p>
+              </div>
+            </div>
+            <div class="question-count-badge">
+              <span>目前版本</span>
+              <strong>{{ questions.length }}</strong>
+            </div>
+          </div>
 
           <!-- filters -->
           <div class="d-toolbar">
@@ -211,12 +265,16 @@
           </div>
 
           <!-- states -->
-          <div class="d-state" v-if="!selectedVideo">
-            請先於 A 區塊選擇影片後，再查看題目版本。
+          <div class="d-state empty-state" v-if="!selectedVideo">
+            <div class="empty-state-icon">🎬</div>
+            <strong>尚未選擇影片</strong>
+            <span>請先在上方選擇單元與教學影片，再查看或建立題目版本。</span>
           </div>
 
-          <div class="d-state" v-else-if="loading.questions">
-            ⏳ 載入題目中，請稍候…
+          <div class="d-state empty-state" v-else-if="loading.questions">
+            <div class="loading-ring" aria-hidden="true"></div>
+            <strong>正在載入題目版本</strong>
+            <span>請稍候，系統正在同步最新資料。</span>
           </div>
 
           <div class="d-state err" v-else-if="err.d">
@@ -225,15 +283,17 @@
             <button class="btn mini" @click="fetchQuestions()">重新嘗試</button>
           </div>
 
-          <div class="d-state" v-else-if="questions.length === 0">
-            📭 尚無題目版本<br />
-            請點擊「建立題目」以建立 AI 題目。<br />
-            <button class="btn mini" @click="regenerate()">建立題目</button>
+          <div class="d-state empty-state" v-else-if="questions.length === 0">
+            <div class="empty-state-icon">🧩</div>
+            <strong>這支影片尚無題目版本</strong>
+            <span>建立第一個 AI Parsons 題目後，即可在此預覽與發布。</span>
+            <button class="btn primary mini" @click="regenerate()">建立第一個題目</button>
           </div>
 
           <!-- table -->
           <div v-else class="table-wrap">
             <table class="t">
+              <caption class="sr-only">Parsons 題目版本列表</caption>
               <thead>
                 <tr>
                   <th style="width: 90px;">題型</th>
@@ -3489,10 +3549,13 @@ async function loadSegmentEditorTask(taskId) {
       });
 
     previewData.value.source_type = (selectedQ?.source_type || data.source_type || data.gen_source || "fixed").toString().toLowerCase();
+    const previewVersion = previewData.value.source_type === "fixed"
+      ? (selectedQ ? getTaskCode(selectedQ) : (data.task_code || "FIXED-01"))
+      : (selectedQ?.version || data.version || "—");
     previewData.value.meta = {
       ...(previewData.value.meta || {}),
       task_id: data.task_id,
-      version: selectedQ?.version || data.version || "—",
+      version: previewVersion,
       unit: selectedUnit.value || "—",
       title: selectedVideoTitle.value || "—",
       segment_label: data.segment_label || "—",
@@ -3664,12 +3727,17 @@ async function openPreview(row = null) {
       ? data.solution_order.map((x) => String(x || "").trim()).filter(Boolean)
       : parseSolutionOrderText(data.solution_order || "");
 
+    const previewSourceType = (row?.source_type || data.source_type || data.gen_source || "ai").toString().toLowerCase();
+    const previewVersion = previewSourceType === "fixed"
+      ? (row ? getTaskCode(row) : (data.task_code || "FIXED-01"))
+      : (data.version || row?.version || "—");
+
     previewData.value = {
       ok: true,
-      source_type: (row?.source_type || data.source_type || data.gen_source || "ai").toString().toLowerCase(),
+      source_type: previewSourceType,
       meta: {
         task_id: data.task_id,
-        version: data.version || row.version || "—",
+        version: previewVersion,
         unit: selectedUnit.value || "—",
         title: selectedVideoTitle.value || "—",
         segment_label: data.segment_label || "—",
@@ -6315,6 +6383,631 @@ watch(selectedUnit, () => {
 .pillBtn.edit {
   background: #dbeafe;
   color: #1d4ed8;
+}
+
+
+/* ===== 2026 Teacher Question Workspace Refresh ===== */
+.t5-layout {
+  --ink: #172033;
+  --muted: #667085;
+  --surface: #ffffff;
+  --surface-soft: #fffaf2;
+  --line: #e7e9ee;
+  --accent: #f4a62a;
+  --accent-strong: #df8614;
+  --accent-soft: #fff1d6;
+  --navy: #203a5f;
+  --success: #20875a;
+  --danger: #c83e4d;
+  background:
+    radial-gradient(circle at 92% 5%, rgba(244, 166, 42, .13), transparent 24rem),
+    #f6f7f9;
+  color: var(--ink);
+}
+
+.main {
+  width: min(100%, 1580px);
+  margin: 0 auto;
+  padding: 28px 32px 48px;
+}
+
+.page-hero {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 28px;
+  padding: 30px 32px;
+  margin-bottom: 18px;
+  border: 1px solid rgba(32, 58, 95, .09);
+  border-radius: 24px;
+  background:
+    linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,247,231,.96)),
+    var(--surface);
+  box-shadow: 0 14px 36px rgba(23, 32, 51, .08);
+}
+
+.page-hero::after {
+  content: "";
+  position: absolute;
+  width: 210px;
+  height: 210px;
+  right: -66px;
+  top: -110px;
+  border-radius: 50%;
+  background: rgba(244, 166, 42, .17);
+}
+
+.hero-copy,
+.hero-stats { position: relative; z-index: 1; }
+
+.hero-eyebrow,
+.section-kicker {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.title {
+  margin: 0;
+  text-align: left;
+  color: var(--ink);
+  font-size: clamp(24px, 2.4vw, 36px);
+  line-height: 1.2;
+  letter-spacing: -.035em;
+}
+
+.hero-description {
+  max-width: 660px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.hero-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(92px, 1fr));
+  gap: 10px;
+  min-width: 330px;
+}
+
+.hero-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 78px;
+  padding: 14px;
+  border: 1px solid rgba(32, 58, 95, .1);
+  border-radius: 16px;
+  background: rgba(255,255,255,.8);
+}
+
+.hero-stat-accent {
+  border-color: rgba(244, 166, 42, .32);
+  background: var(--accent-soft);
+}
+
+.hero-stat-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.hero-stat strong {
+  color: var(--navy);
+  font-size: 15px;
+}
+
+.assessment-panel {
+  margin-bottom: 18px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: rgba(255,255,255,.94);
+  box-shadow: 0 8px 24px rgba(23, 32, 51, .05);
+}
+
+.assessment-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 0 2px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.assessment-panel-head h2 {
+  margin: 0;
+  font-size: 17px;
+  letter-spacing: -.015em;
+}
+
+.assessment-panel-head p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.posttest-bar {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 14px 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.test-control-group {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #fbfcfe;
+}
+
+.posttest-left {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 8px;
+}
+
+.posttest-label {
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.posttest-status {
+  justify-self: start;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.posttest-status.open {
+  color: #146c46;
+  background: #e8f7ef;
+}
+
+.posttest-status.closed {
+  color: #a52d3d;
+  background: #fff0f2;
+}
+
+.posttest-hint {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.posttest-actions { justify-content: flex-start; }
+
+.grid {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+}
+
+.card {
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(255,255,255,.97);
+  box-shadow: 0 10px 30px rgba(23, 32, 51, .06);
+}
+
+.card:hover {
+  border-color: #d9dde5;
+  box-shadow: 0 14px 34px rgba(23, 32, 51, .08);
+}
+
+.section-head,
+.section-head-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.section-head {
+  margin-bottom: 22px;
+  padding-bottom: 17px;
+  border-bottom: 1px solid var(--line);
+}
+
+.section-head-spread {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.section-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 42px;
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  color: #7a4700;
+  background: linear-gradient(135deg, #ffd98f, #ffbd48);
+  box-shadow: inset 0 0 0 1px rgba(122,71,0,.08);
+  font-size: 12px;
+  font-weight: 950;
+  letter-spacing: .05em;
+}
+
+.card-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.section-description {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.question-count-badge {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 11px 8px 14px;
+  border: 1px solid #f4d39f;
+  border-radius: 999px;
+  color: #81520a;
+  background: #fff8ea;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.question-count-badge strong {
+  display: grid;
+  place-items: center;
+  min-width: 29px;
+  height: 29px;
+  padding: 0 7px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--accent-strong);
+}
+
+.row2 {
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.field {
+  min-width: 0;
+}
+
+.field label {
+  margin-bottom: 7px;
+  color: #344054;
+  font-size: 12px;
+  letter-spacing: .01em;
+}
+
+.field input,
+.field select,
+.d-filter select,
+.source-info-grid select {
+  width: 90%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid #d7dce5;
+  border-radius: 12px;
+  color: var(--ink);
+  background: #fff;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+}
+
+.field input:focus,
+.field select:focus,
+.d-filter select:focus,
+.source-info-grid select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(244, 166, 42, .15);
+}
+
+.field input:disabled,
+.field select:disabled,
+.d-filter select:disabled {
+  color: #98a2b3;
+  background: #f3f4f6;
+  cursor: not-allowed;
+}
+
+.field-help {
+  margin: 7px 1px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.source-info-grid {
+  align-items: center;
+  margin: 0 -3px 12px;
+  padding: 12px 14px;
+  border: 1px solid #edf0f4;
+  border-radius: 14px;
+  background: #fafbfc;
+}
+
+.source-info-grid:last-of-type { margin-bottom: 0; }
+
+.source-info-grid .kv {
+  min-width: 0;
+  color: #475467;
+  line-height: 1.55;
+}
+
+.source-info-grid .k { color: var(--ink); }
+
+.chip {
+  margin-top: 2px;
+  padding: 5px 9px;
+  border: 0;
+  font-size: 11px;
+}
+
+.chip-ok {
+  color: #136b43;
+  background: #e6f6ed;
+}
+
+.chip-off {
+  color: #667085;
+  background: #eceff3;
+}
+
+.actions {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.btn,
+.pillBtn {
+  min-height: 38px;
+  border: 1px solid #d7dce5;
+  border-radius: 11px;
+  font-weight: 850;
+  transition: transform .08s ease, border-color .15s ease, box-shadow .15s ease, background .15s ease;
+}
+
+.btn:hover:not(:disabled),
+.pillBtn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(23, 32, 51, .1);
+}
+
+.btn.primary {
+  border-color: var(--navy);
+  background: var(--navy);
+  color: #fff;
+}
+
+.btn.primary:hover:not(:disabled) { background: #182f50; }
+
+.btn.warn {
+  border-color: #f5c6cd;
+  color: #a52d3d;
+  background: #fff1f3;
+}
+
+.d-toolbar {
+  position: sticky;
+  top: 10px;
+  z-index: 8;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgba(255,255,255,.94);
+  box-shadow: 0 6px 18px rgba(23,32,51,.05);
+  backdrop-filter: blur(10px);
+}
+
+.d-filter {
+  color: #344054;
+  font-size: 12px;
+}
+
+.d-filter select {
+  width: auto;
+  min-width: 158px;
+  min-height: 38px;
+  padding: 7px 10px;
+}
+
+.stable-toggle {
+  margin-left: auto;
+  min-height: 38px;
+  border-color: #d7dce5;
+  color: #475467;
+  background: #fff;
+}
+
+.stable-toggle.stable-on {
+  border-color: #f0b652;
+  color: #8b5600;
+  background: #fff7e8;
+}
+
+.stable-on .stable-knob { background: var(--accent-strong); }
+
+.d-state {
+  min-height: 150px;
+  padding: 24px;
+  border-color: #d9e0ea;
+  border-radius: 16px;
+  background: #fafbfc;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.empty-state strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.empty-state span {
+  max-width: 520px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.empty-state-icon { font-size: 28px; }
+
+.loading-ring {
+  width: 28px;
+  height: 28px;
+  border: 3px solid #eceff3;
+  border-top-color: var(--accent-strong);
+  border-radius: 50%;
+  animation: teacher-log-spin .8s linear infinite;
+}
+
+@keyframes teacher-log-spin { to { transform: rotate(360deg); } }
+
+.table-wrap {
+  overflow: auto;
+  border-color: var(--line);
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.7);
+}
+
+.t {
+  min-width: 930px;
+  color: #344054;
+  font-size: 12px;
+}
+
+.t th,
+.t td {
+  padding: 13px 12px;
+}
+
+.t thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  color: #475467;
+  background: #f8f9fb;
+  font-size: 11px;
+  letter-spacing: .02em;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.t tbody tr { transition: background .12s ease; }
+.t tbody tr:hover { background: #fffaf1; }
+.t tbody tr:last-child td { border-bottom: 0; }
+
+.fixed-row { background: #f8fbff; }
+.fixed-row td:first-child { box-shadow: inset 3px 0 0 #73a8df; }
+.fixed-row td { border-left: 0; }
+
+.pin-badge,
+.ai-badge {
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: .02em;
+}
+
+.ai-badge {
+  color: #8b5600;
+  background: #fff1d6;
+}
+
+.pin-badge {
+  color: #285c92;
+  background: #e9f3ff;
+}
+
+.btns {
+  gap: 6px;
+}
+
+.pillBtn {
+  min-height: 32px;
+  padding: 6px 10px;
+  color: #344054;
+  background: #fff;
+  font-size: 11px;
+}
+
+.pillBtn.preview { background: var(--navy); color: #fff; border-color: var(--navy); }
+.pillBtn.publish { background: #fff1d6; color: #7a4700; border-color: #f0cf94; }
+.pillBtn.unpub { background: #f2f4f7; color: #475467; border-color: #e1e4ea; }
+.pillBtn.regen { background: #fff0f2; color: #a52d3d; border-color: #f3c6cc; }
+.pillBtn.edit { background: #edf4ff; color: #285c92; border-color: #cfe0f5; }
+
+.visible-yes,
+.visible-no {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.visible-yes { color: #146c46; background: #e8f7ef; }
+.visible-no { color: #667085; background: #eceff3; }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 1180px) {
+  .page-hero { align-items: stretch; flex-direction: column; }
+  .hero-stats { min-width: 0; }
+  .posttest-bar { grid-template-columns: 1fr; }
+  .stable-toggle { margin-left: 0; }
+}
+
+@media (max-width: 820px) {
+  .t5-layout { grid-template-columns: 1fr; }
+  .main { padding: 18px 14px 36px; }
+  .page-hero { padding: 22px; border-radius: 20px; }
+  .hero-stats { grid-template-columns: 1fr; }
+  .assessment-panel-head,
+  .section-head-spread { flex-direction: column; align-items: stretch; }
+  .row2 { grid-template-columns: 1fr; }
+  .source-info-grid { padding: 12px; }
+  .question-count-badge { align-self: flex-start; }
+  .d-toolbar { position: static; }
+  .d-filter { width: 100%; justify-content: space-between; }
+  .d-filter select { flex: 1; min-width: 0; }
 }
 
 </style>

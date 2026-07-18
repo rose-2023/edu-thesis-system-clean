@@ -31,7 +31,7 @@ export function clearAuthState() {
 
 export async function logoutCurrentSession(apiBase = null) {
   const base = String(
-    apiBase || import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000",
+    apiBase || import.meta.env.VITE_API_BASE || "",
   ).replace(/\/$/, "");
   try {
     await window.fetch(`${base}/api/auth/logout`, { method: "POST" });
@@ -58,7 +58,7 @@ function isApiRequest(input) {
 function isBackendAxiosRequest(config) {
   try {
     const backendBase = new URL(
-      import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000",
+      import.meta.env.VITE_API_BASE || "",
       window.location.origin,
     );
     const target = new URL(config?.url || "", config?.baseURL || window.location.origin);
@@ -117,6 +117,13 @@ export function installAxiosSessionHandling(client = axios) {
 
   client.interceptors.request.use((config) => {
     const token = getAuthToken();
+    const isBackend = isBackendAxiosRequest(config);
+    console.log("[sessionAuth]", {
+      url: config.url,
+      baseURL: config.baseURL,
+      hasToken: Boolean(token),
+      isBackend,
+  });
     if (token && isBackendAxiosRequest(config)) {
       config.headers = config.headers || {};
       if (!config.headers.Authorization) {

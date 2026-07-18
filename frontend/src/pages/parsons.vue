@@ -1,12 +1,43 @@
 <template>  
   <div class="page">
+
     <!-- 題目 -->
     <div class="qbox">
       <div class="qtitle">題目</div>
       <div class="qtext">{{ task?.question_text || (state.loading ? "載入中..." : "（無題目）") }}</div>
+      <div v-if="completionTimeText" class="answer-time">
+        {{ answerTimeLabel }}：{{ completionTimeText }}
+      </div>
     </div>
 
-    <div class="board">
+    <div v-if="isChoiceTestQuestion" class="choice-board">
+      <div class="choice-panel">
+        <div class="choice-topline">
+          <span>前測選擇題</span>
+          <span>第 {{ testMeta.current_index }} / {{ testMeta.total }} 題</span>
+        </div>
+
+        <div v-if="state.noTask" class="emptyBox">
+          {{ state.err || "目前沒有可作答的前測題目" }}
+        </div>
+
+        <div v-else class="choice-options" role="radiogroup" aria-label="選擇答案">
+          <button
+            v-for="option in choiceOptions"
+            :key="option.key"
+            type="button"
+            class="choice-option"
+            :class="{ selected: selectedChoiceKey === option.key }"
+            @click="selectChoice(option)"
+          >
+            <span class="choice-key">{{ option.key }}</span>
+            <span class="choice-text">{{ option.text }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-else class="board">
       <!-- 左：挖空作答區 -->
       <div class="panel">
         <div class="panel-title">題目作答程式區：</div>
@@ -29,13 +60,13 @@
 
           <div class="hint" v-if="shouldShowSlotSemantic(slot, idx)">
             <span
-              v-if="isCStrategy ? isWrongSlot(idx) : isAffectedWrong(idx)"
+              v-if="!isCStrategy && isAffectedWrong(idx)"
               class="hint-affected-icon"
               aria-hidden="true"
           >
           </span>
 
-            {{ idx + 1 }}. {{ semanticTextForSlot(slot) }}
+            {{ slotSemanticDisplayText(slot, idx) }}
           </div>
 
           <div
@@ -55,11 +86,18 @@
             <div
               class="blank"
               :class="{ filled: !!filled[slot.slot], over: overSlot === slot.slot }"
-              @dragover.prevent="onDragOver(slot.slot)"
+              @dragenter.prevent="onDragOver(slot.slot, $event)"
+              @dragover.prevent="onDragOver(slot.slot, $event)"
               @dragleave="onDragLeave"
-              @drop.prevent="onDrop(slot.slot)"
+              @drop.prevent="onDrop(slot.slot, $event)"
             >
-              <span v-if="filled[slot.slot]">
+              <span
+                v-if="filled[slot.slot]"
+                class="filled-block"
+                draggable="true"
+                @dragstart.stop="onDragStart(filled[slot.slot], $event)"
+                @dragend="onDragEnd"
+              >
                 {{ filled[slot.slot].text }}
               </span>
               <span v-else class="placeholder">（把右邊片段拖到這裡）</span>
@@ -90,8 +128,8 @@
             :key="b.id"
             class="pill"
             :class="[b.type, { used: isUsed(b.id) }]"
-            :draggable="!isUsed(b.id)"
-            @dragstart="onDragStart(b)"
+            :draggable="true"
+            @dragstart="onDragStart(b, $event)"
             @dragend="onDragEnd"
           >
             {{ b.text }}
@@ -102,13 +140,21 @@
 
     <!-- 按鈕 -->
     <div class="actions">
-      <button class="btn submit" @click="submit" :disabled="state.submitting || state.noTask">
-        {{ state.submitting ? "送出中..." : "送出" }}
+      <button class="btn ghost back-page-btn" type="button" @click="goPreviousPage">
+        返回影片觀看
       </button>
+      <button
+        class="btn submit"
+        @click="submit"
+        :disabled="state.submitting || state.noTask || (isChoiceTestQuestion && !selectedChoiceKey)"
+      >
+        {{ state.submitting ? "送出中..." : (isChoiceTestQuestion ? "送出答案" : "送出") }}
+      </button>
+
     </div>
 
     <!-- 回饋（測驗模式不顯示） -->
-    <template v-if="!isTestMode">
+    <template v-if="!isTestMode || state.errType === 'incomplete_answer' || isChoiceTestQuestion">
       <div v-if="state.err && !state.noTask" class="result">
         {{ state.err }}
       </div>
@@ -187,7 +233,7 @@
             <button class="btn submit" @click="returnToFixFromHint">返回題目修正</button>
           </div>
         </template>
-
+        <!-- 錯誤固定語意反饋 -->
         <template v-else-if="feedbackModal.mode === 'fixed_semantic_feedback'">
           <div class="fb-title first-error-title">❌ {{ firstHintPanel.headline }}</div>
 
@@ -298,9 +344,6 @@
               <button class="btn submit" @click="onToggleHintOpen" :disabled="feedbackModal.hintLoading || (!feedbackModal.hintOpen && feedbackModal.hintLimitReached)">
                 {{ feedbackModal.hintLoading ? "提示中..." : (feedbackModal.hintOpen ? "收起提示" : (feedbackModal.hintLimitReached ? "提示已達上限" : "查看提示")) }}
               </button>
-              <button v-if="showReviewVideoFeature" class="btn submit" @click="onToggleReviewOpen">
-                {{ feedbackModal.reviewOpen ? "收起影片" : "查看影片" }}
-              </button>
             </div>
           </div>
 
@@ -316,21 +359,8 @@
                 {{ hintRemaining <= 0 ? "已使用提示" : (isRegeneratingHint ? "提示中..." : `再次提示(${hintRemaining})`) }}
               </button>
             </div>
-            <div v-if="showReviewVideoFeature" class="fb-actions pick">
-              <button class="btn submit" @click="openReviewFromHint">回看影片</button>
-            </div>
           </div>
 
-          <div class="fb-section fb-review" v-if="showReviewVideoFeature && feedbackModal.reviewOpen">
-            <div class="fb-label">🎬 建議回看片段</div>
-            <div class="fb-focus" v-if="feedbackModal.reviewMode === 'chapter_recommendation'">模式：章節推薦</div>
-            <div class="fb-focus" v-else>模式：秒級字幕對齊</div>
-            <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
-            <div v-if="feedbackModal.debugText" class="fb-debug">{{ feedbackModal.debugText }}</div>
-            <div class="fb-actions">
-              <button class="btn submit" @click="goReviewFromModal">前往影片</button>
-            </div>
-          </div>
         </template>
       </div>
     </div>
@@ -357,6 +387,7 @@
         </div>
 
         <div class="fb-actions">
+          <button class="btn ghost" @click="dismissSuccessModal">回到題目</button>
           <button class="btn ghost" @click="goBackToUnitPage">回到影片單元頁面</button>
           <button v-if="successModal.hasNext" class="btn submit" @click="goNextUnit">前往下一題</button>
         </div>
@@ -368,8 +399,8 @@
 <script setup>
 import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } from "vue";
 import { useRoute, useRouter, onBeforeRouteLeave } from "vue-router";
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
-const showReviewVideoFeature = false;
+import { formatTaipeiDateTime } from "../utils/dateTime.js";
+const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 const route = useRoute();
 const router = useRouter();
@@ -449,6 +480,18 @@ function authHeaders(base = {}) {
   const token = String(localStorage.getItem("token") || "").trim();
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
+}
+
+function extractCompletionTime(payload, fallback = "") {
+  const candidates = [
+    payload?.previous_completed_at,
+    payload?.last_completed_at,
+    payload?.completed_at,
+    payload?.submitted_at,
+    payload?.created_at,
+    fallback,
+  ];
+  return String(candidates.find((value) => value != null && String(value).trim()) || "").trim();
 }
 
 async function logLearningEvent(eventType, extra = {}) {
@@ -549,18 +592,96 @@ const videoId = computed(() => {
   return String(route.params.videoId || route.params.id || route.params.video_id || "");
 });
 
-const review_attempt_id = computed(() => {
-  const a = route.query.review_attempt_id ? String(route.query.review_attempt_id) : "";
-  const b = route.query.attempt_id ? String(route.query.attempt_id) : "";
-  return a || b;
-});
 
 // ====== 後端載入的題目資料 ======
 const task = ref(null);
 const poolBlocks = ref([]);
 const templateSlots = ref([]);
+const testQuestionType = ref("parsons");
+const choiceOptions = ref([]);
+const selectedChoiceKey = ref("");
+const previousCompletedAt = ref("");
+const currentCompletedAt = ref("");
+const answerTimeRaw = computed(() => previousCompletedAt.value || currentCompletedAt.value || "");
+const answerTimeLabel = computed(() => previousCompletedAt.value ? "上一次作答時間" : "作答時間");
+const completionTimeText = computed(() => {
+  return answerTimeRaw.value ? formatTaipeiDateTime(answerTimeRaw.value, "") : "";
+});
 const teacherForcedHideSemantic = ref(false);
 const effectiveShowSemanticZh = computed(() => !teacherForcedHideSemantic.value);
+const isChoiceTestQuestion = computed(() => (
+  isTestMode.value &&
+  String(testQuestionType.value || "").toLowerCase() === "choice"
+));
+
+function normalizeChoiceOptions(rawOptions = []) {
+  const list = Array.isArray(rawOptions) ? rawOptions : [];
+  const labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  return list
+    .map((option, index) => {
+      const fallbackKey = labels[index] || String(index + 1);
+      if (option && typeof option === "object") {
+        return {
+          key: String(option.key || option.label || option.value || fallbackKey).trim().toUpperCase(),
+          text: String(option.text || option.label_text || option.content || option.value || "").trim(),
+        };
+      }
+      const rawText = String(option || "").trim();
+      const match = rawText.match(/^\s*([A-Za-z])[\.\)、)]\s*(.+)$/);
+      return {
+        key: match ? match[1].toUpperCase() : fallbackKey,
+        text: match ? match[2].trim() : rawText,
+      };
+    })
+    .filter((option) => option.key && option.text);
+}
+
+function normalizeTestQuestionType(payload = {}) {
+  const raw = String(payload?.question_type || payload?.type || "").trim().toLowerCase();
+  if (["choice", "choices", "mcq", "multiple_choice", "single_choice"].includes(raw)) return "choice";
+  if (Array.isArray(payload?.options) && payload.options.length) return "choice";
+  return "parsons";
+}
+
+async function applyTestTaskPayload(payload, { bindBlanks = true } = {}) {
+  testQuestionType.value = normalizeTestQuestionType(payload);
+  selectedChoiceKey.value = "";
+
+  if (testQuestionType.value === "choice") {
+    task.value = {
+      ...(payload || {}),
+      task_id: String(payload?.task_id || payload?.question_id || ""),
+      question_type: "choice",
+      question_text: String(payload?.question_text || payload?.stem || payload?.question || ""),
+    };
+    choiceOptions.value = normalizeChoiceOptions(payload?.options || []);
+    poolBlocks.value = [];
+    templateSlots.value = [];
+    wrongIndices.value = [];
+    primaryWrongIndex.value = null;
+    wrongSlotIssueMap.value = {};
+    result.value = null;
+    state.err = "";
+    state.errType = "";
+    return;
+  }
+
+  choiceOptions.value = [];
+  const norm = normalizeTaskPayload(payload);
+  task.value = norm.taskObj;
+  poolBlocks.value = norm.pool;
+  teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
+  templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
+  if (bindBlanks) {
+    await bindBlankFocusHandlers();
+  }
+}
+
+function selectChoice(option) {
+  selectedChoiceKey.value = String(option?.key || "").trim().toUpperCase();
+  state.err = "";
+  state.errType = "";
+}
 
 // 回饋策略：舊資料沒有欄位時預設 B，避免影響原本功能
 const feedbackStrategy = computed(() => {
@@ -582,6 +703,8 @@ const isCStrategy = computed(() => {
 const dragging = ref(null);
 const overSlot = ref(null);
 const filled = reactive({});
+const fixedSemanticFeedbackActive = ref(false);
+const cStrategyWrongSubmitCount = ref(0);
 
 function normalizeFilledBlock(block) {
   if (!block) return null;
@@ -635,6 +758,7 @@ function indentBoxPx(slotKey, deltaPx) {
   const next = clampIndentPx(cur + Number(deltaPx || 0));
   if (next === cur) return false;
 
+  preserveSubmitFeedbackForEditing();
   slotIndentLevel[k] = next;
   // 保存最新縮排
   savePracticeState({
@@ -696,6 +820,7 @@ const state = reactive({
   submitting: false,
   noTask: false,
   err: "",
+  errType: "",
 });
 
 const feedbackModal = reactive({
@@ -711,32 +836,17 @@ const feedbackModal = reactive({
   conceptHint: "",
   reflectionQuestions: [],
   impactHint: "",
-  reviewRange: "（未提供）",
-  reviewMode: "subtitle_alignment",
-  subtitleHealth: null,
-  chapterRecommendation: null,
-  chapterLabel: "",
-  reviewFocus: "",
   hintOpen: false,
   hintLoading: false,
   hintLoaded: false,
   hintError: "",
   hintLimitReached: false,
-  reviewOpen: false,
-  start: null,
-  end: null,
-  chapterStart: null,
-  chapterEnd: null,
-  jumpVideoId: "",
   attemptId: "",
   attemptV2Id: "",
   attemptNo: null,
-  reviewAttemptId: "",
-  reviewOpenLogId: "",
+  hintViewLogId: "",
   taskId: "",
   targetConcept: "",
-  hintClicked: false,
-  videoClicked: false,
   source: "default",
   aiDiagnosisSummary: "",
   hintRecord: null,
@@ -756,7 +866,6 @@ const feedbackModal = reactive({
   possibleCauses: [],
   actualText: "",
   expectedText: "",
-  debugText: "",
 });
 
 const firstHintPanel = reactive({
@@ -1094,6 +1203,14 @@ function resetFilled() {
   wrongSlotIssueMap.value = {};
   result.value = null;
   state.err = "";
+  state.errType = "";
+  selectedChoiceKey.value = "";
+  choiceOptions.value = [];
+  testQuestionType.value = "parsons";
+  fixedSemanticFeedbackActive.value = false;
+  cStrategyWrongSubmitCount.value = 0;
+  previousCompletedAt.value = "";
+  currentCompletedAt.value = "";
   feedbackModal.aiHint1Meta = {};
   feedbackModal.aiHint2Meta = {};
 
@@ -1132,6 +1249,18 @@ function isWrongSlot(idx) {
 // C 策略也沿用這個判斷作紅色標記，但顯示內容改成固定中文語意。
 function isAffectedWrong(idx) {
   return isWrongSlot(idx) && !isPrimaryWrong(idx);
+}
+
+function preserveSubmitFeedbackForEditing() {
+  const wasCorrect = result.value?.is_correct === true;
+  firstHintPanel.visible = false;
+  if (result.value != null) {
+    result.value = null;
+  }
+  if (wasCorrect) {
+    cStrategyWrongSubmitCount.value = 0;
+  }
+  state.err = "";
 }
 
 function addSlotIssue(map, idx, kind) {
@@ -1404,6 +1533,12 @@ function semanticTextForSlot(slot) {
   ).trim();
 }
 
+function slotSemanticDisplayText(slot, idx) {
+  const text = semanticTextForSlot(slot);
+  if (isCStrategy.value) return text;
+  return `${Number(idx) + 1}. ${text}`;
+}
+
 // 中文語意顯示條件
 function shouldShowSlotSemantic(slot, idx) {
   if (!effectiveShowSemanticZh.value) {
@@ -1417,10 +1552,10 @@ function shouldShowSlotSemantic(slot, idx) {
   }
 
   // C：尚未送出時 wrongIndices 為空，因此完全不顯示。
-  // 送出後只有錯誤格顯示。
+  // 第二次錯誤觸發固定回饋後，才在錯誤格顯示預生成語意。
   // 修正成功的格子會從 wrongIndices 消失，因此提示同步消失。
   if (isCStrategy.value) {
-    return isWrongSlot(idx);
+    return fixedSemanticFeedbackActive.value && isWrongSlot(idx);
   }
 
   // B：完全維持原本「有中文語意就顯示」的行為。
@@ -1439,6 +1574,66 @@ function findSlotKeyByBlockId(blockId) {
   return null;
 }
 
+function findPoolBlockById(blockId) {
+  const id = String(blockId || "").trim();
+  if (!id) return null;
+  return (poolBlocks.value || []).find((block) => String(block?.id) === id) || null;
+}
+
+function orderedSlotKeys() {
+  return (templateSlots.value || [])
+    .map((slot) => (slot?.slot != null ? String(slot.slot) : ""))
+    .filter(Boolean);
+}
+
+function insertBlockLikePuzzle(targetSlotKey, block, sourceSlotKey = null) {
+  const slotKeys = orderedSlotKeys();
+  const targetKey = String(targetSlotKey || "");
+  const targetIdx = slotKeys.indexOf(targetKey);
+  if (targetIdx < 0 || !block?.id) return new Set();
+
+  const sourceKey = sourceSlotKey != null ? String(sourceSlotKey) : findSlotKeyByBlockId(block.id);
+  const sourceIdx = sourceKey != null ? slotKeys.indexOf(String(sourceKey)) : -1;
+  const records = slotKeys.map((key) => ({
+    block: filled[key] ? normalizeFilledBlock(filled[key]) : null,
+    indent: slotIndentLevel[key],
+  }));
+
+  const movingRecord = {
+    block: normalizeFilledBlock(block),
+    indent: sourceIdx >= 0 ? records[sourceIdx]?.indent : undefined,
+  };
+
+  if (sourceIdx === targetIdx) {
+    return new Set([targetKey]);
+  }
+
+  if (sourceIdx >= 0) {
+    records.splice(sourceIdx, 1);
+  }
+
+  records.splice(targetIdx, 0, movingRecord);
+
+  const affectedSlotKeys = new Set(slotKeys);
+  for (const key of slotKeys) {
+    delete filled[key];
+    delete slotIndentLevel[key];
+  }
+
+  slotKeys.forEach((key, idx) => {
+    const record = records[idx];
+    if (record?.block) {
+      filled[key] = normalizeFilledBlock(record.block);
+    }
+    if (record?.indent != null) {
+      slotIndentLevel[key] = record.indent;
+    }
+  });
+
+  applyIndentStylesToDOM();
+  return affectedSlotKeys;
+}
+
 // ====== 拖曳事件 ======
 let taskStartLoggedFor = "";
 
@@ -1454,36 +1649,53 @@ function recordTaskStartOnce() {
   logLearningEvent("task_start").catch(() => {});
 }
 
-function onDragStart(block) {
+function onDragStart(block, event = null) {
   recordTaskStartOnce();
+  preserveSubmitFeedbackForEditing();
   const fromSlotKey = findSlotKeyByBlockId(block?.id);
   dragging.value = { block, fromSlotKey };
+
+  try {
+    if (event?.dataTransfer && block?.id != null) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", String(block.id));
+    }
+  } catch (_) {}
 }
 function onDragEnd() {
   dragging.value = null;
   overSlot.value = null;
 }
-function onDragOver(slotKey) {
+function onDragOver(slotKey, event = null) {
   overSlot.value = slotKey;
+  try {
+    if (event?.dataTransfer) event.dataTransfer.dropEffect = "move";
+  } catch (_) {}
 }
 function onDragLeave() {
   overSlot.value = null;
 }
-function onDrop(slotKey) {
+function onDrop(slotKey, event = null) {
   overSlot.value = null;
-  const payload = dragging.value;
+  preserveSubmitFeedbackForEditing();
+  let payload = dragging.value;
+  if (!payload?.block) {
+    const fallbackId = event?.dataTransfer?.getData("text/plain") || "";
+    const fallbackBlock = findPoolBlockById(fallbackId);
+    if (fallbackBlock) {
+      payload = {
+        block: fallbackBlock,
+        fromSlotKey: findSlotKeyByBlockId(fallbackBlock.id),
+      };
+    }
+  }
   if (!payload?.block) return;
 
-  const existedKey = findSlotKeyByBlockId(payload.block.id);
-  if (existedKey != null && existedKey !== slotKey) {
-    delete filled[existedKey];
-  }
-
-  if (payload.fromSlotKey != null && payload.fromSlotKey !== slotKey) {
-    delete filled[payload.fromSlotKey];
-  }
-
-  filled[String(slotKey)] = normalizeFilledBlock(payload.block);
+  insertBlockLikePuzzle(
+    slotKey,
+    payload.block,
+    payload.fromSlotKey
+  );
 
   setActiveSlotKey(slotKey);
   dragging.value = null;
@@ -1498,22 +1710,8 @@ function onDrop(slotKey) {
 function removeFromSlot(slotKey) {
   if (slotKey == null) return;
 
+  preserveSubmitFeedbackForEditing();
   delete filled[String(slotKey)];
-
-  const idx = templateSlots.value.findIndex(
-    (slot) => String(slot.slot) === String(slotKey)
-  );
-
-  if (idx >= 0) {
-    wrongIndices.value = (wrongIndices.value || []).filter(
-      (wrongIndex) => Number(wrongIndex) !== Number(idx)
-    );
-    const nextIssueMap = {
-      ...(wrongSlotIssueMap.value || {}),
-    };
-    delete nextIssueMap[String(idx)];
-    wrongSlotIssueMap.value = nextIssueMap;
-  }
 
   delete slotIndentLevel[String(slotKey)];
 
@@ -1561,18 +1759,14 @@ async function advanceTestAfterSubmit() {
         testMeta.total = j?.total || total;
         testMeta.current_index = j?.current_index || (cur + 1);
 
-        const norm = normalizeTaskPayload(j);
-        task.value = norm.taskObj;
-        poolBlocks.value = norm.pool;
-        templateSlots.value = norm.slots;
-
         resetFilled();
+        await applyTestTaskPayload(j);
         wrongIndices.value = [];
         primaryWrongIndex.value = null;
         wrongSlotIssueMap.value = {};
         result.value = null;
         state.err = "";
-        await bindBlankFocusHandlers();
+        state.errType = "";
         await recordTaskOpen();
         return;
       }
@@ -1596,13 +1790,6 @@ async function advanceTestAfterSubmit() {
       router.push("/home");
     }
   }
-}
-
-function fmtTime(sec) {
-  const s = Math.max(0, Math.floor(Number(sec) || 0));
-  const mm = String(Math.floor(s / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
 }
 
 function debugFeedback(payload) {
@@ -1645,16 +1832,6 @@ function buildWrongFeedbackParts(r) {
     reflectionQuestions.push(aiGuidingQuestion);
   }
   const hasUsableAi = Boolean(aiDiagnosisSummary || aiConceptHint || aiFirstHint || aiSecondHint || reflectionQuestions.length || possibleCauses.length || aiImpactHint);
-
-  const startSec = Number.isFinite(Number(r?.jump?.start)) ? Number(r.jump.start) : 0;
-  const endSec = Number.isFinite(Number(r?.jump?.end)) ? Number(r.jump.end) : 0;
-  const subtitleHealth = (r?.subtitle_health && typeof r.subtitle_health === "object") ? r.subtitle_health : null;
-  const chapterRecommendation = (r?.chapter_recommendation && typeof r.chapter_recommendation === "object") ? r.chapter_recommendation : null;
-  const reviewMode = String(r?.review_mode || subtitleHealth?.mode || (chapterRecommendation ? "chapter_recommendation" : "subtitle_alignment") || "subtitle_alignment").trim() || "subtitle_alignment";
-  const chapterLabel = buildChapterLabel(chapterRecommendation);
-  const reviewRange = (reviewMode === "chapter_recommendation")
-    ? (chapterLabel || "（章節推薦）")
-    : ((endSec > startSec) ? `${fmtTime(startSec)} - ${fmtTime(endSec)}` : "（未提供）");
 
   const hasIfElseStructure = (poolBlocks.value || []).some((b) => String(b?.text || "").trim() === "else:")
     && (poolBlocks.value || []).some((b) => /^\s*if\s+.+:\s*$/.test(String(b?.text || "")));
@@ -1778,9 +1955,6 @@ function buildWrongFeedbackParts(r) {
     conceptHint,
     reflectionQuestions: resolvedReflections,
     impactHint: aiImpactHint || impactHint,
-    reviewRange,
-    startSec,
-    endSec,
     hasIndentError,
     indentErrorCount: indentErrors.length,
     source: hasUsableAi ? "ai" : "default",
@@ -1791,18 +1965,11 @@ function buildWrongFeedbackParts(r) {
     expectedText,
     wrongType,
     conceptTag,
-    reviewMode,
-    subtitleHealth,
-    chapterRecommendation,
-    chapterLabel,
   };
 }
 
 function buildWrongFeedback(r) {
   const parts = buildWrongFeedbackParts(r);
-  const reviewLabel = String(parts.reviewMode || "").trim() === "chapter_recommendation"
-    ? "建議回看章節"
-    : "建議回看影片";
 
   return [
     `❌ 你錯在：${parts.slotLabel}`,
@@ -1816,9 +1983,6 @@ function buildWrongFeedback(r) {
     "引導思考",
     `1 ${parts.reflectionQuestions[0] || "請重新檢查此格在流程中的執行條件。"}`,
     `2 ${parts.reflectionQuestions[1] || "這行程式若放在目前位置，執行時機是否正確？"}`,
-    "",
-    reviewLabel,
-    parts.reviewRange,
   ].join("\n");
 }
 
@@ -1845,22 +2009,6 @@ function buildFeedbackLocation(parts) {
   return `${numText}（程式區塊）`;
 }
 
-function buildFeedbackReviewFocus(parts) {
-  if (String(parts?.reviewMode || "").trim() === "chapter_recommendation") {
-    return String(parts?.chapterLabel || parts?.conceptTag || "章節推薦");
-  }
-  if (String(parts?.slotLabel || "").includes("條件") && String(parts?.slotLabel || "").includes("縮排")) {
-    return "if 與縮排";
-  }
-  if (String(parts?.slotLabel || "").includes("縮排")) {
-    return "縮排層級與執行範圍";
-  }
-  if (String(parts?.slotLabel || "").includes("條件")) {
-    return "條件判斷流程";
-  }
-  return "程式區塊流程";
-}
-
 function buildHintQuestion(parts) {
   const firstHint = String(parts?.firstHint || "").trim();
   if (firstHint) return firstHint;
@@ -1876,81 +2024,6 @@ function buildHintQuestion(parts) {
     return "這一行是否需要再往右縮排一層？";
   }
   return "這一行在目前流程中的位置正確嗎？";
-}
-
-const CONCEPT_TAG_ZH = {
-  loop_count_control: "迴圈次數控制",
-  loop_reverse_range: "反向 range 迴圈",
-  nested_loop_structure: "巢狀迴圈結構",
-  if_condition_logic: "條件判斷邏輯",
-  if_branch_order: "分支順序",
-  edge_case_condition: "邊界條件",
-  star_formula_2i_minus_1: "星號公式 2i-1",
-  space_formula_n_minus_i: "空白公式 n-i",
-  input_int_cast: "輸入轉整數",
-  print_separator: "輸出分隔格式",
-  python_syntax: "Python 語法",
-};
-
-function toConceptZh(tag) {
-  const key = String(tag || "").trim().toLowerCase();
-  if (!key) return "";
-  return CONCEPT_TAG_ZH[key] || String(tag || "").trim();
-}
-
-function buildChapterLabel(ch) {
-  const title = String(ch?.chapter_title || ch?.chapter_name || ch?.title || "").trim();
-  const conceptLabel = String(ch?.concept_label || ch?.chapter_label || "").trim();
-  const family = String(ch?.family || "").trim();
-  const conceptTags = Array.isArray(ch?.concept_tags)
-    ? ch.concept_tags.map((x) => String(x || "").trim()).filter(Boolean)
-    : [];
-  const conceptTagsZh = conceptTags.map((tag) => toConceptZh(tag)).filter(Boolean);
-  const _num = (v) => {
-    if (v === null || v === undefined) return null;
-    const t = String(v).trim();
-    if (!t) return null;
-    const n = Number(t);
-    return Number.isFinite(n) ? n : null;
-  };
-  // 章節模式應優先使用秒數欄位，不應把 slot_start/slot_end（格位索引）當時間。
-  const chapterStartSec = _num(ch?.start_sec) ?? _num(ch?.start);
-  const chapterEndSec = _num(ch?.end_sec) ?? _num(ch?.end);
-  const rangeText = (chapterStartSec != null && chapterEndSec != null && chapterEndSec > chapterStartSec)
-    ? `${fmtTime(chapterStartSec)} - ${fmtTime(chapterEndSec)}`
-    : "";
-  const head = title || conceptLabel || family || conceptTagsZh[0] || "章節推薦";
-  let tail = "";
-  if (conceptLabel && conceptLabel !== head) {
-    tail = `・${conceptLabel}`;
-  } else if (!conceptLabel && conceptTagsZh.length) {
-    const tagsText = conceptTagsZh.slice(0, 2).join("／");
-    if (tagsText && tagsText !== head) {
-      tail = `・${tagsText}`;
-    }
-  }
-  return `${head}${tail}${rangeText ? `（${rangeText}）` : ""}`;
-}
-
-function getChapterBoundary(ch, keys) {
-  for (const key of keys) {
-    const raw = ch?.[key];
-    if (raw === null || raw === undefined) continue;
-    const text = String(raw).trim();
-    if (!text) continue;
-    const n = Number(text);
-    if (Number.isFinite(n)) {
-      return n;
-    }
-  }
-  return null;
-}
-
-function buildReviewRangeText(parts) {
-  if (String(parts?.reviewMode || "").trim() === "chapter_recommendation") {
-    return String(parts?.chapterLabel || "").trim() || "（章節推薦）";
-  }
-  return String(parts?.reviewRange || "").trim() || "（未提供）";
 }
 
 function buildRetryHintQuestion(parts, usedCount = 1) {
@@ -2015,33 +2088,13 @@ async function handleRetryHint() {
       hint_loaded: true,
       hint_retry_count: nextUsed,
     })));
-    feedbackModal.reviewOpenLogId = String(openEvent?.log_id || "");
-    await updateReviewOpenHintLog({
+    feedbackModal.hintViewLogId = String(openEvent?.log_id || "");
+    await updateHintViewLog({
       trigger_method: "click_hint_retry",
       button_name: "再次提示",
       hint_loaded: true,
       hint_retry_count: nextUsed,
     });
-    if (feedbackModal.attemptId) {
-      await sendChoice(feedbackModal.attemptId, "no", {
-        click_type: "hint_retry",
-        hint_retry_count: nextUsed,
-        trigger_method: "click_hint_retry",
-        button_name: "再次提示",
-        hint_no: currentHintNo(),
-        hint_click_no: currentHintNo(),
-        max_hint_count: maxHintCount,
-        hint_text: feedbackModal.hintQuestion,
-        hint_content: feedbackModal.hintQuestion,
-        hint_source: feedbackModal.source || "frontend",
-        hint_loaded: true,
-        error_type: feedbackModal.errorClass || null,
-        wrong_slots: Array.isArray(wrongIndices.value)
-          ? wrongIndices.value.map((v) => Number(v)).filter((v) => Number.isFinite(v))
-          : [],
-        ai_diagnosis_summary: feedbackModal.aiDiagnosisSummary || feedbackModal.diagnosis || "",
-      });
-    }
   } catch (err) {
     console.error("handleRetryHint error:", err);
   } finally {
@@ -2095,6 +2148,39 @@ async function openSuccessModal(r) {
 
 function dismissSuccessModal() {
   successModal.open = false;
+}
+
+function buildVideoReturnRoute() {
+  const targetVideoId = String(
+    route.query.from_video_id
+    || videoId.value
+    || task.value?.video_id
+    || ""
+  ).trim();
+
+  if (!targetVideoId) return null;
+
+  return {
+    path: `/learn/video/${encodeURIComponent(targetVideoId)}`,
+    query: {
+      unit_id: currentUnitId() || "",
+      from_video_id: targetVideoId,
+    },
+  };
+}
+
+function goPreviousPage() {
+  successModal.open = false;
+  feedbackModal.open = false;
+  saveCurrentPracticeBeforeLeave();
+
+  const returnRoute = buildVideoReturnRoute();
+  if (returnRoute) {
+    router.replace(returnRoute);
+    return;
+  }
+
+  router.push("/home");
 }
 
 function goBackToUnitPage() {
@@ -2173,55 +2259,21 @@ function openFeedbackModal(r, taskId) {
   feedbackModal.possibleCauses = Array.isArray(parts.possibleCauses) ? parts.possibleCauses : [];
   feedbackModal.actualText = String(parts.actualText || "");
   feedbackModal.expectedText = String(parts.expectedText || "");
-  feedbackModal.reviewMode = String(parts.reviewMode || "subtitle_alignment");
-  feedbackModal.subtitleHealth = parts.subtitleHealth || null;
-  feedbackModal.chapterRecommendation = parts.chapterRecommendation || null;
-  feedbackModal.chapterLabel = buildChapterLabel(parts.chapterRecommendation);
-  feedbackModal.reviewRange = buildReviewRangeText({ ...parts, chapterLabel: feedbackModal.chapterLabel });
-  feedbackModal.reviewFocus = buildFeedbackReviewFocus(parts);
   feedbackModal.hintOpen = false;
   feedbackModal.hintLoading = false;
   feedbackModal.hintLoaded = false;
   feedbackModal.hintError = "";
   feedbackModal.hintLimitReached = false;
-  feedbackModal.reviewOpen = false;
   feedbackModal.aiDiagnosisSummary = "";
-  feedbackModal.start = parts.startSec;
-  feedbackModal.end = parts.endSec;
-  feedbackModal.chapterStart = getChapterBoundary(parts.chapterRecommendation, ["start", "start_sec"]);
-  feedbackModal.chapterEnd = getChapterBoundary(parts.chapterRecommendation, ["end", "end_sec"]);
-  feedbackModal.jumpVideoId = String(r?.jump?.video_id || "");
   feedbackModal.attemptId = String(r?.attempt_id || "");
   feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
   feedbackModal.attemptNo = Number.isFinite(Number(r?.attempt_no)) ? Number(r.attempt_no) : null;
-  feedbackModal.reviewAttemptId = String(r?.review_attempt_id || r?.attempt_id || "");
-  feedbackModal.reviewOpenLogId = "";
+  feedbackModal.hintViewLogId = "";
   feedbackModal.taskId = String(taskId || "");
   feedbackModal.targetConcept = String(r?.target_concept || currentTargetConcept() || "");
-  feedbackModal.hintClicked = false;
-  feedbackModal.videoClicked = false;
-  feedbackModal.debugText = "";
   hintRetryUsed.value = 0;
   isRegeneratingHint.value = false;
 
-  // if (import.meta.env.DEV) {
-  //   const src = String(r?.segment_source || "");
-  //   const concept = String(r?.segment_concept || "");
-  //   const wrongType = String(r?.wrong_type || "");
-  //   const conceptTag = String(r?.concept_tag || "");
-  //   const wrongIdx = Number.isFinite(Number(r?.wrong_index)) ? Number(r.wrong_index) : null;
-  //   const traceArr = Array.isArray(r?.alignment_trace) ? r.alignment_trace : [];
-  //   const traceText = traceArr.map((x) => {
-  //     const step = String(x?.step || "?");
-  //     const fbSrc = String(x?.fallback_source || "").trim();
-  //     const reason = String(x?.reason || x?.segment_source || "");
-  //     if (fbSrc) {
-  //       return `${step}:${reason || "n/a"}(${fbSrc})`;
-  //     }
-  //     return reason ? `${step}:${reason}` : step;
-  //   }).join(" | ");
-  //   feedbackModal.debugText = `debug src=${src || "n/a"}, concept=${concept || "n/a"}, wrong_type=${wrongType || "n/a"}, concept_tag=${conceptTag || "n/a"}, wrong_index=${wrongIdx != null ? wrongIdx : "n/a"}${traceText ? `\ntrace ${traceText}` : ""}`;
-  // }
 
   debugFeedback({
     modalOpen: true,
@@ -2518,6 +2570,7 @@ function showSystemRecheck(r, taskId) {
 }
 // c策略頁面每次答錯都呼叫這個函式
 function showFixedSemanticFeedbackModal(r, taskId) {
+  fixedSemanticFeedbackActive.value = true;
   const flow =
     r?.hint_flow && typeof r.hint_flow === "object"
       ? r.hint_flow
@@ -2949,7 +3002,7 @@ async function loadAiHintForModal() {
       slotLabel: feedbackModal.slotLabel,
     });
     feedbackModal.hintLoaded = true;
-    await updateReviewOpenHintLog({ hint_loaded: true });
+    await updateHintViewLog({ hint_loaded: true });
     return;
   }
 
@@ -2974,11 +3027,11 @@ async function loadAiHintForModal() {
     }
     applyAiHintToFeedbackModal(data);
     feedbackModal.hintLoaded = true;
-    await updateReviewOpenHintLog({ hint_loaded: true });
+    await updateHintViewLog({ hint_loaded: true });
   } catch (err) {
     feedbackModal.hintError = err?.message || "提示產生失敗";
     feedbackModal.hintQuestion = "AI 提示暫時無法產生，請稍後再試。";
-    await updateReviewOpenHintLog({
+    await updateHintViewLog({
       hint_loaded: false,
       hint_error: feedbackModal.hintError,
     });
@@ -3116,8 +3169,8 @@ async function logSecondHintReminderIgnored(returnMethod = "return_to_fix") {
   });
 }
 
-async function updateReviewOpenHintLog(extra = {}) {
-  const logId = String(feedbackModal.reviewOpenLogId || "").trim();
+async function updateHintViewLog(extra = {}) {
+  const logId = String(feedbackModal.hintViewLogId || "").trim();
   if (!logId) return null;
   try {
     const token = String(localStorage.getItem("token") || "").trim();
@@ -3154,9 +3207,6 @@ async function closeHintAndReturnToTask(closeMethod) {
   }));
   const closed = await closeHintReview(closeMethod);
   if (!closed) return;
-  if (feedbackModal.attemptId) {
-    await sendChoice(feedbackModal.attemptId, "no");
-  }
   feedbackModal.open = false;
   await logLearningEvent("return_to_task", learningContext);
 }
@@ -3180,9 +3230,6 @@ async function dismissFeedbackModal() {
     feedbackModal.hintOpen = false;
     await logLearningEvent("hide_hint", learningContext);
   }
-  if (feedbackModal.attemptId) {
-    await sendChoice(feedbackModal.attemptId, "no");
-  }
   feedbackModal.open = false;
   feedbackModal.mode = "legacy";
   feedbackModal.stage = "choice";
@@ -3191,14 +3238,10 @@ async function dismissFeedbackModal() {
   feedbackModal.hintLoaded = false;
   feedbackModal.hintError = "";
   feedbackModal.hintLimitReached = false;
-  feedbackModal.reviewOpen = false;
   feedbackModal.attemptV2Id = "";
   feedbackModal.attemptNo = null;
-  feedbackModal.reviewOpenLogId = "";
+  feedbackModal.hintViewLogId = "";
   feedbackModal.targetConcept = "";
-  feedbackModal.hintClicked = false;
-  feedbackModal.videoClicked = false;
-  feedbackModal.debugText = "";
   feedbackModal.source = "default";
   feedbackModal.aiDiagnosisSummary = "";
   feedbackModal.hintRecord = null;
@@ -3213,12 +3256,6 @@ async function dismissFeedbackModal() {
   feedbackModal.secondHintReminderShownLogged = false;
   feedbackModal.secondHintReminderResolved = false;
   feedbackModal.errorClass = "";
-  feedbackModal.reviewMode = "subtitle_alignment";
-  feedbackModal.subtitleHealth = null;
-  feedbackModal.chapterRecommendation = null;
-  feedbackModal.chapterLabel = "";
-  feedbackModal.chapterStart = null;
-  feedbackModal.chapterEnd = null;
   feedbackModal.firstHint = "";
   feedbackModal.secondHint = "";
   feedbackModal.possibleCauses = [];
@@ -3234,43 +3271,6 @@ async function dismissFeedbackModal() {
   }
 }
 
-async function goReviewFromModal() {
-  if (!feedbackModal.jumpVideoId) {
-    feedbackModal.open = false;
-    return;
-  }
-
-  await sendChoice(feedbackModal.attemptId, "yes");
-  savePracticeState({ attempt_id: feedbackModal.attemptId || "" });
-
-  const useChapterMode = String(feedbackModal.reviewMode || "").trim() === "chapter_recommendation";
-  const start = useChapterMode && Number.isFinite(Number(feedbackModal.chapterStart))
-    ? Number(feedbackModal.chapterStart)
-    : (feedbackModal.start ?? 0);
-  const end = useChapterMode && Number.isFinite(Number(feedbackModal.chapterEnd))
-    ? Number(feedbackModal.chapterEnd)
-    : (feedbackModal.end ?? 0);
-  const jumpVideoId = feedbackModal.jumpVideoId;
-  const attemptId = feedbackModal.reviewAttemptId;
-  const taskId = feedbackModal.taskId;
-
-  feedbackModal.open = false;
-  feedbackModal.hintClicked = false;
-  feedbackModal.videoClicked = false;
-
-  router.push({
-    path: `/learn/video/${jumpVideoId}`,
-    query: {
-      start,
-      end,
-      review_mode: useChapterMode ? "chapter_recommendation" : "subtitle_alignment",
-      attempt_id: String(attemptId || ""),
-      task_id: String(taskId || ""),
-      level: route.query.level ? String(route.query.level) : "L1",
-    },
-  });
-}
-
 async function onToggleHintOpen() {
   if (feedbackModal.hintOpen) {
     await closeHintAndReturnToTask("click_ai_hint_again");
@@ -3283,7 +3283,7 @@ async function onToggleHintOpen() {
     trigger_method: "click_ai_hint",
     button_name: "AI提示",
   })));
-  feedbackModal.reviewOpenLogId = String(openEvent?.log_id || "");
+  feedbackModal.hintViewLogId = String(openEvent?.log_id || "");
   const hintMetadata = openEvent?.metadata || {};
   if (hintMetadata.hint_limit_reached === true) {
     feedbackModal.hintOpen = false;
@@ -3292,65 +3292,12 @@ async function onToggleHintOpen() {
   }
   feedbackModal.hintOpen = true;
   feedbackModal.hintLimitReached = Number(hintMetadata.hint_no) >= Number(hintMetadata.max_hint_count || 2);
-  if (!feedbackModal.hintClicked && feedbackModal.attemptId) {
-    feedbackModal.hintClicked = true;
-    sendChoice(feedbackModal.attemptId, "no", { click_type: "hint" }).catch(() => {});
-  }
   await loadAiHintForModal();
-  await updateReviewOpenHintLog({
+  await updateHintViewLog({
     trigger_method: "click_ai_hint",
     button_name: "AI提示",
     hint_loaded: feedbackModal.hintLoaded,
   });
-}
-
-async function onToggleReviewOpen() {
-  const nextOpen = !feedbackModal.reviewOpen;
-  feedbackModal.reviewOpen = nextOpen;
-  if (nextOpen && !feedbackModal.videoClicked && feedbackModal.attemptId) {
-    feedbackModal.videoClicked = true;
-    await sendChoice(feedbackModal.attemptId, "no", { click_type: "video" });
-  }
-}
-
-async function openReviewFromHint() {
-  if (!feedbackModal.reviewOpen) {
-    feedbackModal.reviewOpen = true;
-  }
-  if (!feedbackModal.videoClicked && feedbackModal.attemptId) {
-    feedbackModal.videoClicked = true;
-    await sendChoice(feedbackModal.attemptId, "no", { click_type: "video" });
-  }
-}
-
-async function sendChoice(attempt_id, choice, extra = {}) {
-  if (!attempt_id) return;
-  try {
-    const token = String(localStorage.getItem("token") || "").trim();
-    const headers = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
-    await fetch(`${API_BASE}/api/parsons/review_choice`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        attempt_id,
-        student_id: (localStorage.getItem("student_id") || ""),
-        student_choice: choice,
-        session_id: learningSessionId,
-        page: "parsons",
-        activity_type: isTestMode.value ? "test" : "practice",
-        test_role: isTestMode.value ? String(testRole.value || "") : null,
-        task_id: feedbackModal.taskId || currentTaskId(),
-        attempt_v2_id: feedbackModal.attemptV2Id || null,
-        attempt_no: feedbackModal.attemptNo,
-        target_concept: feedbackModal.targetConcept || currentTargetConcept(),
-        question_id: feedbackModal.taskId || currentTaskId(),
-        unit_id: currentUnitId(),
-        question_type: "parsons",
-        ...extra,
-      }),
-    });
-  } catch (_) {}
 }
 
 // 每題作答狀態保存
@@ -3712,6 +3659,133 @@ function clearAiFeedback() {
   aiGuidingQuestion.value = "";
 }
 
+function resetFirstHintPanel() {
+  Object.assign(firstHintPanel, {
+    visible: false,
+    headline: "",
+    text: "",
+    wrongCount: 0,
+    sequenceCount: 0,
+    indentationCount: 0,
+    wrongPositionText: "紅色標記的位置",
+    errorTypeText: "待檢查",
+    hintRecord: null,
+  });
+}
+
+function resetFeedbackModalState() {
+  Object.assign(feedbackModal, {
+    open: false,
+    mode: "legacy",
+    stage: "choice",
+    headline: "",
+    locationText: "",
+    hintQuestion: "",
+    slotLabel: "",
+    diagnosis: "",
+    errorClass: "",
+    conceptHint: "",
+    reflectionQuestions: [],
+    impactHint: "",
+    hintOpen: false,
+    hintLoading: false,
+    hintLoaded: false,
+    hintError: "",
+    hintLimitReached: false,
+    attemptId: "",
+    attemptV2Id: "",
+    attemptNo: null,
+    hintViewLogId: "",
+    taskId: "",
+    targetConcept: "",
+    source: "default",
+    aiDiagnosisSummary: "",
+    hintRecord: null,
+    hintId: "",
+    firstSystemHintText: "",
+    aiHint1Text: "",
+    aiHint1Meta: {},
+    aiHint2Text: "",
+    aiHint2Meta: {},
+    activeAiHintNo: 1,
+    secondHintLoading: false,
+    secondHintNoticeVisible: false,
+    secondHintReminderShownLogged: false,
+    secondHintReminderResolved: false,
+    firstHint: "",
+    secondHint: "",
+    possibleCauses: [],
+    actualText: "",
+    expectedText: "",
+  });
+  hintRetryUsed.value = 0;
+  isRegeneratingHint.value = false;
+}
+
+function clearSubmitFeedbackState({ clearMessage = true } = {}) {
+  result.value = null;
+  wrongIndices.value = [];
+  primaryWrongIndex.value = null;
+  wrongSlotIssueMap.value = {};
+  fixedSemanticFeedbackActive.value = false;
+  successModal.open = false;
+  resetFirstHintPanel();
+  resetFeedbackModalState();
+  clearAiFeedback();
+  if (clearMessage) {
+    state.err = "";
+    state.errType = "";
+  }
+}
+
+function answerCompletenessStatus() {
+  const slots = templateSlots.value || [];
+  const total = slots.length;
+  const missingIndices = [];
+
+  slots.forEach((slot, idx) => {
+    const slotKey = slot?.slot != null ? String(slot.slot) : "";
+    const blockId = slotKey ? filled[slotKey]?.id : null;
+    if (blockId == null || String(blockId).trim() === "") {
+      missingIndices.push(idx);
+    }
+  });
+
+  const missingCount = missingIndices.length;
+  const complete = total > 0 && missingCount === 0;
+  const allBlank = total > 0 && missingCount === total;
+  let message = "尚未載入題目，無法送出。";
+  if (total > 0) {
+    message = allBlank
+      ? "請先將所有程式片段放入作答區。"
+      : `尚有 ${missingCount} 個程式片段未放入作答區，請填答完整後再送出。`;
+  }
+
+  return {
+    complete,
+    total,
+    missingCount,
+    missingIndices,
+    allBlank,
+    message,
+  };
+}
+
+function showIncompleteAnswerMessage(status = {}) {
+  clearSubmitFeedbackState({ clearMessage: false });
+  const missingCount = Number(status.missing_count ?? status.missingCount ?? 0);
+  const allBlank = status.all_blank === true || status.allBlank === true;
+  state.err = String(
+    status.message ||
+    (
+      allBlank
+        ? "請先將所有程式片段放入作答區。"
+        : `尚有 ${missingCount} 個程式片段未放入作答區，請填答完整後再送出。`
+    )
+  );
+  state.errType = "incomplete_answer";
+}
+
 // ====== 送出作答 ======
 
 // 收集 block IDs
@@ -3724,27 +3798,24 @@ function clearAiFeedback() {
 async function submit() {
   if (state.submitting || state.noTask) return;
   state.submitting = true;
-  state.err = "";
-  result.value = null;
-  wrongIndices.value = [];
-  primaryWrongIndex.value = null;
-  firstHintPanel.visible = false;
-  feedbackModal.open = false;
-
-  // 每次送出前先清空 AI 回饋
-  aiFeedbackDetail.value = null;
-  aiConceptExplanation.value = "";
-  aiPossibleCauses.value = [];
-  aiImpact.value = "";
-  aiGuidingQuestion.value = "";
+  clearSubmitFeedbackState();
 
   try {
+    if (!isChoiceTestQuestion.value) {
+      const completeness = answerCompletenessStatus();
+      if (!completeness.complete) {
+        showIncompleteAnswerMessage(completeness);
+        return;
+      }
+    }
+
     // ==============================
     // 前/後測模式：不顯示任何回饋，直接下一題/結束
     // ==============================
     if (isTestMode.value) {
       if (!studentId.value) {
         state.err = "";
+        state.errType = "";
         result.value = null;
         try {
           if (window?.history?.length > 1) router.back();
@@ -3763,6 +3834,15 @@ async function submit() {
         ? Math.max(0, Math.round((submittedAt.getTime() - Number(testMeta.started_at_ms)) / 1000))
         : 0;
 
+      if (isChoiceTestQuestion.value && !selectedChoiceKey.value) {
+        showIncompleteAnswerMessage({
+          message: "請先選擇一個答案後再送出。",
+          missingCount: 1,
+          allBlank: true,
+        });
+        return;
+      }
+
       const body = {
         session_id: learningSessionId,
         page: "parsons",
@@ -3771,10 +3851,12 @@ async function submit() {
         test_cycle_id: String(testCycleId.value || ""),
         test_role: String(testRole.value || ""),
         task_id: String(currentTaskId() || ""),
-        answer_lines: buildAnswerLines(),
-        answer_ids: Array.isArray(answer_ids.value)
-          ? answer_ids.value.filter(Boolean)
-          : [],
+        question_type: testQuestionType.value,
+        answer_lines: isChoiceTestQuestion.value ? [] : buildAnswerLines(),
+        answer_ids: isChoiceTestQuestion.value
+          ? []
+          : (Array.isArray(answer_ids.value) ? answer_ids.value : []),
+        selected_answer: isChoiceTestQuestion.value ? selectedChoiceKey.value : null,
         started_at: startedAtIso,
         submitted_at: submittedAt.toISOString(),
         duration_sec,
@@ -3800,7 +3882,12 @@ async function submit() {
       const r = await res.json();
 
       if (!res.ok) {
+        if (r?.error === "incomplete_answer") {
+          showIncompleteAnswerMessage(r);
+          return;
+        }
         state.err = r?.message || "答案送出失敗，請稍後再試。";
+        state.errType = "submit_error";
         result.value = { is_correct: false, feedback: state.err };
         return;
       }
@@ -3815,6 +3902,7 @@ async function submit() {
       result.value = null;
       wrongIndices.value = [];
       state.err = "";
+      state.errType = "";
 
       if (r?.ok && r?.already_submitted) {
         window.alert("你已經完成本次測驗，無法重複作答。");
@@ -3841,6 +3929,7 @@ async function submit() {
     const task_id = task.value?.task_id || task.value?._id;
     if (!task_id) {
       state.err = "尚未載入題目，無法送出。";
+      state.errType = "submit_error";
       result.value = { is_correct: false, feedback: state.err };
       return;
     }
@@ -3862,7 +3951,6 @@ async function submit() {
       answer_lines: buildAnswerLines(),
       video_id: String(videoId.value || ""),
       level: route.query.level ? String(route.query.level) : "L1",
-      review_attempt_id: review_attempt_id.value,
       student_id: String(studentId.value || ""),
       participant_id: String(participantId.value || ""),
       started_at: startedAtIso,
@@ -3879,7 +3967,12 @@ async function submit() {
     const r = await res.json();
 
     if (!res.ok) {
+      if (r?.error === "incomplete_answer") {
+        showIncompleteAnswerMessage(r);
+        return;
+      }
       state.err = r?.message || "答案送出失敗，請稍後再試。";
+      state.errType = "submit_error";
       result.value = { is_correct: false, feedback: state.err };
       return;
     }
@@ -3938,6 +4031,7 @@ async function submit() {
       // 只有答對，才清除此題的排列、縮排、紅標與修正狀態。
       // 其他尚未完成的題目仍各自保留。
       clearPracticeStateForTask(task_id);
+      currentCompletedAt.value = extractCompletionTime(r, submittedAt.toISOString());
       wrongSlotIssueMap.value = {};
       await openSuccessModal(r);
     }
@@ -3953,19 +4047,57 @@ async function submit() {
     "B"
   ).trim().toUpperCase();
 
-  // C 策略：錯誤位置與固定中文語意直接顯示在題目槽位。
-  // 此研究條件不顯示第一次錯誤 Modal，也不開啟 AI Modal。
+  const flow = submitHintFlow;
+  const attemptNo = Number(r?.attempt_no || 0);
+  const wrongAttemptCount = Number(
+    flow.wrong_attempt_count
+    ?? r?.wrong_attempt_count
+    ?? 0
+  );
+  const isSubmitCStrategy = submitFeedbackStrategy === "C" || isCStrategy.value;
+
+  if (r?.ok && r?.is_correct === false && isSubmitCStrategy) {
+    cStrategyWrongSubmitCount.value += 1;
+
+    if (cStrategyWrongSubmitCount.value <= 1) {
+      fixedSemanticFeedbackActive.value = false;
+      showFirstSystemHint(r, task_id);
+      return;
+    }
+
+    showFixedSemanticFeedbackModal(r, task_id);
+    return;
+  }
+
+  if (
+    r?.ok &&
+    r?.is_correct === false &&
+    flow?.type === "fixed_semantic_feedback"
+  ) {
+    showFixedSemanticFeedbackModal(r, task_id);
+    return;
+  }
+
   if (
     r?.ok &&
     r?.is_correct === false &&
     (
-      submitFeedbackStrategy === "C" ||
-      submitHintFlow?.type === "fixed_semantic_feedback"
+      flow?.type === "first_system_hint"
+      || (!flow?.type && wrongAttemptCount <= 1)
+      || (!flow?.type && !wrongAttemptCount && attemptNo === 1)
     )
   ) {
-    // 此時 wrongIndices 已由後端結果更新。
-    // C 策略每次答錯都顯示固定回饋 modal，並保留錯誤格紅色標記。
-    showFixedSemanticFeedbackModal(r, task_id);
+    showFirstSystemHint(r, task_id);
+    return;
+  }
+
+  if (
+    r?.ok &&
+    r?.is_correct === false &&
+    flow?.type === "system_recheck" &&
+    !["A", "B"].includes(submitFeedbackStrategy)
+  ) {
+    showSystemRecheck(r, task_id);
     return;
   }
 
@@ -3988,14 +4120,6 @@ async function submit() {
     r?.is_correct === false &&
     usesAiHintFlow
   ) {
-    const flow = submitHintFlow;
-
-    const attemptNo = Number(r?.attempt_no || 0);
-    const wrongAttemptCount = Number(
-      flow.wrong_attempt_count
-      ?? r?.wrong_attempt_count
-      ?? 0
-    );
     const aiHintRecoveryNeeded =
       flow.type === "system_recheck" &&
       flow.existing_ai_hint_available !== true &&
@@ -4040,6 +4164,7 @@ async function submit() {
   }
   } catch (e) {
     state.err = e?.message || "送出失敗";
+    state.errType = "submit_error";
     result.value = { is_correct: false, feedback: state.err };
 
     aiFeedbackDetail.value = null;
@@ -4235,14 +4360,7 @@ async function loadTask() {
 
       testMeta.total = Number(r?.total || 1);
       testMeta.current_index = Number(r?.current_index || testMeta.request_index || 1);
-      const norm = normalizeTaskPayload(r);
-      task.value = norm.taskObj;
-      poolBlocks.value = norm.pool;
-      teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
-      // 前後測不顯示中文提示：清空 label
-      templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
-
-      await bindBlankFocusHandlers();
+      await applyTestTaskPayload(r);
       await recordEnterParsonsTaskFromVideo();
       await recordTaskOpen();
       return;
@@ -4272,6 +4390,8 @@ async function loadTask() {
     poolBlocks.value = norm.pool;
     teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
     templateSlots.value = norm.slots;
+    previousCompletedAt.value = extractCompletionTime(r);
+    currentCompletedAt.value = "";
 
     // C 策略不得保留上一個 B 題目的 AI 狀態
     if (isCStrategy.value) {
@@ -4452,6 +4572,13 @@ watch(
   font-family: "Noto Sans TC", "Segoe UI", "PingFang TC", sans-serif;
 }
 
+.page-top-actions{
+  max-width: 980px;
+  margin: 0 auto 12px;
+  display: flex;
+  justify-content: flex-start;
+}
+
 .qbox{
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -4476,11 +4603,103 @@ watch(
   color: #0f172a;
 }
 
+.answer-time{
+  margin-top: 10px;
+  color: #047857;
+  font-size: 14px;
+  font-weight: 900;
+}
+
 .board{
   display: grid;
   grid-template-columns: 1.25fr 1fr;
   gap: 16px;
   margin-top: 16px;
+}
+
+.choice-board{
+  margin-top: 16px;
+}
+
+.choice-panel{
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 18px;
+  min-height: 360px;
+  background: var(--paper);
+  box-shadow: var(--shadow-soft);
+  animation: rise-in .32s ease both;
+}
+
+.choice-topline{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  color: #475569;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.choice-options{
+  display: grid;
+  gap: 12px;
+}
+
+.choice-option{
+  width: 100%;
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 10px 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: var(--radius-md);
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-weight: 900;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease, background .18s ease;
+}
+
+.choice-option:hover{
+  transform: translateY(-1px);
+  border-color: #0f5c84;
+  box-shadow: 0 12px 24px rgba(15, 92, 132, 0.12);
+}
+
+.choice-option.selected{
+  border-color: #0f5c84;
+  background: #eef9ff;
+  box-shadow: 0 0 0 3px rgba(15, 92, 132, 0.14);
+}
+
+.choice-key{
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.choice-option.selected .choice-key{
+  background: #0f5c84;
+  color: #ffffff;
+}
+
+.choice-text{
+  min-width: 0;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 .panel{
@@ -4555,7 +4774,7 @@ watch(
   position: relative;
   border: 2px dashed #8da2b8;
   border-radius: 14px;
-  padding: 12px 44px 12px 12px;
+  padding: 8px 44px 8px 8px;
   background: var(--paper-strong);
   min-height: 48px;
   display:flex;
@@ -4569,8 +4788,33 @@ watch(
   transform: translateY(-1px);
   box-shadow: 0 6px 14px rgba(15, 23, 42, 0.08);
 }
-.blank.over { border-color: var(--primary); background: #eef9ff; }
+.blank.over {
+  border-color: var(--primary);
+  background: #eef9ff;
+  box-shadow: 0 0 0 3px rgba(14, 165, 233, .16);
+}
 .blank.filled{ border-style: solid; border-color: #4f46e5; background: #eef0ff; }
+.filled-block{
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  /* border: 1px solid #c7d2fe; */
+  border-radius: 10px;
+  background: linear-gradient(180deg, #ffffff 0%, #eef2ff 100%);
+  box-shadow: 0 6px 14px rgba(79, 70, 229, .12);
+  cursor: grab;
+  user-select: none;
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+/* .filled-block:hover{
+  transform: translateY(-1px);
+  border-color: #818cf8;
+  box-shadow: 0 10px 18px rgba(79, 70, 229, .18);
+} */
+.filled-block:active{ cursor: grabbing; }
 .placeholder{ color:#777; font-weight: 800; }
 
 .remove{
@@ -4650,7 +4894,11 @@ watch(
   transform: translateY(-2px);
   box-shadow: 0 10px 20px rgba(15, 23, 42, 0.1);
 }
-.pill.used { opacity: 0.35; cursor: not-allowed; }
+.pill.used { opacity: 0.55; cursor: grab; }
+.pill.used:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 16px rgba(15, 23, 42, 0.08);
+}
 
 .actions{ display:flex; justify-content:center; gap:16px; margin-top:18px; }
 .btn{
@@ -4661,6 +4909,10 @@ watch(
   font-weight: 900;
   cursor: pointer;
   transition: transform .15s ease, box-shadow .15s ease, filter .15s ease;
+}
+.btn.back-page-btn{
+  min-width: 112px;
+  padding: 10px 14px;
 }
 .btn:hover:not(:disabled) {
   transform: translateY(-1px);
@@ -4709,7 +4961,7 @@ watch(
   padding: 4px 10px;
   background: #fee2e2;
   color: #7f1d1d;
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 900;
 }
 
@@ -5005,7 +5257,7 @@ watch(
 }
 
 .fb-text{
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 700;
   color: #0f172a;
   line-height: 1.6;
@@ -5033,27 +5285,8 @@ watch(
   background: #fff7ed;
   border: 1px solid #fed7aa;
   color: #7c2d12;
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 800;
-}
-
-.fb-review{
-  background: #f0f9ff;
-  border-color: #bae6fd;
-}
-
-.fb-time{
-  font-size: 18px;
-  font-weight: 900;
-  color: #0c4a6e;
-  letter-spacing: 0.4px;
-}
-
-.fb-focus{
-  margin-top: 8px;
-  font-size: 14px;
-  font-weight: 800;
-  color: #1e3a8a;
 }
 
 .fb-more{
@@ -5075,13 +5308,24 @@ watch(
 }
 
 .btn.ghost{
-  background: #e8edf3;
+  background: #dce5ef;
   color: #1f2937;
+  width: 150px;
 }
 
 @media (max-width: 900px) {
   .page { padding: 14px; }
   .qtext { font-size: 20px; }
+  .choice-panel { min-height: 0; padding: 14px; }
+  .choice-topline { align-items: flex-start; flex-direction: column; }
+  .choice-option {
+    grid-template-columns: 36px 1fr;
+    padding: 10px 12px;
+  }
+  .choice-key {
+    width: 30px;
+    height: 30px;
+  }
   .panel { min-height: 0; }
   .board{ grid-template-columns: 1fr; }
   .floating-ai-hint{

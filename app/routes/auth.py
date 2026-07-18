@@ -16,6 +16,10 @@ auth_bp = Blueprint("auth", __name__)
 def _utc_now():
     return datetime.now(timezone.utc)
 
+@auth_bp.get("/")
+def ldsafasdfogin():
+    return jsonify({"ok": True, "message": "Login endpoint is working."})
+
 
 @auth_bp.post("/login")
 def login():

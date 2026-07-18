@@ -15,6 +15,46 @@ def normalize_unit_key(unit):
     return re.sub(r"^A(?=U\d+)", "", raw, flags=re.I).strip()
 
 
+def _natural_text_key(value):
+    parts = re.split(r"(\d+)", str(value or "").strip().lower())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def unit_sort_key(unit, label=None):
+    raw = str(unit or "").strip()
+    key = normalize_unit_key(raw)
+    text = f"{raw} {key} {label or ''}".lower()
+
+    match = re.match(r"^U(\d+)(?:[-_ ]*([A-Za-z]+))?", key, flags=re.I)
+    if match:
+        unit_rank = int(match.group(1))
+        subtag = (match.group(2) or "").lower()
+    else:
+        is_io = (
+            "\u8f38\u5165\u8f38\u51fa" in text
+            or re.search(r"\binput[ /_-]*output\b", text, flags=re.I)
+            or re.search(r"\bio\b", text, flags=re.I)
+        )
+        unit_rank = 1 if is_io else 9999
+        subtag = ""
+
+    sub_rank = {
+        "io": 0,
+        "int": 1,
+        "if": 0,
+        "ifelse": 1,
+        "elif": 2,
+        "for": 0,
+        "loop": 1,
+    }.get(subtag, 50)
+    return (unit_rank, sub_rank, _natural_text_key(key or raw), _natural_text_key(label or ""))
+
+
+def sort_units(units, labels=None):
+    label_map = labels or {}
+    return sorted(list(units or []), key=lambda unit: unit_sort_key(unit, label_map.get(unit)))
+
+
 def default_unit_label(unit):
     raw = normalize_unit_key(unit)
     if not raw:
@@ -32,6 +72,8 @@ def default_unit_label(unit):
 
     if prefix == "U1" and subtag == "io":
         return "\u8f38\u5165\u8f38\u51fa"
+    if prefix == "U1" and subtag == "int":
+        return "\u6578\u503c\u904b\u7b97"
     if prefix == "U2":
         return "\u689d\u4ef6\u5224\u65b7"
     if prefix == "U3" and subtag == "for":

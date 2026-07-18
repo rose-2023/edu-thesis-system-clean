@@ -5,7 +5,12 @@ from datetime import datetime, timezone
 from flask import Blueprint, g, jsonify, request
 
 from app.db import db
-from app.avatar_utils import resolve_avatar_src
+from app.avatar_utils import (
+    DEFAULT_AVATAR_KEY,
+    DEFAULT_AVATAR_SRC,
+    DEFAULT_AVATAR_STYLE,
+    resolve_avatar_src,
+)
 from app.session_auth import require_active_session
 
 
@@ -50,20 +55,12 @@ AVATAR_GROUPS = [
         "group_label": "預設頭像",
         "avatars": [
             {
-                "avatar_key": "default_male",
-                "avatar_type": "emoji",
-                "avatar_src": "👨",
-                "avatar_style": "emoji",
+                "avatar_key": DEFAULT_AVATAR_KEY,
+                "avatar_type": "image",
+                "avatar_src": DEFAULT_AVATAR_SRC,
+                "avatar_style": DEFAULT_AVATAR_STYLE,
                 "avatar_license": None,
-                "label": "男生預設",
-            },
-            {
-                "avatar_key": "default_female",
-                "avatar_type": "emoji",
-                "avatar_src": "👩",
-                "avatar_style": "emoji",
-                "avatar_license": None,
-                "label": "女生預設",
+                "label": "預設頭像",
             },
         ],
     },

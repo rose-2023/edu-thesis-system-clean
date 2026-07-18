@@ -11,9 +11,14 @@ if __name__ == "__main__":
             "Waitress is required. Run: pip install -r requirements.txt"
         ) from exc
 
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "5000"))
+    threads = max(4, int(os.environ.get("WAITRESS_THREADS", "8")))
+    print(f"Starting backend on http://{host}:{port}", flush=True)
+
     serve(
         app,
-        host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", "5000")),
-        threads=max(4, int(os.environ.get("WAITRESS_THREADS", "8"))),
+        host=host,
+        port=port,
+        threads=threads,
     )

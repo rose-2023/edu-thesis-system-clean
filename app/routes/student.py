@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timezone
 from ..db import db
-from ..unit_labels import unit_label_map, unit_label
+from ..unit_labels import sort_units, unit_label_map, unit_label
 from ..avatar_utils import resolve_avatar_src
 from ..session_auth import current_participant_id, current_student_id
 import os
@@ -157,7 +157,8 @@ def units_progress():
         correct_video_ids = {str(x) for x in correct_video_ids if x is not None}
 
         units_out = []
-        for unit, vids in sorted(unit_videos.items(), key=lambda x: x[0]):
+        for unit in sort_units(unit_videos.keys(), labels):
+            vids = unit_videos.get(unit) or []
             total = len(vids)
             done = sum(1 for vid in vids if vid in correct_video_ids)
             progress = 0

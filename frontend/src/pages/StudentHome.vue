@@ -5,7 +5,6 @@
       <div class="leftProfile">
         <button
           class="avatar"
-          :class="`avatar-${studentSexj || 'unknown'}`"
           type="button"
           :aria-label="`${avatarLabel}，點擊更換頭像`"
           @click="openAvatarModal"
@@ -29,8 +28,8 @@
       </div>
 
       <div class="rightTools">
-        <div class="rightProgress cardPanel">
-          <div class="progressTitle">
+        <!-- <div class="rightProgress cardPanel"> -->
+          <!-- <div class="progressTitle">
             未完成課程：<span>{{ ongoingUnit }}</span> Parsons
           </div>
           <div class="dots">
@@ -40,7 +39,7 @@
               class="dot"
               :class="{ on: i <= doneDots }"
             ></span>
-          </div>
+          </div> -->
 
           <!-- ✅【新增】後測進度點點：與老師端「後測發布/取消發布」連動（同一份 test_control） -->
           <div class="postProgress">
@@ -56,7 +55,7 @@
               ></span>
             </div>
           </div>
-        </div>
+        <!-- </div> -->
 
         <button class="logoutBtn" @click="logout">
           登出
@@ -125,7 +124,7 @@
     <main class="main">
       <div class="pageIntro">
         <h1 class="title">單元列表</h1>
-        <p class="subtitle">請選擇要進入的學習單元，依序完成影片學習與 Parsons 練習。</p>
+        <p class="subtitle">請選擇要進入的學習單元，依序完成影片觀看與練習題。</p>
       </div>
 
       <div class="unitGrid">
@@ -210,7 +209,7 @@ import axios from "axios";
 import { logoutCurrentSession } from "../sessionAuth";
 
 // ✅ 固定打後端（避免相對路徑打到 Vite 5173 回傳 index.html => <!doctype html>）
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
+const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 const router = useRouter();
 
@@ -227,35 +226,36 @@ const avatarModalOpen = ref(false);
 const avatarOptionsLoading = ref(false);
 const avatarSaving = ref(false);
 const avatarError = ref("");
+const DEFAULT_AVATAR_SRC = "/static/avatars/person_edit.svg";
+const LEGACY_DEFAULT_AVATAR_KEYS = new Set(["default_male", "default_female"]);
 const currentAvatarEmoji = computed(() => {
-  if (avatarType.value === "emoji" && ["👨", "👩"].includes(avatarSrc.value)) {
-    return avatarSrc.value;
-  }
-  return studentSexj.value === "girl" || studentSexj.value === "女生" ? "👩" : "👨";
+  return "👤";
 });
 const currentAvatarImageUrl = computed(() => (
-  avatarType.value === "image" ? avatarAssetUrl(avatarSrc.value) : ""
+  avatarAssetUrl(avatarSrc.value || DEFAULT_AVATAR_SRC)
 ));
 const avatarLabel = computed(() => {
   if (currentAvatarImageUrl.value) return "學生圖片頭像";
-  if (currentAvatarEmoji.value === "👩") return "女學生頭像";
-  if (currentAvatarEmoji.value === "👨") return "男學生頭像";
   return "學生頭像";
 });
 
 function avatarAssetUrl(value) {
   const path = String(value || "").trim();
-  const allowedPath = /^\/static\/avatars\/(?:bot_0[1-6]|bottts(?:_neutral)?_0[1-6]|initial_face_0[1-6]|lorelei(?:_neutral)?_0[1-6]|notionists(?:_neutral)?_0[1-6]|avataaars(?:_neutral)?_0[1-6])\.svg$/;
+  const allowedPath = /^\/static\/avatars\/(?:person_edit|bot_0[1-6]|bottts(?:_neutral)?_0[1-6]|initial_face_0[1-6]|lorelei(?:_neutral)?_0[1-6]|notionists(?:_neutral)?_0[1-6]|avataaars(?:_neutral)?_0[1-6])\.svg$/;
   if (!allowedPath.test(path)) return "";
   return `${API_BASE.replace(/\/$/, "")}${path}`;
 }
 
 function applyAvatar(avatar) {
-  avatarType.value = avatar?.avatar_type || null;
-  avatarKey.value = avatar?.avatar_key || null;
-  avatarSrc.value = (
+  const key = avatar?.avatar_key || null;
+  const src = (
     avatar?.avatar_src || avatar?.avatar_url || avatar?.avatar_value || null
   );
+  avatarType.value = avatar?.avatar_type || (src ? "image" : null);
+  avatarKey.value = LEGACY_DEFAULT_AVATAR_KEYS.has(key)
+    ? "default_person"
+    : (key || (src === DEFAULT_AVATAR_SRC ? "default_person" : null));
+  avatarSrc.value = src;
 }
 
 async function loadAvatarOptions() {
@@ -320,7 +320,7 @@ async function selectAvatar(selectedAvatarKey) {
 const units = ref([]);
 
 // 右上角「進度點點」
-const totalDots = ref(12);
+const totalDots = ref(10);
 const doneDots = ref(0);
 
 // 顯示未完成課程（沿用舊 UI 字串）
@@ -381,6 +381,9 @@ function unitDisplayName(rawUnit) {
   if (prefix === "U1" && subTag === "io") {
     return "輸入輸出";
   }
+  if (prefix === "U1" && subTag === "int") {
+    return "數值運算";
+  }
 
   // 若原字串含中文尾綴（例如 U7-Function函數觀念解析），優先用中文尾綴
   if (tail) {
@@ -399,6 +402,40 @@ function unitDisplayName(rawUnit) {
     // U7: "函數觀念解析",
   };
   return nameMap[prefix] || String(rawUnit || "").trim();
+}
+
+function courseUnitOrder(rawUnit, unitLabel = "") {
+  const raw = String(rawUnit || "").trim().replace(/^A(?=U\d+)/i, "");
+  const m = raw.match(/^(U\d+)(?:[-_ ]*([A-Za-z]+))?/i);
+  const prefix = m?.[1]?.toUpperCase() || "";
+  const unitRankMatch = prefix.match(/^U(\d+)/i);
+  const unitRank = unitRankMatch ? Number(unitRankMatch[1]) : 9999;
+  const subTag = String(m?.[2] || "").toLowerCase();
+  const text = `${raw} ${unitLabel || ""}`.toLowerCase();
+  const subRankMap = {
+    io: 0,
+    int: 1,
+    if: 0,
+    ifelse: 1,
+    elif: 2,
+    for: 0,
+    loop: 1,
+  };
+  let subRank = subRankMap[subTag] ?? 50;
+  const isInputOutput =
+    text.includes("輸入輸出") ||
+    /\binput[ /_-]*output\b/i.test(text) ||
+    /\bio\b/i.test(text);
+  if (unitRank === 1 && (!subTag || isInputOutput)) subRank = 0;
+  return { unitRank, subRank, raw };
+}
+
+function compareCourseUnits(a, b) {
+  const orderA = courseUnitOrder(a.unit, a.name);
+  const orderB = courseUnitOrder(b.unit, b.name);
+  if (orderA.unitRank !== orderB.unitRank) return orderA.unitRank - orderB.unitRank;
+  if (orderA.subRank !== orderB.subRank) return orderA.subRank - orderB.subRank;
+  return orderA.raw.localeCompare(orderB.raw, "en", { numeric: true });
 }
 
 async function loadHomeData() {
@@ -420,17 +457,21 @@ async function loadHomeData() {
       return;
     }
 
-    // 1) units
+    // 1) units 卡片顏色設置
     // 後端會回：[{unit, progress, total_videos, done_videos}]
-    const themePool = ["blue", "green", "purple", "orange"];
+    const themePool = ["red","orange","green","blue","greenblue","purple"];
 
-    units.value = (data.units || []).map((u, idx) => ({
+    const sortedUnits = (data.units || []).map((u) => ({
       unit: u.unit,
       name: u.unit_label || u.name || unitDisplayName(u.unit),
       progress: Number(u.progress || 0),
       total_videos: Number(u.total_videos || 0),
+    })).filter((u) => u.total_videos > 0).sort(compareCourseUnits);
+
+    units.value = sortedUnits.map((u, idx) => ({
+      ...u,
       theme: themePool[idx % themePool.length],
-    })).filter((u) => u.total_videos > 0);
+    }));
 
     const firstOngoing = units.value.find((u) => Number(u.progress || 0) < 100);
     ongoingUnit.value = firstOngoing ? firstOngoing.name : "已完成";
@@ -592,7 +633,7 @@ onMounted(async () => {
   overflow: hidden;
   border-radius: 50%;
   place-items: center;
-  background: inherit;
+  background: #ebd491;
 }
 
 .avatarImg {
@@ -988,7 +1029,7 @@ onMounted(async () => {
   bottom: 18px;
   height: 8px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.6);
   overflow: hidden;
 }
 
@@ -999,20 +1040,26 @@ onMounted(async () => {
 }
 
 /* 顏色主題 */
-.unitCard.blue {
-  background: linear-gradient(135deg, #0b6aa6 0%, #0f86cf 100%);
-}
-
-.unitCard.green {
-  background: linear-gradient(135deg, #5fa371 0%, #74bf84 100%);
-}
-
-.unitCard.purple {
-  background: linear-gradient(135deg, #7b61c9 0%, #9a84e6 100%);
+.unitCard.red {
+  background: linear-gradient(135deg, #df765c 0%, #df765c 100%);
 }
 
 .unitCard.orange {
-  background: linear-gradient(135deg, #d9893b 0%, #f2a14f 100%);
+  background: linear-gradient(135deg, #da8c3f 0%, #f2a14f 100%);
+}
+
+.unitCard.green {
+  background: linear-gradient(135deg, #74bf84 0%, #74bf84 100%);
+}
+.unitCard.blue {
+  background: linear-gradient(130deg, #0f86cf 0%, #0f86cf 100%);
+}
+
+.unitCard.greenblue {
+  background: linear-gradient(135deg, #53afbb 0%, #53afbb 100%)
+}
+.unitCard.purple {
+  background: linear-gradient(135deg, #9a84e6 0%, #9a84e6 100%);
 }
 
 /* 後測卡片 */
@@ -1038,7 +1085,7 @@ onMounted(async () => {
 }
 
 .unitCard.post {
-  background: linear-gradient(135deg, #f8fafc 0%, #eef2f7 100%);
+  background: linear-gradient(135deg, #77b8f8 0%, #eef2f7 100%);
 }
 
 .unitCard.post .cardGlow {

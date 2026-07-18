@@ -273,6 +273,7 @@
                         <thead>
                           <tr>
                             <th>題目</th>
+                            <th class="center">來源</th>
                             <th class="center">狀態</th>
                             <th class="center">提交次數</th>
                             <th>最後作答</th>
@@ -285,6 +286,12 @@
                               <div class="progress-sub mono">{{ task.task_id || "-" }}</div>
                             </td>
                             <td class="center">
+                              <span class="source-badge" :class="taskSourceClass(task)">
+                                {{ formatTaskSource(task) }}
+                              </span>
+                              <div v-if="task.task_code" class="progress-sub mono">{{ task.task_code }}</div>
+                            </td>
+                            <td class="center">
                               <span class="status-badge" :class="statusClass(task.status)">
                                 {{ formatProgressStatus(task.status) }}
                               </span>
@@ -293,7 +300,7 @@
                             <td>{{ formatDateTime(task.last_submitted_at) }}</td>
                           </tr>
                           <tr v-if="expandedPracticeTasks(row).length === 0">
-                            <td class="empty" colspan="4">此單元目前沒有題目資料</td>
+                            <td class="empty" colspan="5">此單元目前沒有題目資料</td>
                           </tr>
                         </tbody>
                       </table>
@@ -360,6 +367,7 @@
                 <th>姓名</th>
                 <th>單元</th>
                 <th>題目</th>
+                <th class="center">來源</th>
                 <th class="center">作答輪次</th>
                 <th class="center">輪內次數</th>
                 <th class="center">結果</th>
@@ -378,6 +386,12 @@
                     <div class="cell-task-title">{{ row.task_title || row.task_id || "-" }}</div>
                     <div class="progress-sub mono">{{ row.task_id || "-" }}</div>
                   </td>
+                  <td class="center">
+                    <span class="source-badge" :class="taskSourceClass(row)">
+                      {{ formatTaskSource(row) }}
+                    </span>
+                    <div v-if="row.task_code" class="progress-sub mono">{{ row.task_code }}</div>
+                  </td>
                   <td class="center compact">{{ row.round_no || "-" }}</td>
                   <td class="center compact">{{ row.round_attempt_count || 0 }}</td>
                   <td class="center compact">
@@ -395,13 +409,13 @@
                   </td>
                 </tr>
                 <tr v-if="isHintJsonExpanded(row)" class="jsonExpandRow">
-                  <td colspan="10">
+                  <td colspan="11">
                     <pre class="jsonPreview">{{ formatJson(row.hint_summary || {}) }}</pre>
                   </td>
                 </tr>
               </template>
               <tr v-if="!loading && practiceTaskLatestRows.length === 0">
-                <td class="empty" colspan="10">目前沒有符合條件的學生題目進度資料</td>
+                <td class="empty" colspan="11">目前沒有符合條件的學生題目進度資料</td>
               </tr>
             </tbody>
           </table>
@@ -1023,9 +1037,15 @@
             <table class="dataTable analytics-table video-rewatch-table">
               <thead>
                 <tr>
-                  <th>觀看時間</th>
                   <th>學生 ID</th>
                   <th>姓名</th>
+                  <th class="center">跳轉方向</th>
+                  <th class="center">跳轉起點</th>
+                  <th class="center">跳轉終點</th>
+                  <th class="center">跳轉秒數</th>
+                  <th class="center">倒退回看</th>
+                  <th class="center">播放倍速</th>
+                  <th>觀看時間</th>
                   <th>影片</th>
                   <th>事件</th>
                   <th class="center">觀看秒數</th>
@@ -1033,14 +1053,22 @@
                   <th class="center">目前進度</th>
                   <th class="center">影片長度</th>
                   <th class="center">是否看完</th>
-                  <th>任務 ID</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="row in pagedVideoRewatchRecords" :key="row.log_id">
-                  <td class="compact">{{ formatTaipeiDateTime(row.event_at) }}</td>
                   <td class="mono">{{ row.student_id || "-" }}</td>
                   <td>{{ row.student_name || "-" }}</td>
+                  <td class="center compact">{{ formatSeekDirection(row.seek_direction) }}</td>
+                  <td class="center compact">{{ formatSeconds(row.seek_from_sec) }}</td>
+                  <td class="center compact">{{ formatSeconds(row.seek_to_sec) }}</td>
+                  <td class="center compact">{{ formatSignedSeconds(row.seek_delta_sec) }}</td>
+                  <td class="center compact">{{ row.is_backward_seek ? "是" : "-" }}</td>
+                  <td class="center compact">{{ formatPlaybackRate(row) }}</td>
+                  <td class="video-event-time-cell">
+                    <span>{{ formatVideoEventTimeParts(row.event_at).date }}</span>
+                    <span>{{ formatVideoEventTimeParts(row.event_at).time }}</span>
+                  </td>
                   <td>
                     <div class="cell-task-title" :title="row.video_title || row.video_id || '-'">
                       {{ row.video_title || row.video_id || "-" }}
@@ -1055,10 +1083,9 @@
                   <td class="center compact">{{ formatSeconds(row.current_time_sec) }}</td>
                   <td class="center compact">{{ formatSeconds(row.video_duration_sec) }}</td>
                   <td class="center compact">{{ row.reached_end || row.completed_fully ? "是" : "否" }}</td>
-                  <td class="mono">{{ row.task_id || "-" }}</td>
                 </tr>
                 <tr v-if="!loading && videoRewatchRecords.length === 0">
-                  <td class="empty" colspan="11">目前沒有符合條件的 video_rewatch_logs 紀錄。</td>
+                  <td class="empty" colspan="16">目前沒有符合條件的 video_rewatch_logs 紀錄。</td>
                 </tr>
               </tbody>
             </table>
@@ -1094,7 +1121,7 @@ import AnalyticsBarChart from "../components/AnalyticsBarChart.vue";
 import TeacherSidebar from "../components/TeacherSidebar.vue";
 import { formatTaipeiDateTime } from "../utils/dateTime.js";
 
-const API_BASE = (import.meta?.env?.VITE_API_BASE || "http://127.0.0.1:5000").replace(/\/$/, "");
+const API_BASE = (import.meta?.env?.VITE_API_BASE || "").replace(/\/$/, "");
 
 const modeOptions = [
   { value: "practice", label: "平時練習", activityType: "practice", testRole: null },
@@ -1499,6 +1526,45 @@ function formatSeconds(value) {
   return `${Math.round(n * 10) / 10}s`;
 }
 
+function formatVideoEventTimeParts(value) {
+  const text = formatTaipeiDateTime(value, "");
+  if (!text) return { date: "-", time: "" };
+  const [date, time = ""] = text.split(" ");
+  return { date, time };
+}
+
+function formatSignedSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "-";
+  const rounded = Math.round(n * 10) / 10;
+  return `${rounded > 0 ? "+" : ""}${rounded}s`;
+}
+
+const seekDirectionLabels = {
+  forward: "向前跳轉",
+  backward: "倒退回看",
+  minor_adjustment: "微調",
+};
+
+function formatSeekDirection(value) {
+  return seekDirectionLabels[String(value || "")] || "-";
+}
+
+function formatRate(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "-";
+  return `${Math.round(n * 100) / 100}x`;
+}
+
+function formatPlaybackRate(row) {
+  const from = row?.playback_rate_from;
+  const to = row?.playback_rate_to;
+  if (row?.event_type === "video_rate_change" && Number.isFinite(Number(from)) && Number.isFinite(Number(to))) {
+    return `${formatRate(from)} -> ${formatRate(to)}`;
+  }
+  return formatRate(row?.playback_rate_current ?? row?.playback_rate);
+}
+
 function formatErrorTypes(value) {
   if (!Array.isArray(value) || value.length === 0) return "-";
   return value.map((item) => `${item.type}(${item.count})`).join(", ");
@@ -1557,6 +1623,11 @@ Object.assign(eventTypeLabels, {
   second_hint_reminder_shown: "第二次提示提醒顯示",
   second_hint_reminder_clicked: "點擊第二次提示提醒",
   second_hint_reminder_ignored: "未查看第二次提示",
+});
+
+Object.assign(eventTypeLabels, {
+  video_seek: "影片跳轉",
+  video_rate_change: "倍速變更",
 });
 
 const metadataValueLabels = {
@@ -1812,6 +1883,24 @@ function formatPracticeResult(value) {
   if (value === "incorrect") return "錯誤";
   if (value === "not_started") return "未開始";
   return "-";
+}
+
+function normalizedTaskSource(row) {
+  return String(row?.source_type || row?.gen_source || "").trim().toLowerCase();
+}
+
+function formatTaskSource(row) {
+  const source = normalizedTaskSource(row);
+  if (source === "fixed" || source === "fixed_task") return "fixed";
+  if (source === "openai" || source === "ai" || source === "fallback") return "ai";
+  return "-";
+}
+
+function taskSourceClass(row) {
+  const source = normalizedTaskSource(row);
+  if (source === "fixed" || source === "fixed_task") return "fixed";
+  if (source === "openai" || source === "ai" || source === "fallback") return "ai";
+  return "unknown";
 }
 
 function toggleHintJson(row) {
@@ -2704,7 +2793,7 @@ onMounted(() => {
 
 .practice-matrix-table,
 .practice-latest-table {
-  min-width: 1040px;
+  min-width: 1120px;
 }
 
 .matrixCellBtn {
@@ -2764,7 +2853,7 @@ onMounted(() => {
 }
 
 .compact-inner-table {
-  min-width: 640px;
+  min-width: 720px;
 }
 
 .inlineActionBtn {
@@ -2826,6 +2915,33 @@ onMounted(() => {
   color: #475569;
   background: #f1f5f9;
   border: 1px solid #cbd5e1;
+}
+
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 900;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.source-badge.fixed {
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+  background: #dbeafe;
+}
+
+.source-badge.ai {
+  color: #854d0e;
+  border-color: #fde68a;
+  background: #fef3c7;
 }
 
 .progress-sub {
@@ -3153,6 +3269,16 @@ onMounted(() => {
 .event-badge {
   background: #eff6ff;
   color: #1d4ed8;
+}
+
+.video-event-time-cell {
+  min-width: 118px;
+  white-space: nowrap;
+}
+
+.video-event-time-cell span {
+  display: block;
+  line-height: 1.35;
 }
 
 .slot-list {

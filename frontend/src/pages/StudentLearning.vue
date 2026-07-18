@@ -4,8 +4,7 @@
       <div class="topbar-left">
         <div class="brand-dot"></div>
         <div class="topbar-texts">
-          <div class="title">單元列表</div>
-          <div class="subtitle">{{ currentUnitLabel || displayUnitName(currentUnit) }}<span v-if="currentTitle">：{{ currentTitle }}</span></div>
+          <div class="title">單元列表{{ currentUnitLabel || displayUnitName(currentUnit) }}<span v-if="currentTitle">：{{ currentTitle }}</span></div>
         </div>
       </div>
 
@@ -83,7 +82,9 @@
             :key="selectedVideoId"
             class="player"
             controls
+            controlsList="nodownload"
             :src="selectedVideo.videoUrl"
+            @contextmenu.prevent
           >
             <track
               v-if="subtitleTrackUrl"
@@ -93,7 +94,7 @@
               :src="subtitleTrackUrl"
             />
           </video>
-          <div v-if="activeSubtitleText" class="subtitleOverlay">
+          <div v-if="activeSubtitleText && !nativeSubtitleVisible" class="subtitleOverlay">
             {{ activeSubtitleText }}
           </div>
         </div>
@@ -115,10 +116,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter, useRoute } from "vue-router";
-import { computed } from "vue";
-import { onBeforeUnmount } from "vue";
 import { logoutCurrentSession } from "../sessionAuth";
 
 const router = useRouter();
@@ -130,8 +129,8 @@ const watchStartAt = ref(null);
 const reachedEnd = ref(false);
 const watchSeconds = ref(0);
 
-let lastCurrentTime = 0;
-let autoSaveTimer = null; // ✅【新增】每 5 秒送一次
+const RESUME_END_TOLERANCE_SEC = 3;
+
 let hasSentReached = false; // ✅【新增】避免 reached_end 重複送
 
 // ✅【修正】用「影片時間差」累積實際觀看秒數（比 setInterval 穩定、也能避免背景分頁被節流）
@@ -139,6 +138,11 @@ let _watchBound = false;
 let _lastVideoTime = null; // 上一次 timeupdate 的 currentTime
 let _lastSentWatchSeconds = 0;
 let _watchSessionId = "";
+let _previousPlaybackRate = 1;
+let _seekFromSec = null;
+let _suppressNextPauseLog = false;
+let _suppressNextSeekLog = false;
+let _leaveSentForCurrentVideo = false;
 
 function newWatchSessionId() {
   try {
@@ -153,10 +157,6 @@ function _resetWatchAccumulators() {
 }
 
 function resetWatchCounters() {
-  if (autoSaveTimer) {
-    clearInterval(autoSaveTimer);
-    autoSaveTimer = null;
-  }
   watchStartAt.value = null;
   reachedEnd.value = false;
   watchSeconds.value = 0;
@@ -167,7 +167,28 @@ function resetWatchCounters() {
 
 function resetWatchSession() {
   _watchSessionId = newWatchSessionId();
+  _leaveSentForCurrentVideo = false;
+  _previousPlaybackRate = 1;
+  _seekFromSec = null;
+  _suppressNextPauseLog = false;
+  _suppressNextSeekLog = false;
   resetWatchCounters();
+}
+
+function isNaturalPlaybackEnd(el) {
+  if (!el) return false;
+  if (reachedEnd.value) return true;
+  const duration = Number(el.duration);
+  const currentTime = Number(el.currentTime || 0);
+  return Number.isFinite(duration) && duration > 0 && currentTime >= duration - 0.5;
+}
+
+function pauseCurrentVideo({ logPause = true } = {}) {
+  const el = player.value;
+  if (!el || el.paused) return;
+
+  _suppressNextPauseLog = !logPause;
+  el.pause();
 }
 
 function _bindPlayerWatchEvents() {
@@ -181,6 +202,9 @@ function _bindPlayerWatchEvents() {
   el.addEventListener("loadedmetadata", () => {
     updateActiveSubtitle(el.currentTime || 0);
     syncNativeSubtitleMode();
+
+    // 保存目前影片初始播放速度，作為後續倍速變更的 from。
+    _previousPlaybackRate = Number(el.playbackRate || 1);
   });
 
   el.addEventListener("webkitbeginfullscreen", () => {
@@ -194,47 +218,87 @@ function _bindPlayerWatchEvents() {
   });
 
   el.addEventListener("play", () => {
+    _leaveSentForCurrentVideo = false;
+    _suppressNextPauseLog = false;
+    const duration = Number(el.duration);
+    const currentTime = Number(el.currentTime || 0);
+    if (
+      reachedEnd.value &&
+      Number.isFinite(duration) &&
+      duration > 0 &&
+      currentTime < duration - 0.5
+    ) {
+      reachedEnd.value = false;
+      hasSentReached = false;
+    }
     if (!watchStartAt.value) watchStartAt.value = new Date().toISOString();
     // 以目前播放位置作為起點
     _lastVideoTime = el.currentTime;
     sendWatchLog("video_play");
-
-    // ✅【新增】播放時啟動自動送
-    if (!autoSaveTimer) {
-      autoSaveTimer = setInterval(() => {
-        sendWatchLog("video_progress");
-      }, 5000);
-    }
   });
 
   el.addEventListener("pause", () => {
     _lastVideoTime = el.currentTime;
-    if (!reachedEnd.value) {
+    if (_suppressNextPauseLog) {
+      _suppressNextPauseLog = false;
+    } else if (!isNaturalPlaybackEnd(el)) {
       sendWatchLog("video_pause");
-    }
-    // ✅【新增】暫停就停止自動送（省資源）
-    if (autoSaveTimer) {
-      clearInterval(autoSaveTimer);
-      autoSaveTimer = null;
     }
   });
 
-  // 使用者拖曳進度條（seek）時，不計入「連續觀看」秒數，直接重設起點
+  el.addEventListener("ratechange", () => {
+    const nextPlaybackRate = Number(el.playbackRate || 1);
+    const previousPlaybackRate = Number(_previousPlaybackRate || 1);
+
+    // 相同速度不重複記錄。
+    if (Math.abs(nextPlaybackRate - previousPlaybackRate) < 0.001) {
+      return;
+    }
+
+    sendWatchLog("video_rate_change", {
+      playback_rate_from: previousPlaybackRate,
+      playback_rate_to: nextPlaybackRate,
+    });
+
+    _previousPlaybackRate = nextPlaybackRate;
+  });
+
+  // seeking 發生時 currentTime 通常已經是新位置，因此先保留拖曳前位置。
   el.addEventListener("seeking", () => {
-    _lastVideoTime = el.currentTime;
+    if (_seekFromSec == null) {
+      _seekFromSec = Number.isFinite(Number(_lastVideoTime))
+        ? Number(_lastVideoTime)
+        : Number(el.currentTime || 0);
+    }
     updateActiveSubtitle(el.currentTime || 0);
+  });
+
+  el.addEventListener("seeked", () => {
+    const seekToSec = Number(el.currentTime || 0);
+    const seekFromSec = Number(_seekFromSec);
+    _lastVideoTime = seekToSec;
+    _seekFromSec = null;
+
+    if (_suppressNextSeekLog) {
+      _suppressNextSeekLog = false;
+    } else if (Number.isFinite(seekFromSec) && Number.isFinite(seekToSec)) {
+      sendWatchLog("video_seek", {
+        seek_from_sec: seekFromSec,
+        seek_to_sec: seekToSec,
+      });
+    }
   });
 
   el.addEventListener("ended", () => {
     reachedEnd.value = true;
+    _suppressNextPauseLog = true;
     activeSubtitleText.value = "";
     _lastVideoTime = null;
-    if (autoSaveTimer) {
-      clearInterval(autoSaveTimer);
-      autoSaveTimer = null;
-    }
     // 看完就先送一次（不等離開頁面）
-    sendWatchLog("video_ended");
+    if (!hasSentReached) {
+      hasSentReached = true;
+      sendWatchLog("video_ended");
+    }
   });
 
   el.addEventListener("timeupdate", () => {
@@ -267,7 +331,7 @@ function _bindPlayerWatchEvents() {
   });
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:5000";
+const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 const units = ref([]);
 const openIndex = ref(0);
@@ -285,8 +349,10 @@ const subtitleLoading = ref(false);
 const subtitleError = ref("");
 const subtitleTrackUrl = ref("");
 const isNativeSubtitleFullscreen = ref(false);
+const nativeSubtitleVisible = ref(false);
 
 const player = ref(null);
+let nativeTextTrackList = null;
 
 const bullets = ref([
   "（示意）這裡未來可以放 AI 摘要/錯誤原因",
@@ -343,6 +409,7 @@ function displayUnitName(rawUnit) {
     if (subTag === "elif") return "elif 條件判斷";
   }
   if (prefix === "U1" && subTag === "io") return "輸入輸出";
+  if (prefix === "U1" && subTag === "int") return "數值運算";
 
   if (tail) {
     const cleanTail = tail.replace(/^[-_\s]+/, "").trim();
@@ -359,6 +426,45 @@ function displayUnitName(rawUnit) {
     // U7: "函數觀念解析",
   };
   return nameMap[prefix] || raw;
+}
+
+function courseUnitOrder(rawUnit, unitLabel = "") {
+  const raw = _normalizeRawUnit(rawUnit);
+  const key = _normalizeUnitKey(raw);
+  const text = `${raw} ${key} ${unitLabel || ""}`.toLowerCase();
+  const match = key.match(/^U(\d+)(?:[-_\s]*([a-z]+))?/i);
+  const unitRank = match ? Number(match[1]) : 9999;
+  const subTag = String(match?.[2] || "").toLowerCase();
+  const isInputOutput =
+    text.includes("\u8f38\u5165\u8f38\u51fa") ||
+    /\binput[ /_-]*output\b/i.test(text) ||
+    /\bio\b/i.test(text);
+
+  const subRankMap = {
+    io: 0,
+    int: 1,
+    if: 0,
+    ifelse: 1,
+    elif: 2,
+    for: 0,
+    loop: 1,
+  };
+  let subRank = subRankMap[subTag] ?? 50;
+  if (unitRank === 1 && (!subTag || isInputOutput)) subRank = 0;
+
+  return { unitRank, subRank };
+}
+
+function compareCourseUnits(a, b) {
+  const orderA = courseUnitOrder(a.unitKey || a.unit, a.unitLabel);
+  const orderB = courseUnitOrder(b.unitKey || b.unit, b.unitLabel);
+  if (orderA.unitRank !== orderB.unitRank) return orderA.unitRank - orderB.unitRank;
+  if (orderA.subRank !== orderB.subRank) return orderA.subRank - orderB.subRank;
+  return String(a.unitKey || a.unit || "").localeCompare(
+    String(b.unitKey || b.unit || ""),
+    "en",
+    { numeric: true }
+  );
 }
 
 const segmentLabel = computed(() => {
@@ -387,9 +493,7 @@ function groupByUnit(videos) {
       unit_label: label,
     });
   }
-  return [...map.values()].sort((a, b) =>
-    (a.unitKey || a.unit).localeCompare((b.unitKey || b.unit), "en", { numeric: true })
-  );
+  return [...map.values()].sort(compareCourseUnits);
 }
 
 function parseSubtitleTime(raw) {
@@ -465,7 +569,10 @@ function setSubtitleTrack(cues) {
   if (!Array.isArray(cues) || !cues.length) return;
   const blob = new Blob([buildVttFromCues(cues)], { type: "text/vtt;charset=utf-8" });
   subtitleTrackUrl.value = URL.createObjectURL(blob);
-  nextTick(() => syncNativeSubtitleMode());
+  nextTick(() => {
+    bindNativeSubtitleModeListener();
+    syncNativeSubtitleMode();
+  });
 }
 
 function updateActiveSubtitle(currentTime) {
@@ -487,13 +594,51 @@ function isPlayerFullscreen() {
     || document.msFullscreenElement === el;
 }
 
+function updateNativeSubtitleVisibility() {
+  const el = player.value;
+  if (!el?.textTracks?.length) {
+    nativeSubtitleVisible.value = false;
+    return;
+  }
+  nativeSubtitleVisible.value = Array.from(el.textTracks).some((track) => {
+    const kind = String(track.kind || "").toLowerCase();
+    return (kind === "subtitles" || kind === "captions") && track.mode === "showing";
+  });
+}
+
+function unbindNativeSubtitleModeListener() {
+  if (nativeTextTrackList?.removeEventListener) {
+    nativeTextTrackList.removeEventListener("change", updateNativeSubtitleVisibility);
+  }
+  nativeTextTrackList = null;
+}
+
+function bindNativeSubtitleModeListener() {
+  const nextTrackList = player.value?.textTracks || null;
+  if (nativeTextTrackList === nextTrackList) {
+    updateNativeSubtitleVisibility();
+    return;
+  }
+
+  unbindNativeSubtitleModeListener();
+  nativeTextTrackList = nextTrackList;
+  if (nativeTextTrackList?.addEventListener) {
+    nativeTextTrackList.addEventListener("change", updateNativeSubtitleVisibility);
+  }
+  updateNativeSubtitleVisibility();
+}
+
 function syncNativeSubtitleMode(forceVisible = null) {
   const el = player.value;
-  if (!el?.textTracks?.length) return;
+  if (!el?.textTracks?.length) {
+    nativeSubtitleVisible.value = false;
+    return;
+  }
   const visible = forceVisible === null ? isNativeSubtitleFullscreen.value : Boolean(forceVisible);
   for (const track of Array.from(el.textTracks)) {
     track.mode = visible ? "showing" : "hidden";
   }
+  updateNativeSubtitleVisibility();
 }
 
 function handleFullscreenChange() {
@@ -501,11 +646,25 @@ function handleFullscreenChange() {
   syncNativeSubtitleMode();
 }
 
+function handleVisibilityChange() {
+  // 學生切換分頁、最小化瀏覽器或跳到其他 App 時立即暫停。
+  if (document.hidden) {
+    pauseCurrentVideo({ logPause: true });
+  }
+}
+
+function handlePageHide() {
+  // 關閉分頁、重新整理或離開網站時保底；sendWatchLog 使用 keepalive。
+  sendVideoLeaveOnce();
+}
+
 async function loadSubtitleForVideo(video) {
   subtitleCues.value = [];
   activeSubtitleText.value = "";
   subtitleError.value = "";
   isNativeSubtitleFullscreen.value = false;
+  nativeSubtitleVisible.value = false;
+  unbindNativeSubtitleModeListener();
   clearSubtitleTrackUrl();
 
   const vid = videoKey(video);
@@ -538,24 +697,157 @@ async function loadSubtitleForVideo(video) {
   }
 }
 
-function selectVideo(u, v) {
-  if (selectedVideoId.value) {
-    sendWatchLog("video_leave");
+function resumeStorageKey(videoId) {
+  const sid = String(
+    localStorage.getItem("student_id")
+      || localStorage.getItem("studentId")
+      || localStorage.getItem("participant_id")
+      || "anonymous"
+  ).trim();
+  return `video_resume:${sid}:${String(videoId || "").trim()}`;
+}
+
+function readLocalResumePosition(videoId) {
+  try {
+    const raw = localStorage.getItem(resumeStorageKey(videoId));
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw);
+    const seconds = Number(parsed?.current_time_sec);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  } catch (_) {
+    return 0;
   }
+}
+
+function saveLocalResumePosition(payload) {
+  // 錯誤片段回看不應覆蓋學生原本的完整影片進度。
+  if (route.query.start != null) return;
+
+  const videoId = String(payload?.video_id || "").trim();
+  if (!videoId) return;
+
+  const storageKey = resumeStorageKey(videoId);
+  const currentTime = Number(payload?.current_time_sec);
+  const duration = Number(payload?.video_duration_sec);
+  const completed = payload?.event_type === "video_ended"
+    || payload?.reached_end === true
+    || (
+      Number.isFinite(currentTime)
+      && Number.isFinite(duration)
+      && duration > 0
+      && currentTime >= duration - RESUME_END_TOLERANCE_SEC
+    );
+
+  try {
+    if (completed) {
+      localStorage.removeItem(storageKey);
+      return;
+    }
+    if (Number.isFinite(currentTime) && currentTime > 0) {
+      localStorage.setItem(storageKey, JSON.stringify({
+        current_time_sec: currentTime,
+        updated_at: new Date().toISOString(),
+      }));
+    }
+  } catch (_) {}
+}
+
+async function fetchResumePosition(videoId) {
+  const fallback = readLocalResumePosition(videoId);
+  try {
+    const token = String(localStorage.getItem("token") || "").trim();
+    const headers = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const qs = new URLSearchParams({ video_id: String(videoId) });
+    const response = await fetch(`${API_BASE}/api/video_rewatch_logs/resume?${qs.toString()}`, {
+      headers,
+    });
+    if (!response.ok) return fallback;
+    const data = await response.json();
+    const seconds = Number(data?.resume_sec);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+async function restoreResumePosition(videoId) {
+  if (!videoId || route.query.start != null) return;
+  const resumeSec = await fetchResumePosition(videoId);
+  if (!Number.isFinite(resumeSec) || resumeSec <= 0) return;
+  if (String(selectedVideoId.value || "") !== String(videoId)) return;
+
+  await nextTick();
+  const el = player.value;
+  if (!el) return;
+
+  const applyPosition = () => {
+    if (String(selectedVideoId.value || "") !== String(videoId)) return;
+    const duration = Number(el.duration);
+    if (Number.isFinite(duration) && resumeSec >= duration - RESUME_END_TOLERANCE_SEC) return;
+    _suppressNextSeekLog = true;
+    el.currentTime = resumeSec;
+    _lastVideoTime = resumeSec;
+    updateActiveSubtitle(resumeSec);
+  };
+
+  if (el.readyState >= 1) applyPosition();
+  else el.addEventListener("loadedmetadata", applyPosition, { once: true });
+}
+
+async function syncSelectedVideoRoute(videoId, unitValue) {
+  if (!videoId || route.query.start != null) return;
+  const query = {
+    unit_id: String(unitValue || ""),
+    from_video_id: String(videoId),
+  };
+  await router.replace({
+    path: `/learn/video/${videoId}`,
+    query,
+  });
+}
+
+async function sendVideoLeaveOnce() {
+  if (!selectedVideoId.value || _leaveSentForCurrentVideo) return;
+  _leaveSentForCurrentVideo = true;
+  pauseCurrentVideo({ logPause: false });
+  await sendWatchLog("video_leave");
+}
+
+async function selectVideo(u, v, options = {}) {
+  const { syncRoute = true, restoreResume = true } = options;
+  const nextVideoId = String(v?._id || v?.id || v?.video_id || "").trim();
+  if (!nextVideoId) return;
+
+  if (selectedVideo.value && String(selectedVideoId.value || "") === nextVideoId) {
+    if (syncRoute) await syncSelectedVideoRoute(nextVideoId, u.unit);
+    return;
+  }
+
+  if (selectedVideoId.value && String(selectedVideoId.value) !== nextVideoId) {
+    await sendVideoLeaveOnce();
+  }
+
   selectedVideo.value = v;
-  selectedVideoId.value = v._id || v.id || v.video_id;
+  selectedVideoId.value = nextVideoId;
   currentUnit.value = u.unit;
   currentUnitLabel.value = u.unitLabel || v.unit_label || displayUnitName(u.unit);
   currentTitle.value = v.title;
   resetWatchSession();
   loadSubtitleForVideo(v);
-  sendWatchLog("video_click");
 
   // ✅ 每次切換影片都重新綁定一次監聽（新的 <video> 會重新渲染）
   _watchBound = false;
-  nextTick(() => {
-    _bindPlayerWatchEvents();
-  });
+  await nextTick();
+  _bindPlayerWatchEvents();
+  sendWatchLog("video_click");
+
+  if (syncRoute) {
+    await syncSelectedVideoRoute(nextVideoId, u.unit);
+  }
+  if (restoreResume) {
+    await restoreResumePosition(nextVideoId);
+  }
 }
 
 function videoKey(v) {
@@ -671,16 +963,30 @@ async function goParsons() {
     alert("請先從左側選擇一部影片");
     return;
   }
-  await sendWatchLog("video_leave");
+  const selectedId = String(selectedVideoId.value || route.params.videoId || "");
+  const reviewAttemptId = String(route.query.attempt_id || "");
+  await sendVideoLeaveOnce();
   const toTaskId = firstRelatedTaskId();
   await logLearningTransition("click_next_to_practice", {
     to_task_id: toTaskId,
   });
+
+  // 先把瀏覽紀錄中的學習頁改成目前影片；之後按上一頁才不會回到單元第一部。
+  if (!showReturnBar.value) {
+    await router.replace({
+      path: `/learn/video/${selectedId}`,
+      query: {
+        unit_id: currentUnit.value || selectedVideo.value?.unit || "",
+        from_video_id: selectedId,
+      },
+    });
+  }
+
   router.push({
-    path: `/parsons/${selectedVideoId.value || route.params.videoId}`,
+    path: `/parsons/${selectedId}`,
     query: {
-      review_attempt_id: String(route.query.attempt_id || ""),
-      from_video_id: String(selectedVideoId.value || route.params.videoId || ""),
+      review_attempt_id: reviewAttemptId,
+      from_video_id: selectedId,
       from_video_title: currentTitle.value || selectedVideo.value?.title || "",
       unit_id: currentUnit.value || selectedVideo.value?.unit || "",
       watch_session_id: _watchSessionId,
@@ -690,12 +996,12 @@ async function goParsons() {
 }
 
 async function goHome() {
-  await sendWatchLog("video_leave");
+  await sendVideoLeaveOnce();
   router.push("/home");
 }
 
 async function logout() {
-  await sendWatchLog("video_leave");
+  await sendVideoLeaveOnce();
   await logoutCurrentSession(API_BASE);
   router.replace("/login");
 }
@@ -713,6 +1019,7 @@ async function seekToSegment(start, end) {
       // ✅【新增】每次開始回看片段前，重置回看統計（避免上一段殘留）
       resetWatchCounters();
 
+      _suppressNextSeekLog = true;
       el.currentTime = start;
       el.play?.();
 
@@ -773,6 +1080,8 @@ onMounted(async () => {
   await nextTick();
   document.addEventListener("fullscreenchange", handleFullscreenChange);
   document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("pagehide", handlePageHide);
   await loadCompletedVideoIds();
 
   // ✅ 注意：影片 <video> 會在選到影片後才出現，所以監聽會在 selectVideo() 裡 nextTick 後綁定
@@ -791,25 +1100,57 @@ onMounted(async () => {
     && v.is_deleted !== true
   ));
 
-  function resolveFileUrl(p, kind = "") {
-    if (!p) return "";
-    const s = String(p).trim();
+  function resolveFileUrl(path, kind = "") {
+  if (!path) return "";
 
-    // 已經是完整網址
-    if (/^https?:\/\//i.test(s)) return s;
+  let value = String(path)
+    .trim()
+    .replace(/\\/g, "/");
 
-    // 縮圖特別處理：後端 DB 存 thumbnails/xxx.jpg，但實際可讀路徑是 uploads/thumbnails/xxx.jpg
-    if (kind === "thumbnail") {
-      if (s.startsWith("/uploads/")) return `${API_BASE}${s}`;
-      if (s.startsWith("uploads/")) return `${API_BASE}/${s}`;
-      if (s.startsWith("/thumbnails/")) return `${API_BASE}/uploads${s}`;
-      if (s.startsWith("thumbnails/")) return `${API_BASE}/uploads/${s}`;
+  // 舊資料若曾儲存 localhost 或 127.0.0.1，
+  // 不再使用舊網域，只保留其路徑
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+
+      if (
+        url.hostname === "127.0.0.1" ||
+        url.hostname === "localhost"
+      ) {
+        value = url.pathname;
+      } else {
+        // 真正的外部 HTTPS 影片網址
+        return value;
+      }
+    } catch {
+      return "";
     }
-
-    // 一般檔案
-    if (s.startsWith("/")) return `${API_BASE}${s}`;
-    return `${API_BASE}/${s}`;
   }
+
+  // 清除開頭斜線
+  value = value.replace(/^\/+/, "");
+
+  // 縮圖在資料庫可能存成 thumbnails/xxx.jpg
+  if (
+    kind === "thumbnail" &&
+    value.startsWith("thumbnails/")
+  ) {
+    value = `uploads/${value}`;
+  }
+
+  // 後端上傳檔案的實際路由
+  if (value.startsWith("uploads/")) {
+    return `${API_BASE}/api/admin_upload/${value}`;
+  }
+
+  // 已經是 API 路徑
+  if (value.startsWith("api/")) {
+    return `${API_BASE}/${value}`;
+  }
+
+  return `${API_BASE}/api/admin_upload/uploads/${value}`;
+}
+
 
   let normalized = filtered.map((v) => ({
     ...v,
@@ -831,7 +1172,12 @@ onMounted(async () => {
   await loadCompletedVideoIds();
 
   // ✅ 方案 B：如果是 /learn/video/:videoId
-  const routeVid = route.params.videoId ? String(route.params.videoId) : "";
+  const routeVid = String(
+    route.params.videoId
+      || route.query.from_video_id
+      || route.query.video_id
+      || ""
+  );
   if (routeVid) {
     // 找到該影片
     let foundU = null;
@@ -860,7 +1206,10 @@ onMounted(async () => {
           openIndex.value = 0;
         }
       }
-      selectVideo(foundU, foundV);
+      await selectVideo(foundU, foundV, {
+        syncRoute: false,
+        restoreResume: route.query.start == null,
+      });
       await seekToSegment(start, end);
       return;
     }
@@ -873,7 +1222,10 @@ onMounted(async () => {
     const idx = units.value.findIndex((u) => _normalizeUnitKey(u.unit) === targetKey || String(u.unit).trim() === String(unitParam).trim());
     if (idx >= 0 && units.value[idx].videos.length) {
       openIndex.value = idx;
-      selectVideo(units.value[idx], units.value[idx].videos[0]);
+      await selectVideo(units.value[idx], units.value[idx].videos[0], {
+        syncRoute: false,
+        restoreResume: route.query.start == null,
+      });
       // /learn/:unit 也可支援 query start/end（可有可無）
       await seekToSegment(start, end);
       return;
@@ -883,12 +1235,16 @@ onMounted(async () => {
   // fallback：沒有 unit、也找不到 videoId，就選第一部
   if (units.value.length && units.value[0].videos.length) {
     openIndex.value = 0;
-    selectVideo(units.value[0], units.value[0].videos[0]);
+    await selectVideo(units.value[0], units.value[0].videos[0], {
+      syncRoute: false,
+      restoreResume: route.query.start == null,
+    });
     await seekToSegment(start, end);
   }
 });
 
-async function sendWatchLog(eventType = "video_progress") {
+async function sendWatchLog(eventType, extra = {}) {
+  if (!eventType) return;
   const vid = selectedVideoId.value
     ? String(selectedVideoId.value)
     : (route.params.videoId ? String(route.params.videoId) : "");
@@ -897,8 +1253,6 @@ async function sendWatchLog(eventType = "video_progress") {
   const el = player.value;
   const watchTotal = Math.round(Number(watchSeconds.value || 0));
   const watchDelta = Math.max(0, watchTotal - Math.round(Number(_lastSentWatchSeconds || 0)));
-  if (eventType === "video_progress" && watchDelta <= 0 && !reachedEnd.value) return;
-
   const payload = {
     event_type: eventType,
     video_id: vid,
@@ -913,14 +1267,23 @@ async function sendWatchLog(eventType = "video_progress") {
     watch_delta_sec: watchDelta,
     current_time_sec: el ? Number(el.currentTime || 0) : null,
     video_duration_sec: el && Number.isFinite(Number(el.duration)) ? Number(el.duration) : null,
-    playback_rate: el ? Number(el.playbackRate || 1) : 1,
+    playback_rate: {
+      current: el ? Number(el.playbackRate || 1) : 1,
+      from: extra.playback_rate_from ?? null,
+      to: extra.playback_rate_to ?? null,
+    },
     reached_end: Boolean(reachedEnd.value),
     watch_start_at: watchStartAt.value,
     watch_end_at: new Date().toISOString(),
     event_at: new Date().toISOString(),
     page: "student_learning",
     route_path: route.fullPath,
+    seek_from_sec: extra.seek_from_sec ?? null,
+    seek_to_sec: extra.seek_to_sec ?? null,
   };
+
+  // 即使網路暫時失敗，同一瀏覽器仍可恢復上次位置。
+  saveLocalResumePosition(payload);
 
   try {
     const token = String(localStorage.getItem("token") || "").trim();
@@ -947,17 +1310,16 @@ async function sendWatchLog(eventType = "video_progress") {
 onBeforeUnmount(() => {
   document.removeEventListener("fullscreenchange", handleFullscreenChange);
   document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("pagehide", handlePageHide);
+  unbindNativeSubtitleModeListener();
   clearSubtitleTrackUrl();
-  if (autoSaveTimer) {
-    clearInterval(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  sendWatchLog("video_leave");
+  sendVideoLeaveOnce();
 });
 
 // 返回練習」按鈕 backToPractice() 裡也先送再跳
 async function backToPractice() {
-  await sendWatchLog("video_leave");
+  await sendVideoLeaveOnce();
   router.push({
     path: `/parsons/${selectedVideoId.value || route.params.videoId}`,
     query: {
@@ -965,87 +1327,6 @@ async function backToPractice() {
     },
   });
 }
-
-// ==============================
-// ✅【新增】播放監聽主邏輯
-// ==============================
-function bindVideoWatchEvents() {
-  const v = videoRef.value;
-  if (!v) return;
-
-  v.addEventListener("play", () => {
-    if (!watchStartAt.value) {
-      watchStartAt.value = new Date().toISOString();
-    }
-
-    lastCurrentTime = v.currentTime;
-
-    // ✅ 啟動每 5 秒自動送一次
-    startAutoSave();
-  });
-
-  v.addEventListener("pause", () => {
-    stopAutoSave();
-  });
-
-  v.addEventListener("timeupdate", () => {
-    const delta = v.currentTime - lastCurrentTime;
-
-    if (delta > 0 && delta < 5) {
-      watchSeconds.value += delta;
-    }
-
-    lastCurrentTime = v.currentTime;
-
-    // ✅ 播到 end 秒
-    const end = Number(route.query.end || 0);
-    if (!hasSentReached && end && v.currentTime >= end - 0.2) {
-      reachedEnd.value = true;
-      hasSentReached = true;
-      sendWatchToServer(); // 立刻送一次
-    }
-  });
-}
-
-// ==============================
-// ✅【新增】每 5 秒自動送資料
-// ==============================
-function startAutoSave() {
-  if (autoSaveTimer) return;
-
-  autoSaveTimer = setInterval(() => {
-    sendWatchToServer();
-  }, 5000);
-}
-
-function stopAutoSave() {
-  if (autoSaveTimer) {
-    clearInterval(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-}
-
-// ==============================
-// ✅【新增】送 watch 資料到後端
-// ==============================
-async function sendWatchToServer() {
-  try {
-    await sendWatchLog("video_progress");
-  } catch (e) {
-    console.warn("watch save failed", e);
-  }
-}
-
-// ==============================
-// ✅【新增】關閉頁面前保底
-// ==============================
-// window.addEventListener("beforeunload", () => {
-//   sendWatchToServer();
-// });
-
-// onMounted(() => {
-//   bindVideoWatchEvents();
-// });
 </script>
 
 <style scoped>

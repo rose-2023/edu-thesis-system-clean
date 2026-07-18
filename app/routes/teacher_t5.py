@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import re  # [新增] 用於 version 遞增解析
 from bson import ObjectId
 from ..db import db
-from ..unit_labels import unit_label_map, save_unit_label
+from ..unit_labels import sort_units, unit_label_map, save_unit_label
 
 teacher_t5_bp = Blueprint("teacher_t5", __name__)
 
@@ -35,10 +35,109 @@ def _status_zh(s: str):
 
 
 def _safe_iso(dt):
+    if isinstance(dt, str):
+        return dt.strip()
+    if isinstance(dt, ObjectId):
+        try:
+            return dt.generation_time.isoformat()
+        except Exception:
+            return ""
     try:
         return dt.isoformat() if dt else ""
     except Exception:
         return ""
+
+
+def _doc_created_iso(doc):
+    if not isinstance(doc, dict):
+        return ""
+    return _safe_iso(doc.get("created_at") or doc.get("created_at_utc") or doc.get("_id"))
+
+
+def _doc_created_sort_value(doc):
+    if not isinstance(doc, dict):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    raw = doc.get("created_at") or doc.get("created_at_utc")
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text:
+            try:
+                if text.endswith(("Z", "z")):
+                    text = text[:-1] + "+00:00"
+                return datetime.fromisoformat(text)
+            except Exception:
+                pass
+    oid = doc.get("_id")
+    if isinstance(oid, ObjectId):
+        return oid.generation_time
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _task_source_type(doc):
+    if not isinstance(doc, dict):
+        return "ai"
+    return (
+        (doc.get("source_type") or "").strip().lower()
+        or (doc.get("gen_source") or "").strip().lower()
+        or ("ai" if bool(doc.get("ai_generated")) else "fixed")
+    )
+
+
+def _backfill_created_at_if_missing(doc):
+    if not isinstance(doc, dict) or doc.get("created_at"):
+        return
+    oid = doc.get("_id")
+    if not isinstance(oid, ObjectId):
+        return
+    created_at = doc.get("created_at_utc") or oid.generation_time
+    doc["created_at"] = created_at
+    try:
+        db.parsons_tasks.update_one(
+            {
+                "_id": oid,
+                "$or": [
+                    {"created_at": {"$exists": False}},
+                    {"created_at": None},
+                    {"created_at": ""},
+                ],
+            },
+            {"$set": {"created_at": created_at}},
+        )
+    except Exception:
+        pass
+
+
+def _fixed_task_code(index):
+    return f"FIXED-{max(1, int(index or 1)):02d}"
+
+
+def _backfill_task_code_if_missing(doc, task_code):
+    if not isinstance(doc, dict):
+        return ""
+    existing = str(doc.get("task_code") or "").strip()
+    if existing:
+        return existing
+    clean_code = str(task_code or "").strip() or "FIXED-01"
+    doc["task_code"] = clean_code
+    oid = doc.get("_id")
+    if isinstance(oid, ObjectId):
+        try:
+            db.parsons_tasks.update_one(
+                {
+                    "_id": oid,
+                    "$or": [
+                        {"task_code": {"$exists": False}},
+                        {"task_code": None},
+                        {"task_code": ""},
+                    ],
+                },
+                {"$set": {"task_code": clean_code}},
+            )
+        except Exception:
+            pass
+    return clean_code
 
 
 def _is_soft_deleted(video_doc: dict) -> bool:
@@ -146,9 +245,8 @@ def units():
         "unit",
         {"deleted": {"$nin": [True, 1, "true", "True"]}, "is_deleted": {"$nin": [True, 1, "true", "True"]}},
     )
-    units_list = [u for u in units_list if u]
-    units_list.sort()
     labels = unit_label_map(units_list)
+    units_list = sort_units([u for u in units_list if u], labels)
 
     return jsonify({
         "ok": True,
@@ -355,18 +453,31 @@ def questions():
         _video_deleted_cache[key] = is_del
         return is_del
 
-    for t in db.parsons_tasks.find(q).sort("created_at", sort_dir):
+    task_docs = list(db.parsons_tasks.find(q))
+    for t in task_docs:
+        _backfill_created_at_if_missing(t)
+
+    fixed_docs = [
+        t for t in task_docs
+        if _task_source_type(t) == "fixed" and not _task_video_is_deleted(t)
+    ]
+    fixed_docs.sort(key=lambda doc: (_doc_created_sort_value(doc), str(doc.get("_id") or "")))
+    for idx, fixed_doc in enumerate(fixed_docs, start=1):
+        _backfill_task_code_if_missing(fixed_doc, _fixed_task_code(idx))
+
+    task_docs.sort(
+        key=lambda doc: (_doc_created_sort_value(doc), str(doc.get("_id") or "")),
+        reverse=(sort_dir == -1),
+    )
+
+    for t in task_docs:
         if _task_video_is_deleted(t):
             continue
 
         enabled = bool(t.get("enabled", False))
 
         # ===== 統一來源 =====
-        source_type = (
-            (t.get("source_type") or "").strip().lower()
-            or (t.get("gen_source") or "").strip().lower()
-            or ("ai" if bool(t.get("ai_generated")) else "fixed")
-        )
+        source_type = _task_source_type(t)
 
         # ===== 統一狀態 =====
         raw_status = (
@@ -386,7 +497,7 @@ def questions():
         # ===== 題目代號 =====
         # 固定題優先 task_code，AI 題優先 version
         if source_type == "fixed":
-            version = (t.get("task_code") or "FIXED-01").strip()
+            version = _backfill_task_code_if_missing(t, "FIXED-01")
         else:
             version = (t.get("version") or t.get("task_code") or "v1").strip()
 
@@ -403,13 +514,13 @@ def questions():
         items.append({
             "task_id": str(t["_id"]),
             "version": version,                         # 前端目前 D 區用這個欄位顯示題目代號
-            "task_code": t.get("task_code", ""),       # [新增] 給前端新表格用
+            "task_code": version if source_type == "fixed" else t.get("task_code", ""),       # [新增] 給前端新表格用
             "title": t.get("title") or t.get("video_title") or "",
             "status": raw_status,
             "status_zh": status_zh,
             "enabled": enabled,
             "student_visible": enabled,
-            "created_at": _safe_iso(t.get("created_at")),
+            "created_at": _doc_created_iso(t),
             "segment_label": t.get("segment_label", "—"),
             "has_note": bool((t.get("review_note") or "").strip()),
             "gen_source": source_type,                 # 前端目前用 q.gen_source 判斷 fixed / ai
@@ -436,6 +547,9 @@ def get_question():
     t = db.parsons_tasks.find_one({"_id": tid})
     if not t:
         return jsonify({"ok": False, "error": "task not found"}), 404
+    _backfill_created_at_if_missing(t)
+    if _task_source_type(t) == "fixed":
+        _backfill_task_code_if_missing(t, "FIXED-01")
 
     enabled = bool(t.get("enabled", False))
     st = (t.get("status") or ("published" if enabled else "pending")).strip().lower()
@@ -541,11 +655,12 @@ def get_question():
         "ok": True,
         "task_id": str(t["_id"]),
         "version": t.get("version", "v1"),
+        "task_code": t.get("task_code", ""),
         "status": st,
         "status_zh": _status_zh(st),
         "student_visible": enabled,
         "enabled": enabled,
-        "created_at": _safe_iso(t.get("created_at")),
+        "created_at": _doc_created_iso(t),
         "segment_label": t.get("segment_label", "—"),
         "subtitle_version": t.get("subtitle_version", None),
 

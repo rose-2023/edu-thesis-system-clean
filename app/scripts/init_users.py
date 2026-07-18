@@ -24,7 +24,7 @@ test_users = [
         "participant_id": str(uuid.uuid4()),  # 研究匿名編號
         "created_at": datetime.utcnow().isoformat(),
         "last_login_at": None,
-        "rewatch_stats": {  # V1.7: 回看統計
+        "rewatch_stats": {  
             "total_rewatch_count": 0,
             "videos_never_rewatched": [],
             "rewatch_sessions": []
@@ -36,21 +36,6 @@ test_users = [
         "class_name": "管理員",
         "role": "admin",
         "password_hash": generate_password_hash("admin123"),
-        "participant_id": str(uuid.uuid4()),
-        "created_at": datetime.utcnow().isoformat(),
-        "last_login_at": None,
-        "rewatch_stats": {
-            "total_rewatch_count": 0,
-            "videos_never_rewatched": [],
-            "rewatch_sessions": []
-        }
-    },
-    {
-        "student_id": "A123456789",
-        "name": "測試學生2",
-        "class_name": "資工系 B班",
-        "role": "student",
-        "password_hash": generate_password_hash("password123"),
         "participant_id": str(uuid.uuid4()),
         "created_at": datetime.utcnow().isoformat(),
         "last_login_at": None,

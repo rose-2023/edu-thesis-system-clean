@@ -6,6 +6,7 @@ from bson import ObjectId
 from flask import Blueprint, jsonify, request
 
 from app.db import db
+from app.unit_labels import normalize_unit_key, unit_sort_key as shared_unit_sort_key
 
 
 teacher_analysis_bp = Blueprint("teacher_analysis", __name__)
@@ -459,11 +460,7 @@ def _practice_progress(student_ids):
 
 
 def _unit_sort_key(unit_label):
-    text = str(unit_label or "").strip()
-    prefix = "".join(ch for ch in text if not ch.isdigit()).lower()
-    digits = "".join(ch for ch in text if ch.isdigit())
-    number = int(digits) if digits else 999999
-    return (prefix, number, text.lower())
+    return shared_unit_sort_key(unit_label, unit_label)
 
 
 def _task_unit_label(doc):
@@ -489,6 +486,80 @@ def _task_title_label(doc, fallback_id=""):
     )
 
 
+def _practice_task_unit_key(doc):
+    for key in ("unit", "unit_id", "unit_key", "unit_code", "chapter", "lesson"):
+        value = normalize_unit_key((doc or {}).get(key))
+        if value:
+            return value
+    for key in ("unit_label", "unit_name", "video_title", "target_concept", "concept_tag"):
+        value = _optional_string((doc or {}).get(key))
+        if value:
+            return value
+    return "unknown"
+
+
+def _practice_task_unit_label(doc, unit_key=None):
+    return (
+        _optional_string((doc or {}).get("unit_label"))
+        or _optional_string((doc or {}).get("unit_name"))
+        or _optional_string(unit_key)
+        or _practice_task_unit_key(doc)
+    )
+
+
+def _practice_task_title_label(doc, fallback_id=""):
+    question = (doc or {}).get("question")
+    question_prompt = question.get("prompt") if isinstance(question, dict) else None
+    return (
+        _optional_string((doc or {}).get("task_title"))
+        or _optional_string((doc or {}).get("title"))
+        or _optional_string((doc or {}).get("name"))
+        or _optional_string((doc or {}).get("question_title"))
+        or _optional_string((doc or {}).get("question_text"))
+        or _optional_string((doc or {}).get("question_prompt"))
+        or _optional_string((doc or {}).get("prompt"))
+        or _optional_string(question_prompt)
+        or _optional_string((doc or {}).get("task_code"))
+        or _optional_string((doc or {}).get("version"))
+        or _optional_string(fallback_id)
+        or "-"
+    )
+
+
+def _practice_task_source_type(doc):
+    if not isinstance(doc, dict):
+        return "ai"
+    source_type = (
+        _optional_string(doc.get("source_type"))
+        or _optional_string(doc.get("gen_source"))
+        or ""
+    ).lower()
+    if source_type:
+        return "fixed" if source_type == "fixed_task" else source_type
+    return "ai" if doc.get("ai_generated") is True else "fixed"
+
+
+def _practice_task_code_label(doc):
+    return (
+        _optional_string((doc or {}).get("task_code"))
+        or _optional_string((doc or {}).get("version"))
+        or _optional_string((doc or {}).get("code"))
+        or ""
+    )
+
+
+def _task_explicitly_included_in_analysis(task):
+    return any(
+        (task or {}).get(key) is True
+        for key in (
+            "include_in_analysis",
+            "include_in_practice_analysis",
+            "analysis_enabled",
+            "practice_analysis_enabled",
+        )
+    )
+
+
 def _practice_task_catalog():
     projection = {
         "_id": 1,
@@ -497,8 +568,17 @@ def _practice_task_catalog():
         "title": 1,
         "task_title": 1,
         "name": 1,
+        "question": 1,
+        "question_title": 1,
+        "question_text": 1,
+        "question_prompt": 1,
+        "prompt": 1,
         "unit": 1,
         "unit_id": 1,
+        "unit_key": 1,
+        "unit_code": 1,
+        "unit_label": 1,
+        "unit_name": 1,
         "chapter": 1,
         "lesson": 1,
         "video_title": 1,
@@ -511,6 +591,19 @@ def _practice_task_catalog():
         "created_at": 1,
         "video_id": 1,
         "video_id_str": 1,
+        "source_type": 1,
+        "gen_source": 1,
+        "ai_generated": 1,
+        "task_code": 1,
+        "version": 1,
+        "enabled": 1,
+        "student_visible": 1,
+        "status": 1,
+        "review_status": 1,
+        "include_in_analysis": 1,
+        "include_in_practice_analysis": 1,
+        "analysis_enabled": 1,
+        "practice_analysis_enabled": 1,
     }
     catalog = {}
     aliases = {}
@@ -520,6 +613,7 @@ def _practice_task_catalog():
         "is_deleted": {"$ne": True},
         "$or": [
             {"enabled": True},
+            {"student_visible": True},
             {"status": "published"},
             {"review_status": "published"},
         ],
@@ -534,7 +628,9 @@ def _practice_task_catalog():
         )
         if not task_id:
             continue
-        unit_label = _task_unit_label(task)
+        unit_key = _practice_task_unit_key(task)
+        unit_label = _practice_task_unit_label(task, unit_key)
+        source_type = _practice_task_source_type(task)
         alias_values = [
             str(key or "").strip()
             for key in (task.get("_id"), task.get("task_id"), task.get("id"))
@@ -542,12 +638,18 @@ def _practice_task_catalog():
         ]
         profile = {
             "task_id": task_id,
-            "task_title": _task_title_label(task, task_id),
-            "unit_key": unit_label,
+            "task_title": _practice_task_title_label(task, task_id),
+            "unit_key": unit_key,
             "unit_label": unit_label,
             "target_concept": _first_concept(task),
             "order": task.get("sort_order") if task.get("sort_order") is not None else task.get("order"),
             "created_at": task.get("created_at"),
+            "source_type": source_type,
+            "task_code": _practice_task_code_label(task),
+            "student_visible": task.get("student_visible") is True or task.get("enabled") is True,
+            "status": _optional_string(task.get("status")) or _optional_string(task.get("review_status")) or "",
+            "has_video_ref": task.get("video_id") is not None or bool(_optional_string(task.get("video_id_str"))),
+            "video_id": str(task.get("video_id") or task.get("video_id_str") or ""),
             "aliases": list(dict.fromkeys(alias_values)),
         }
         catalog[task_id] = profile
@@ -616,15 +718,22 @@ def _practice_round_no(attempt):
 
 def _practice_task_profile_from_attempt(attempt):
     task_id = str((attempt or {}).get("task_id") or "").strip()
-    unit_label = _task_unit_label(attempt)
+    unit_key = _practice_task_unit_key(attempt)
+    unit_label = _practice_task_unit_label(attempt, unit_key)
     return {
         "task_id": task_id,
-        "task_title": _task_title_label(attempt, task_id),
-        "unit_key": unit_label,
+        "task_title": _practice_task_title_label(attempt, task_id),
+        "unit_key": unit_key,
         "unit_label": unit_label,
         "target_concept": _optional_string((attempt or {}).get("target_concept")),
         "order": None,
         "created_at": None,
+        "source_type": "",
+        "task_code": "",
+        "student_visible": None,
+        "status": "",
+        "has_video_ref": None,
+        "video_id": "",
         "aliases": [task_id] if task_id else [],
     }
 
@@ -795,6 +904,12 @@ def _practice_task_state(student, profile, attempts, hint_log_summary):
             "unit_label": profile.get("unit_label"),
             "task_id": profile.get("task_id"),
             "task_title": profile.get("task_title"),
+            "source_type": profile.get("source_type") or "",
+            "task_code": profile.get("task_code") or "",
+            "student_visible": profile.get("student_visible"),
+            "task_status": profile.get("status") or "",
+            "has_video_ref": profile.get("has_video_ref"),
+            "video_id": profile.get("video_id") or "",
             "status": "not_started",
             "submission_count": 0,
             "round_no": None,
@@ -829,6 +944,12 @@ def _practice_task_state(student, profile, attempts, hint_log_summary):
         "unit_label": profile.get("unit_label"),
         "task_id": task_id,
         "task_title": _optional_string(final_attempt.get("task_title")) or profile.get("task_title"),
+        "source_type": profile.get("source_type") or "",
+        "task_code": profile.get("task_code") or "",
+        "student_visible": profile.get("student_visible"),
+        "task_status": profile.get("status") or "",
+        "has_video_ref": profile.get("has_video_ref"),
+        "video_id": profile.get("video_id") or "",
         "status": status,
         "submission_count": len(attempts),
         "round_no": latest_round,
@@ -847,7 +968,7 @@ def _task_profile_sort_key(profile):
     order_value = profile.get("order")
     order = _safe_int(order_value, 999999) if order_value is not None else 999999
     return (
-        _unit_sort_key(profile.get("unit_label")),
+        _unit_sort_key(profile.get("unit_key") or profile.get("unit_label")),
         order,
         str(profile.get("task_id") or "").lower(),
         str(profile.get("task_title") or "").lower(),
@@ -875,7 +996,7 @@ def _task_belongs_to_visible_video(task, visible_video_object_ids, visible_video
     raw_video_id = (task or {}).get("video_id")
     raw_video_id_str = _optional_string((task or {}).get("video_id_str"))
     if raw_video_id is None and not raw_video_id_str:
-        return True
+        return _task_explicitly_included_in_analysis(task)
 
     candidates = []
     if raw_video_id is not None:
@@ -904,6 +1025,12 @@ def _practice_task_expand_row(state):
         "unit_label": state.get("unit_label"),
         "task_id": state.get("task_id"),
         "task_title": state.get("task_title"),
+        "source_type": state.get("source_type"),
+        "task_code": state.get("task_code"),
+        "student_visible": state.get("student_visible"),
+        "task_status": state.get("task_status"),
+        "has_video_ref": state.get("has_video_ref"),
+        "video_id": state.get("video_id"),
         "status": state.get("status"),
         "submission_count": state.get("submission_count"),
         "last_submitted_at": state.get("last_submitted_at"),
@@ -954,7 +1081,10 @@ def _practice_unit_progress_payload(class_name, group_filter, student_id=None):
     columns = [
         {
             "unit_key": unit_key,
-            "unit_label": unit_key,
+            "unit_label": (
+                (tasks_by_unit.get(unit_key) or [{}])[0].get("unit_label")
+                or unit_key
+            ),
             "task_total": len(tasks_by_unit.get(unit_key) or []),
         }
         for unit_key in unit_keys
@@ -1019,7 +1149,10 @@ def _practice_unit_progress_payload(class_name, group_filter, student_id=None):
                 status = "not_started"
             units[unit_key] = {
                 "unit_key": unit_key,
-                "unit_label": unit_key,
+                "unit_label": (
+                    (tasks_by_unit.get(unit_key) or [{}])[0].get("unit_label")
+                    or unit_key
+                ),
                 "completed_tasks": completed,
                 "attempted_tasks": attempted,
                 "total_tasks": total,
@@ -1045,9 +1178,9 @@ def _practice_unit_progress_payload(class_name, group_filter, student_id=None):
     latest_task_rows = sorted(
         latest_task_rows,
         key=lambda row: (
-            str(row.get("student_id") or ""),
-            _unit_sort_key(row.get("unit_label")),
+            _unit_sort_key(row.get("unit_key") or row.get("unit_label")),
             str(row.get("task_id") or ""),
+            str(row.get("student_id") or ""),
         ),
     )
     return {
@@ -1291,15 +1424,29 @@ def _load_task_profiles(task_ids):
             "title": 1,
             "task_title": 1,
             "name": 1,
+            "question": 1,
+            "question_title": 1,
+            "question_text": 1,
+            "question_prompt": 1,
+            "prompt": 1,
             "target_concept": 1,
             "concept": 1,
             "concept_tag": 1,
             "tags": 1,
             "unit": 1,
             "unit_id": 1,
+            "unit_key": 1,
+            "unit_code": 1,
+            "unit_label": 1,
+            "unit_name": 1,
             "chapter": 1,
             "lesson": 1,
             "video_title": 1,
+            "source_type": 1,
+            "gen_source": 1,
+            "ai_generated": 1,
+            "task_code": 1,
+            "version": 1,
         },
     )
     for task in cursor:
@@ -1308,23 +1455,17 @@ def _load_task_profiles(task_ids):
             str(task.get("task_id") or ""),
             str(task.get("id") or ""),
         }
-        title = (
-            _optional_string(task.get("task_title"))
-            or _optional_string(task.get("title"))
-            or _optional_string(task.get("name"))
-        )
+        title = _practice_task_title_label(task, str(task.get("_id") or ""))
         concept = _first_concept(task)
-        unit = (
-            _optional_string(task.get("unit"))
-            or _optional_string(task.get("unit_id"))
-            or _optional_string(task.get("chapter"))
-            or _optional_string(task.get("lesson"))
-        )
+        unit = _practice_task_unit_key(task)
         value = {
             "task_title": title,
             "target_concept": concept,
             "unit": unit,
+            "unit_label": _practice_task_unit_label(task, unit),
             "video_title": _optional_string(task.get("video_title")),
+            "source_type": _practice_task_source_type(task),
+            "task_code": _practice_task_code_label(task),
         }
         for key in keys:
             if key:
@@ -1594,6 +1735,12 @@ def _read_attempts(activity_type, test_role, class_name, group_filter, student_i
         "task_id": 1,
         "task_title": 1,
         "target_concept": 1,
+        "unit": 1,
+        "unit_id": 1,
+        "unit_label": 1,
+        "source_type": 1,
+        "gen_source": 1,
+        "task_code": 1,
         "attempt_no": 1,
         "is_correct": 1,
         "score": 1,
@@ -1685,6 +1832,27 @@ def _enrich_attempts(attempts):
             _optional_string(row.get("target_concept"))
             or _optional_string(task.get("target_concept"))
             or "unknown"
+        )
+        row["unit"] = (
+            _optional_string(row.get("unit"))
+            or _optional_string(task.get("unit"))
+            or ""
+        )
+        row["unit_label"] = (
+            _optional_string(row.get("unit_label"))
+            or _optional_string(task.get("unit_label"))
+            or row["unit"]
+        )
+        row["source_type"] = (
+            _optional_string(row.get("source_type"))
+            or _optional_string(row.get("gen_source"))
+            or _optional_string(task.get("source_type"))
+            or ""
+        )
+        row["task_code"] = (
+            _optional_string(row.get("task_code"))
+            or _optional_string(task.get("task_code"))
+            or ""
         )
         row["duration_sec"] = _valid_duration(row.get("duration_sec"))
         enriched.append(row)
@@ -1948,6 +2116,10 @@ def _build_task_analysis(attempts):
         rows.append({
             "task_id": task_id,
             "task_title": first.get("task_title") or "",
+            "unit": first.get("unit") or "",
+            "unit_label": first.get("unit_label") or "",
+            "source_type": first.get("source_type") or "",
+            "task_code": first.get("task_code") or "",
             "target_concept": first.get("target_concept") or "unknown",
             "total_attempts": total,
             "wrong_attempts": wrong,
@@ -2050,6 +2222,51 @@ def _video_watch_seconds_for_total(log):
     return seconds if seconds is not None else 0
 
 
+def _video_playback_rate_parts(log):
+    raw = log.get("playback_rate")
+    current = None
+    previous = None
+    next_rate = None
+    direction = None
+
+    if isinstance(raw, dict):
+        current = _safe_float(raw.get("current"))
+        previous = _safe_float(raw.get("from"))
+        next_rate = _safe_float(raw.get("to"))
+        direction = _optional_string(raw.get("direction"))
+    else:
+        current = _safe_float(raw)
+
+    current = current if current is not None else _safe_float(log.get("playback_rate_current"))
+    previous = previous if previous is not None else _safe_float(log.get("playback_rate_from"))
+    next_rate = next_rate if next_rate is not None else _safe_float(log.get("playback_rate_to"))
+    direction = direction or _optional_string(log.get("playback_rate_direction"))
+
+    return {
+        "playback_rate": current,
+        "playback_rate_current": current,
+        "playback_rate_from": previous,
+        "playback_rate_to": next_rate,
+        "playback_rate_direction": direction,
+    }
+
+
+def _is_auto_end_pause_log(log):
+    if str(log.get("event_type") or "") != "video_pause":
+        return False
+    if log.get("reached_end") is True or log.get("completed_fully") is True:
+        return True
+
+    current_time = _safe_float(log.get("current_time_sec"))
+    duration = _safe_float(log.get("video_duration_sec"))
+    return (
+        current_time is not None
+        and duration is not None
+        and duration > 0
+        and current_time >= duration - 0.5
+    )
+
+
 def _read_video_rewatch_logs(class_name, group_filter, student_id=None, limit=1000):
     student_ids, profiles = _video_rewatch_student_ids(class_name, group_filter, student_id)
     if not student_ids:
@@ -2088,6 +2305,11 @@ def _read_video_rewatch_logs(class_name, group_filter, student_id=None, limit=10
         "watch_end_at": 1,
         "segment_start_sec": 1,
         "segment_end_sec": 1,
+        "seek_from_sec": 1,
+        "seek_to_sec": 1,
+        "seek_delta_sec": 1,
+        "seek_direction": 1,
+        "is_backward_seek": 1,
         "seek_count": 1,
         "total_seek_distance": 1,
         "avg_seek_distance": 1,
@@ -2106,11 +2328,15 @@ def _read_video_rewatch_logs(class_name, group_filter, student_id=None, limit=10
 
     rows = []
     for log in logs:
+        if _is_auto_end_pause_log(log):
+            continue
+
         sid = str(log.get("student_id") or "").strip()
         profile = profiles.get(sid) or {}
         event_at = _video_event_time(log)
         watch_seconds = _safe_float(log.get("watch_seconds"))
         watch_delta_sec = _safe_float(log.get("watch_delta_sec"))
+        playback_rate_parts = _video_playback_rate_parts(log)
         rows.append(_json_safe({
             "log_id": str(log.get("_id") or ""),
             "student_id": sid,
@@ -2138,10 +2364,16 @@ def _read_video_rewatch_logs(class_name, group_filter, student_id=None, limit=10
             "watch_end_at": log.get("watch_end_at"),
             "segment_start_sec": _safe_float(log.get("segment_start_sec")),
             "segment_end_sec": _safe_float(log.get("segment_end_sec")),
+            "seek_from_sec": _safe_float(log.get("seek_from_sec")),
+            "seek_to_sec": _safe_float(log.get("seek_to_sec")),
+            "seek_delta_sec": _safe_float(log.get("seek_delta_sec")),
+            "seek_direction": log.get("seek_direction"),
+            "is_backward_seek": log.get("is_backward_seek") is True,
             "seek_count": log.get("seek_count"),
             "total_seek_distance": _safe_float(log.get("total_seek_distance")),
             "avg_seek_distance": _safe_float(log.get("avg_seek_distance")),
             "is_frequent_seeker": log.get("is_frequent_seeker") is True,
+            **playback_rate_parts,
             "page": log.get("page"),
             "source": log.get("source"),
             "event_at": event_at,
@@ -2210,6 +2442,10 @@ def _student_attempt_rows(attempts, student_id):
             "data_source": attempt.get("data_source") or "unknown",
             "task_id": attempt.get("task_id"),
             "task_title": attempt.get("task_title"),
+            "unit": attempt.get("unit"),
+            "unit_label": attempt.get("unit_label"),
+            "source_type": attempt.get("source_type"),
+            "task_code": attempt.get("task_code"),
             "target_concept": attempt.get("target_concept"),
             "attempt_no": attempt.get("attempt_no"),
             "is_correct": attempt.get("is_correct"),

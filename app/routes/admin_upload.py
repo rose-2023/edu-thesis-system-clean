@@ -7,7 +7,7 @@ from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from bson import ObjectId
 from ..db import db
-from ..unit_labels import unit_label_map
+from ..unit_labels import sort_units, unit_label_map
 
 admin_upload_bp = Blueprint("admin_upload", __name__)
 
@@ -37,7 +37,7 @@ FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 
 @admin_upload_bp.get("/uploads/<path:filename>")
 def serve_uploads(filename):
-    return send_from_directory(UPLOADS_ROOT, filename)
+    return send_from_directory(UPLOADS_ROOT, filename,conditional=True)
 
 
 # =============================
@@ -278,9 +278,8 @@ def list_units():
     try:
         # 只抓未刪除（可含 inactive）
         units = db.videos.distinct("unit", {"deleted": {"$ne": True}})
-        units = [u for u in units if u]
-        units.sort()
         labels = unit_label_map(units)
+        units = sort_units([u for u in units if u], labels)
         return jsonify({
             "ok": True,
             "units": units,

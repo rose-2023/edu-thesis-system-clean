@@ -69,7 +69,6 @@ const showPwd = ref(false);
 const studentIdInput = ref(null);
 
 // [新增] 測驗週期（你現在用 default）
-const DEFAULT_TEST_CYCLE_ID = "default"; // [新增]
 
 // ✅ 教學重點：可提交條件集中管理
 const canSubmit = computed(() => {
@@ -86,13 +85,24 @@ function setError(msg) {
 async function maybeRedirectToPretest(sid) { // [新增]
   try { // [新增]
     const sres = await api.get("/api/parsons/test/status", { // [新增]
-      params: { student_id: sid, test_cycle_id: DEFAULT_TEST_CYCLE_ID }, // [新增]
+      params: { student_id: sid }, // [新增]
     }); // [新增]
     const sdata = sres?.data; // [新增]
+    if (sdata?.ok && sdata?.test_assigned === false) {
+      window.alert("尚未分配測驗批次，請聯絡教師。")
+      return false
+    }
     if (sdata?.ok && sdata?.pre_open && !sdata?.pre_done) { // [新增]
+      const testCycleId = String(sdata?.test_cycle_id || "").trim();
+      if (!testCycleId) return false;
+      localStorage.setItem("test_cycle_id", testCycleId);
+      if (sdata?.pretest_questionnaire_required) {
+        router.replace("/pretest-survey");
+        return true;
+      }
       router.replace({ // [新增]
-        path: "/posttest/parsons", // [新增]
-        query: { mode: "test", test_role: "pre", test_cycle_id: DEFAULT_TEST_CYCLE_ID }, // [新增]
+        path: "/test/taking", // [新增]
+        query: { mode: "test", test_role: "pre", test_cycle_id: testCycleId }, // [新增]
       }); // [新增]
       return true; // [新增]
     } // [新增]

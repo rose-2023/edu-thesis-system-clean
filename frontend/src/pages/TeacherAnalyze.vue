@@ -52,7 +52,8 @@
             <select v-model="groupType" class="input" @change="onGroupChange">
               <option value="">全部組別</option>
               <option value="control">控制組</option>
-              <option value="experimental">實驗組</option>
+              <option value="experimental_1">AI 增強型結構化回饋組</option>
+              <option value="experimental_2">結構化錯誤回饋組</option>
               <option value="test_data">測試資料</option>
             </select>
           </label>
@@ -120,8 +121,12 @@
           </div>
           <div class="overviewCards">
             <div class="overviewCard">
-              <div class="overviewLabel">實驗組人數</div>
-              <div class="overviewValue">{{ userGroupOverview.experimental_count ?? 0 }}</div>
+              <div class="overviewLabel">B 組人數</div>
+              <div class="overviewValue">{{ userGroupOverview.experimental_1_count ?? 0 }}</div>
+            </div>
+            <div class="overviewCard">
+              <div class="overviewLabel">C 組人數</div>
+              <div class="overviewValue">{{ userGroupOverview.experimental_2_count ?? 0 }}</div>
             </div>
             <div class="overviewCard">
               <div class="overviewLabel">控制組人數</div>
@@ -1314,6 +1319,8 @@ const timelineEvents = computed(() => {
     "click_next_to_practice",
     "enter_parsons_task",
     "answer_submit",
+    "questionnaire_opened",
+    "questionnaire_submitted",
     "view_hint",
     "hide_hint",
     "review_open",
@@ -1340,7 +1347,8 @@ const timelineEvents = computed(() => {
 const pagedTimelineEvents = computed(() => pageItems(timelineEvents.value, "studentTimeline"));
 const groupHint = computed(() => {
   if (groupType.value === "control") return "目前顯示控制組正式資料，已排除測試資料。";
-  if (groupType.value === "experimental") return "目前顯示實驗組正式資料，已排除測試資料。";
+  if (groupType.value === "experimental_1") return "目前顯示 B 組（AI 增強型結構化回饋）正式資料，已排除測試資料。";
+  if (groupType.value === "experimental_2") return "目前顯示 C 組（結構化錯誤回饋）正式資料，已排除測試資料。";
   if (groupType.value === "test_data") {
     return "目前為測試資料模式，僅供系統測試，不納入正式研究分析。";
   }
@@ -1383,6 +1391,8 @@ function emptyAnalysis() {
     },
     user_group_overview: {
       experimental_count: 0,
+      experimental_1_count: 0,
+      experimental_2_count: 0,
       control_count: 0,
       test_account_count: 0,
       formal_student_count: 0,
@@ -1601,6 +1611,8 @@ const eventTypeLabels = {
   task_start: "開始作答",
   answer_submit: "提交 Parsons",
   submit_parsons: "提交 Parsons",
+  questionnaire_opened: "開始填寫前測問卷",
+  questionnaire_submitted: "提交前測問卷",
   view_hint: "查看提示",
   hide_hint: "收起提示",
   review_open: "開啟提示",
@@ -1648,7 +1660,8 @@ function formatCorrectness(value) {
 function formatGroupType(row) {
   if (row?.is_test_data === true) return "測試資料";
   if (row?.group_type === "control") return "控制組";
-  if (row?.group_type === "experimental") return "實驗組";
+  if (row?.group_type === "experimental_1") return "B 組（AI 增強型結構化回饋）";
+  if (row?.group_type === "experimental_2") return "C 組（結構化錯誤回饋）";
   return row?.group_type || "-";
 }
 
@@ -1669,6 +1682,16 @@ function formatEventType(value, row = null) {
   const metadata = hasMetadata(row?.metadata) ? row.metadata : {};
   const triggerMethod = metadata.trigger_method || row?.trigger_method;
   const buttonName = metadata.button_name || row?.button_name;
+  if (value === "answer_submit" || value === "submit_parsons") {
+    const testRole = String(
+      row?.test_role
+      || analysis.value?.filters?.test_role
+      || selectedModeConfig.value?.testRole
+      || "",
+    ).trim().toLowerCase();
+    if (testRole === "pre" || testRole === "pretest") return "前測作答";
+    if (testRole === "post" || testRole === "posttest") return "後測作答";
+  }
   if ((value === "view_hint" || value === "review_open")
     && (triggerMethod === "click_hint_retry" || buttonName === "再次提示")) {
     return "再次提示";
@@ -1738,6 +1761,15 @@ function formatMetadataSummary(row) {
     if (Array.isArray(metadata.error_types)) {
       parts.push(`錯誤類型：${metadata.error_types.length ? metadata.error_types.join("、") : "無"}`);
     }
+  } else if (row.event_type === "questionnaire_opened") {
+    parts.push("學生已進入前測固定問卷");
+    if (metadata.form_version) parts.push(`版本：${metadata.form_version}`);
+    if (metadata.test_cycle_id) parts.push(`測驗批次：${metadata.test_cycle_id}`);
+  } else if (row.event_type === "questionnaire_submitted") {
+    parts.push(`已提交 ${metadata.question_count ?? 0} 題前測問卷`);
+    if (metadata.form_version) parts.push(`版本：${metadata.form_version}`);
+    if (metadata.test_cycle_id) parts.push(`測驗批次：${metadata.test_cycle_id}`);
+    if (metadata.locked === true) parts.push("回答已鎖定");
   } else if ([
     "first_error_hint_shown",
     "ai_hint_modal_open",
@@ -1945,7 +1977,8 @@ function selectedProgressLastActivity(row) {
 
 function selectedGroupFilter() {
   if (groupType.value === "control") return "control";
-  if (groupType.value === "experimental") return "experimental";
+  if (groupType.value === "experimental_1") return "experimental_1";
+  if (groupType.value === "experimental_2") return "experimental_2";
   if (groupType.value === "test_data") return "test";
   return "all";
 }
@@ -1965,7 +1998,7 @@ function buildFilterQuery() {
   if (className.value) params.set("class_name", className.value);
   if (groupType.value) params.set("group_type", groupType.value);
   if (selectedStudentId.value) params.set("student_id", selectedStudentId.value);
-  params.set("exclude_test_data", groupType.value === "control" || groupType.value === "experimental" ? "true" : "false");
+  params.set("exclude_test_data", ["control", "experimental_1", "experimental_2"].includes(groupType.value) ? "true" : "false");
   return params;
 }
 
@@ -2119,7 +2152,8 @@ function currentModeLabel() {
 
 function currentGroupLabel() {
   if (groupType.value === "control") return "控制組";
-  if (groupType.value === "experimental") return "實驗組";
+  if (groupType.value === "experimental_1") return "B 組（AI 增強型結構化回饋）";
+  if (groupType.value === "experimental_2") return "C 組（結構化錯誤回饋）";
   if (groupType.value === "test_data") return "測試資料";
   return "全部組別";
 }
@@ -2352,9 +2386,12 @@ async function uploadStudentCsv(event) {
       throw new Error(data?.message || `users csv import failed: ${response.status}`);
     }
     const invalidCount = Array.isArray(data.invalid_rows) ? data.invalid_rows.length : 0;
+    const assignment = data.assignment || {};
     csvMessage.value =
       `學生 CSV 匯入完成：新增 ${data.inserted_count || 0} 筆，更新 ${data.updated_count || 0} 筆，` +
-      `跳過 ${data.skipped_count || 0} 筆，錯誤 ${invalidCount} 筆`;
+      `跳過 ${data.skipped_count || 0} 筆，錯誤 ${invalidCount} 筆。` +
+      `自動分派：A 組 ${assignment.control || 0} 人、B 組 ${assignment.experimental_1 || 0} 人、C 組 ${assignment.experimental_2 || 0} 人；` +
+      `已保留既有分派 ${assignment.already_assigned || 0} 人。`;
     invalidRows.value = (data.invalid_rows || []).slice(0, 5);
     await fetchAnalysis();
   } catch (error) {

@@ -139,6 +139,8 @@ ALLOWED_EVENT_TYPES = {
     "click_next_to_practice",
     "enter_parsons_task",
     "answer_submit",
+    "questionnaire_opened",
+    "questionnaire_submitted",
     "view_hint",
     "hide_hint",
     "review_open",

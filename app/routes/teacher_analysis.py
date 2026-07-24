@@ -14,7 +14,7 @@ teacher_analysis_bp = Blueprint("teacher_analysis", __name__)
 TEST_STUDENT_ID = "11461127"
 VALID_ACTIVITY_TYPES = {"practice", "test"}
 VALID_TEST_ROLES = {"pretest", "posttest"}
-FORMAL_GROUP_TYPES = ("control", "experimental")
+FORMAL_GROUP_TYPES = ("control", "experimental_1", "experimental_2")
 TEST_DATA_GROUP_FILTER = "test_data"
 
 
@@ -59,8 +59,6 @@ def _apply_group_filter(query, class_name, group_filter, student_id=None):
         query["$or"] = [
             {"is_test_data": True},
             {"student_id": TEST_STUDENT_ID},
-            {"group_type": None},
-            {"group_type": ""},
         ]
         if selected_student:
             query["student_id"] = selected_student
@@ -71,7 +69,10 @@ def _apply_group_filter(query, class_name, group_filter, student_id=None):
 
     if group_filter in FORMAL_GROUP_TYPES:
         query["is_test_data"] = {"$ne": True}
-        query["group_type"] = group_filter
+        query["$or"] = [
+            {"group_type": group_filter},
+            {"analysis_group_type": group_filter},
+        ]
     return query
 
 
@@ -87,14 +88,15 @@ def _student_user_query(class_name=None, group_filter=None, student_id=None):
         query["$or"] = [
             {"is_test_data": True},
             {"student_id": TEST_STUDENT_ID},
-            {"group_type": None},
-            {"group_type": ""},
         ]
         return query
 
     if group_filter in FORMAL_GROUP_TYPES:
         query["is_test_data"] = {"$ne": True}
-        query["group_type"] = group_filter
+        query["$or"] = [
+            {"group_type": group_filter},
+            {"analysis_group_type": group_filter},
+        ]
     return query
 
 
@@ -108,10 +110,15 @@ def _user_group_overview(class_name=None):
         "is_test_data": {"$ne": True},
         "group_type": "control",
     })
-    experimental_count = db.users.count_documents({
+    experimental_1_count = db.users.count_documents({
         **base,
         "is_test_data": {"$ne": True},
-        "group_type": "experimental",
+        "group_type": "experimental_1",
+    })
+    experimental_2_count = db.users.count_documents({
+        **base,
+        "is_test_data": {"$ne": True},
+        "group_type": "experimental_2",
     })
     test_ids = set()
     cursor = db.users.find(
@@ -120,8 +127,6 @@ def _user_group_overview(class_name=None):
             "$or": [
                 {"is_test_data": True},
                 {"student_id": TEST_STUDENT_ID},
-                {"group_type": None},
-                {"group_type": ""},
             ],
         },
         {"_id": 0, "student_id": 1},
@@ -132,11 +137,13 @@ def _user_group_overview(class_name=None):
             test_ids.add(sid)
 
     return {
-        "experimental_count": experimental_count,
+        "experimental_count": experimental_1_count + experimental_2_count,
+        "experimental_1_count": experimental_1_count,
+        "experimental_2_count": experimental_2_count,
         "control_count": control_count,
         "test_account_count": len(test_ids),
-        "formal_student_count": experimental_count + control_count,
-        "total_student_count": experimental_count + control_count + len(test_ids),
+        "formal_student_count": experimental_1_count + experimental_2_count + control_count,
+        "total_student_count": experimental_1_count + experimental_2_count + control_count + len(test_ids),
     }
 
 
@@ -296,7 +303,6 @@ def _test_completion_overview(test_role, class_name, group_filter, student_id=No
         if (
             row.get("is_test_data") is True
             or str(row.get("student_id") or "").strip() == TEST_STUDENT_ID
-            or row.get("group_type") in (None, "")
         )
     }
     test_group_ids = {sid for sid in test_group_ids if sid}
@@ -1105,7 +1111,6 @@ def _practice_unit_progress_payload(class_name, group_filter, student_id=None):
             "is_test_data": (
                 student.get("is_test_data") is True
                 or sid == TEST_STUDENT_ID
-                or student.get("group_type") in (None, "")
             ),
         }
         units = {}
@@ -1257,7 +1262,6 @@ def _student_progress_rows(class_name, group_filter, student_id=None):
         is_test_data = (
             student.get("is_test_data") is True
             or sid == TEST_STUDENT_ID
-            or student.get("group_type") in (None, "")
         )
         progress = practice_progress.get(sid) or {}
         pre_row = pre_progress.get(sid) or {}
@@ -1489,7 +1493,6 @@ def _student_option_matches(row, class_name, group_filter):
         return (
             is_test_data
             or sid == TEST_STUDENT_ID
-            or row.get("group_type") in (None, "")
         )
     if group_filter in FORMAL_GROUP_TYPES:
         return (not is_test_data) and row.get("group_type") == group_filter
@@ -1648,7 +1651,7 @@ def _normalize_legacy_test_attempt(attempt, test_role):
         "legacy_test_role": legacy_role,
         "test_cycle_id": attempt.get("test_cycle_id"),
         "task_id": task_id,
-        "task_title": attempt.get("task_title") or "",
+        "task_title": attempt.get("task_title") or attempt.get("question_text") or "",
         "target_concept": attempt.get("target_concept") or attempt.get("concept_tag") or attempt.get("concept") or "unknown",
         "attempt_no": attempt.get("attempt_no") or 1,
         "is_correct": attempt.get("is_correct"),
@@ -1686,6 +1689,7 @@ def _read_legacy_test_attempts(test_role, class_name, group_filter, student_id):
         "task_id": 1,
         "source_task_id": 1,
         "task_title": 1,
+        "question_text": 1,
         "target_concept": 1,
         "concept": 1,
         "concept_tag": 1,
@@ -1821,10 +1825,10 @@ def _enrich_attempts(attempts):
             user.get("is_test_data") is True
             or row.get("is_test_data") is True
             or sid == TEST_STUDENT_ID
-            or row.get("group_type") in (None, "")
         )
         row["task_title"] = (
             _optional_string(row.get("task_title"))
+            or _optional_string(row.get("question_text"))
             or _optional_string(task.get("task_title"))
             or ""
         )
@@ -2169,6 +2173,8 @@ def _read_student_logs(student_id, activity_type, test_role, limit, class_name, 
         "event_at": 1,
         "event_type": 1,
         "page": 1,
+        "activity_type": 1,
+        "test_role": 1,
         "task_id": 1,
         "attempt_id": 1,
         "attempt_no": 1,

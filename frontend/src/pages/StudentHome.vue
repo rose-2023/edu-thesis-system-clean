@@ -22,7 +22,7 @@
         </button>
 
         <div class="profileText">
-          <div class="hello">你好，{{ studentName }}同學</div>
+          <div class="hello">您好，{{ studentName }}同學</div>
           <div class="welcomeText">歡迎回來，今天也一起完成學習進度吧！</div>
         </div>
       </div>
@@ -333,6 +333,7 @@ const ongoingUnit = ref("U1-2 Parsons");
 const postOpen = ref(false);
 const postDoneCount = ref(0);
 const postTotalCount = ref(0);
+const assignedTestCycleId = ref("");
 
 const postTotalDots = computed(() => {
   // 若後端有回 total，就用 total；否則保持 12
@@ -448,7 +449,6 @@ async function loadHomeData() {
     const { data } = await axios.get(`${API_BASE}/api/student/units_progress`, {
       params: {
         student_id,
-        test_cycle_id: "default",
       },
     });
 
@@ -490,6 +490,7 @@ async function loadHomeData() {
     postOpen.value = !!data.posttest?.post_open;
     postDoneCount.value = Number(data.posttest?.done || 0);
     postTotalCount.value = Number(data.posttest?.total || 0);
+    assignedTestCycleId.value = String(data.posttest?.test_cycle_id || "").trim();
   } catch (e) {
     console.error("loadHomeData error:", e);
   }
@@ -505,10 +506,11 @@ function goUnit(unit) {
 }
 
 function goPostTest() {
+  if (!assignedTestCycleId.value) return;
   // [修改] 後測 Parsons 走專用路由(B)，不再導到選擇題 Quiz
   router.push({
-    path: "/posttest/parsons",
-    query: { mode: "test", test_role: "post", test_cycle_id: "default" },
+    path: "/test/taking",
+    query: { mode: "test", test_role: "post", test_cycle_id: assignedTestCycleId.value },
   });
 }
 
@@ -523,12 +525,19 @@ onMounted(async () => {
 
   // [新增] 進首頁先檢查「前測是否必做」：未完成就先導去前測
   try {
-    const sres = await fetch(`${API_BASE}/api/parsons/test/status?student_id=${encodeURIComponent(id)}&test_cycle_id=default`);
+    const sres = await fetch(`${API_BASE}/api/parsons/test/status?student_id=${encodeURIComponent(id)}`);
     const sdata = await sres.json();
     if (sdata?.ok && sdata?.pre_open && !sdata?.pre_done) {
+      const testCycleId = String(sdata?.test_cycle_id || "").trim();
+      if (!testCycleId) return;
+      localStorage.setItem("test_cycle_id", testCycleId);
+      if (sdata?.pretest_questionnaire_required) {
+        router.replace("/pretest-survey");
+        return;
+      }
       router.replace({
-        path: "/posttest/parsons",
-        query: { mode: "test", test_role: "pre", test_cycle_id: "default" },
+        path: "/test/taking",
+        query: { mode: "test", test_role: "pre", test_cycle_id: testCycleId },
       });
       return;
     }
@@ -555,8 +564,13 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+:global(body) {
+  margin: 0;
+}
+
 .homePage {
-  min-height: 100vh;
+  min-height: 100dvh;
+  box-sizing: border-box;
   background:
     radial-gradient(circle at top left, rgba(255, 223, 186, 0.28), transparent 26%),
     linear-gradient(180deg, #fffdf9 0%, #f7f8fc 100%);

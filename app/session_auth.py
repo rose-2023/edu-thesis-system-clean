@@ -1,4 +1,4 @@
-# 預防同個帳號在不同裝置同時登入，造成 session 被覆蓋的問題。
+# 預防同個帳號在不同裝置同時登入，造成 session 被覆蓋的問題。 資安防護
 from datetime import datetime, timezone
 from functools import wraps
 

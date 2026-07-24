@@ -38,6 +38,11 @@
           <p>發布前請先確認測驗題目與開放時程。</p>
         </div>
 
+        <label class="assessment-cycle">
+          <span>測驗批次</span>
+          <input v-model.trim="testCycleId" type="text" placeholder="例如：2026_07_batch_01" @change="fetchPostOpen" />
+        </label>
+
         <div class="posttest-bar">
         <div class="test-control-group">
           <div class="posttest-left">
@@ -45,7 +50,7 @@
             <span class="posttest-status" :class="{ open: preOpen === true, closed: preOpen === false }">
               {{ preOpen === null ? "未讀取" : (preOpen ? "已開放" : "未開放") }}
             </span>
-            <span class="posttest-hint">（首次登入控制：default）</span>
+            <span class="posttest-hint">（批次：{{ testCycleId || "未設定" }}）</span>
           </div>
 
           <div class="posttest-actions">
@@ -64,14 +69,14 @@
             <span class="posttest-status" :class="{ open: postOpen === true, closed: postOpen === false }">
               {{ postOpen === null ? "未讀取" : (postOpen ? "已開放" : "未開放") }}
             </span>
-            <span class="posttest-hint">（全班後測控制：default）</span>
+            <span class="posttest-hint">（批次：{{ testCycleId || "未設定" }}）</span>
           </div>
 
           <div class="posttest-actions">
-            <button class="btn primary" :disabled="postOpenLoading" @click="setPostOpen(true)">
+            <button class="btn primary" :disabled="!testCycleId || postOpenLoading" @click="setPostOpen(true)">
               發布後測
             </button>
-            <button class="btn warn" :disabled="postOpenLoading" @click="setPostOpen(false)">
+            <button class="btn warn" :disabled="!testCycleId || postOpenLoading" @click="setPostOpen(false)">
               取消後測發布
             </button>
           </div>
@@ -1341,9 +1346,7 @@ function isStudentVisible(q) {
 }
 
 // [新增] ===== 測驗開放控制（依單元） =====
-const testCycleId = computed(() => (selectedUnit.value || "default").toString().trim());
-const preTestCycleId = computed(() => "default");
-const postTestCycleId = computed(() => "default");
+const testCycleId = ref("2026_07_batch_01");
 const preOpen = ref(null); // null=未讀取, true/false=狀態
 const postOpen = ref(null); // null=未讀取, true/false=狀態
 const preOpenLoading = ref(false);
@@ -1353,12 +1356,11 @@ async function fetchPostOpen() {
   preOpenLoading.value = true;
   postOpenLoading.value = true;
   try {
-    const [preRes, postRes] = await Promise.all([
-      t5Get("/test_control", { params: { test_cycle_id: preTestCycleId.value } }),
-      t5Get("/test_control", { params: { test_cycle_id: postTestCycleId.value } }),
-    ]);
-    preOpen.value = !!preRes?.data?.pre_open;
-    postOpen.value = !!postRes?.data?.post_open;
+    const { data } = await t5Get("/test_control", {
+      params: { test_cycle_id: testCycleId.value },
+    });
+    preOpen.value = !!data?.pre_open;
+    postOpen.value = !!data?.post_open;
   } catch (e) {
     // 若後端尚未加入此 API，不讓頁面壞掉
     preOpen.value = null;
@@ -1376,7 +1378,7 @@ async function setPreOpen(open) {
 
   try {
     const { data } = await t5Post("/test_control", {
-      test_cycle_id: preTestCycleId.value,
+      test_cycle_id: testCycleId.value,
       test_role: "pre",
       pre_open: open
     });
@@ -1395,7 +1397,7 @@ async function setPostOpen(open) {
 
   try {
     const { data } = await t5Post("/test_control", {
-      test_cycle_id: postTestCycleId.value,
+      test_cycle_id: testCycleId.value,
       test_role: "post",
       post_open: open
     });
@@ -3539,7 +3541,7 @@ async function loadSegmentEditorTask(taskId) {
         return {
           id: String(b.id ?? b._id ?? `b${idx}`),
           text,
-          meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
+          meaning_zh: canonicalMeaningZh(b),
           enabled: b?.enabled !== false,
           indent: hasExplicitIndent && Number.isFinite(Number(b.indent))
             ? Number(b.indent)
@@ -3711,7 +3713,7 @@ async function openPreview(row = null) {
         return {
           id: String(b.id ?? b._id ?? `b${idx}`),
           text,
-          meaning_zh: b.semantic_zh || b.semantic || b.zh || "",
+          meaning_zh: canonicalMeaningZh(b),
           enabled: b?.enabled !== false,
           indent: hasExplicitIndent && Number.isFinite(Number(b.indent))
             ? Number(b.indent)
@@ -3906,6 +3908,12 @@ const editableQuestions = computed(() => {
   return (questions.value || []).filter((q) => !!q?.task_id);
 });
 
+function canonicalMeaningZh(block) {
+  if (!block || typeof block !== "object") return "";
+  const meaning = block.meaning_zh ?? block.semantic_zh ?? block.semantic ?? block.zh ?? "";
+  return String(meaning).trim();
+}
+
 function clonePreviewBlocks(blocks = []) {
   return (Array.isArray(blocks) ? blocks : []).map((b, idx) => {
     const raw = b && typeof b === "object" ? b : {};
@@ -3915,7 +3923,7 @@ function clonePreviewBlocks(blocks = []) {
     return {
       id: String(raw.id ?? raw._id ?? `b${idx}`),
       text,
-      meaning_zh: String(raw.meaning_zh ?? raw.semantic_zh ?? raw.semantic ?? raw.zh ?? ""),
+      meaning_zh: canonicalMeaningZh(raw),
       enabled: raw.enabled !== false,
       indent: hasExplicitIndent && Number.isFinite(Number(raw.indent))
         ? Number(raw.indent)
@@ -4131,7 +4139,7 @@ const solutionBlocks = computed(() => {
     id: String(b.id ?? b._id ?? `s${idx}`),
     _key: `s-${idx}-${b.id ?? ""}`,
     code: b.code || b.text || b.line || "",
-    semantic_zh: b.semantic_zh || b.semantic || b.zh || ""
+    semantic_zh: canonicalMeaningZh(b)
   }));
 });
 
@@ -4141,7 +4149,7 @@ const distractorBlocks = computed(() => {
     id: String(b.id ?? b._id ?? `d${idx}`),
     _key: `d-${idx}-${b.id ?? ""}`,
     code: b.code || b.text || b.line || "",
-    semantic_zh: b.semantic_zh || b.semantic || b.zh || ""
+    semantic_zh: canonicalMeaningZh(b)
   }));
 });
 
@@ -5054,28 +5062,9 @@ async function publishFromPreview() {
 }
 
 // ai中文語意提示
-function enhanceMeaning(codeText, rawMeaning) {
-  const t = (codeText || "").trim();
-
-  // 先用你原本的 rawMeaning 當 fallback
-  const base = rawMeaning || "（未提供）";
-
-  // 針對常見模式做教學版補強
-  if (/^total\s*=\s*0$/.test(t)) {
-    return "建立變數 total，用來累積加總結果，先把初始值設為 0。";
-  }
-  if (/^for\s+\w+\s+in\s+range\(\s*1\s*,\s*6\s*\)\s*:\s*$/.test(t)) {
-    return "使用迴圈讓 i 依序取值 1 到 5，準備逐一加總（range(1,6) 不包含 6）。";
-  }
-  if (/^total\s*\+=\s*i$/.test(t)) {
-    return "把目前的 i 加到 total 中，逐步累積總和。";
-  }
-  if (/^print\(\s*total\s*\)$/.test(t)) {
-    return "迴圈結束後，輸出最後計算完成的總和結果。";
-  }
-
-  // 其他行：維持原本語意
-  return base;
+function enhanceMeaning(_codeText, rawMeaning) {
+  // Preview must faithfully display the saved teacher/AI meaning.
+  return String(rawMeaning ?? "").trim() || "未提供";
 }
 
 
@@ -5097,7 +5086,7 @@ async function returnNotPublish() {
 
 
 // [新增] 切換單元時同步讀取後測開放狀態
-watch(selectedUnit, () => {
+watch(testCycleId, () => {
   fetchPostOpen();
 });</script>
 
@@ -6534,6 +6523,28 @@ watch(selectedUnit, () => {
   font-size: 12px;
 }
 
+.assessment-cycle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  color: var(--navy);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.assessment-cycle input {
+  width: min(280px, 100%);
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--navy);
+  font: inherit;
+  font-weight: 500;
+}
+
 .posttest-bar {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -7000,6 +7011,8 @@ watch(selectedUnit, () => {
   .main { padding: 18px 14px 36px; }
   .page-hero { padding: 22px; border-radius: 20px; }
   .hero-stats { grid-template-columns: 1fr; }
+  .assessment-cycle { align-items: flex-start; flex-direction: column; }
+  .assessment-cycle input { width: 100%; }
   .assessment-panel-head,
   .section-head-spread { flex-direction: column; align-items: stretch; }
   .row2 { grid-template-columns: 1fr; }

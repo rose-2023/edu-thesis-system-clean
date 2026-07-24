@@ -3,7 +3,6 @@ import { createRouter, createWebHistory } from "vue-router";
 import Login from "../pages/Login.vue";
 import Entry from "../pages/Entry.vue";
 import Quiz from "../pages/Quiz.vue";
-import PreCheck from "../pages/PreCheck.vue";
 import StudentHome from "../pages/StudentHome.vue";
 import AdminUpload from "../pages/AdminUpload.vue";
 
@@ -13,13 +12,16 @@ const routes = [
   { path: "/login", name: "login", component: Login, meta: { public: true } },
   { path: "/entry", name: "entry", component: Entry },
   { path: "/parsons/:videoId", name: "parsons", component: () => import("../pages/parsons.vue") },
-  { path: "/posttest/parsons", name: "posttest_parsons", component: () => import("../pages/parsons.vue") },
+  { path: "/test/taking", name: "testTaking", component: () => import("../pages/TestTaking.vue") },
+  { path: "/posttest/parsons", redirect: (to) => ({ path: "/test/taking", query: to.query }) },
   { path: "/learn/video/:videoId", name: "student-learning", component: () => import("../pages/StudentLearning.vue") },
   { path: "/quiz", name: "quiz", component: Quiz },
-  { path: "/precheck", name: "precheck", component: PreCheck },
+  { path: "/pretest-survey", name: "pretestSurvey", component: () => import("../pages/PretestSurvey.vue") },
+  { path: "/precheck", redirect: "/pretest-survey" },
   { path: "/home", name: "home", component: StudentHome },
   { path: "/admin/upload", name: "adminUpload", component: AdminUpload },
   { path: "/admin/dashboard", name: "teacherDashboard", component: () => import("../pages/TeacherDashboard.vue") },
+  { path: "/admin/pretest-surveys", name: "teacherPretestSurveys", component: () => import("../pages/TeacherPretestSurveys.vue") },
   { path: "/admin/agentlog", name: "teacherAgentLog", component: () => import("../pages/TeacherT5AgentLog.vue") },
   { path: "/admin/analyze", name: "teacherAnalyze", component: () => import("../pages/TeacherAnalyze.vue") },
   { path: "/admin/subtitle", name: "teacherSubtitle", component: () => import("../pages/TeacherSubtitles.vue") },

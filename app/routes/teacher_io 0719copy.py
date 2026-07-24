@@ -1,21 +1,15 @@
 import csv
 import io
 import json
-import math
 import re
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
 
-from flask import Blueprint, Response, current_app, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 from werkzeug.security import generate_password_hash
 
 from app.db import db
-from app.randomization import (
-    RandomizationSlotsExhausted,
-    assign_feedback_strategy_on_import,
-)
 from app.routes.teacher_analysis import (
     TEST_STUDENT_ID,
     VALID_TEST_ROLES,
@@ -36,9 +30,8 @@ from app.routes.teacher_analysis import (
 teacher_io_bp = Blueprint("teacher_io", __name__)
 
 TAIPEI_TZ = timezone(timedelta(hours=8))
-VALID_GROUP_TYPES = {"control", "experimental_1", "experimental_2"}
+VALID_GROUP_TYPES = {"experimental", "control"}
 VALID_USER_ROLES = {"student", "teacher", "admin"}
-ASSIGNMENT_METHOD_MATCHED_PAIRS = "matched_pairs"
 MAX_USER_CSV_BYTES = 2 * 1024 * 1024
 SENSITIVE_CSV_FIELDS = frozenset({
     "password",
@@ -88,7 +81,7 @@ def _normalize_sexj(value):
 
 
 def _resolve_import_assignment(existing, role, imported_group_type):
-    """Prepare an import for immediate server-side randomization."""
+    """Resolve group fields without clearing an existing assignment on blank CSV input."""
     existing = existing or {}
     existing_group_type = _optional_string(existing.get("group_type"))
     if existing_group_type not in VALID_GROUP_TYPES:
@@ -103,131 +96,28 @@ def _resolve_import_assignment(existing, role, imported_group_type):
             ),
             "assignment_status": None,
             "assignment_method": None,
-            "assignment_locked": False,
         }
 
-    if existing.get("assignment_locked") is True:
+    if imported_group_type is not None:
+        return {
+            "group_type": imported_group_type,
+            "assignment_status": "assigned",
+            "assignment_method": "manual_import",
+        }
+
+    if existing_group_type is not None:
         return {
             "group_type": existing_group_type,
             "assignment_status": "assigned",
             "assignment_method": existing.get("assignment_method"),
-            "assignment_locked": True,
         }
 
-    if existing.get("assignment_status") == "assigned" and existing_group_type is not None:
-        return {
-            "group_type": existing_group_type,
-            "assignment_status": "assigned",
-            "assignment_method": existing.get("assignment_method"),
-            "assignment_locked": False,
-        }
-
-    # Ignore imported_group_type for new/pending formal students.  Grouping is
-    # performed only by the server-side randomization immediately after import.
     return {
         "group_type": None,
-        "assignment_status": "pending_randomization",
+        "assignment_status": "unassigned",
         "assignment_method": None,
-        "assignment_locked": False,
     }
 
-
-
-def _normalize_score_percentage(value):
-    """Return a finite score between 0 and 100, or None when invalid."""
-    if isinstance(value, bool):
-        return None
-    try:
-        score = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(score) or score < 0 or score > 100:
-        return None
-    return round(score, 4)
-
-
-def _opposite_group(group_type):
-    return "control" if group_type == "experimental_1" else "experimental_1"
-
-
-def _build_matched_pair_assignments(students, start_group):
-    """
-    Sort by score descending, then student_id ascending.
-    Adjacent students form pairs, and the pair direction alternates.
-    """
-    ordered = sorted(
-        students,
-        key=lambda item: (
-            -item["score_percentage"],
-            item["student_id"],
-        ),
-    )
-
-    assignments = []
-    opposite_start = _opposite_group(start_group)
-
-    for index, student in enumerate(ordered):
-        pair_index = index // 2
-        position_in_pair = index % 2
-
-        if pair_index % 2 == 0:
-            pair_pattern = (start_group, opposite_start)
-        else:
-            pair_pattern = (opposite_start, start_group)
-
-        assignments.append({
-            "student_id": student["student_id"],
-            "score_percentage": student["score_percentage"],
-            "rank_in_batch": index + 1,
-            "pair_number": pair_index + 1,
-            "position_in_pair": position_in_pair + 1,
-            "group_type": pair_pattern[position_in_pair],
-        })
-
-    return assignments
-
-
-def _next_assignment_start_group():
-    latest = db.assignment_batches.find_one(
-        {
-            "status": "completed",
-            "assignment_method": ASSIGNMENT_METHOD_MATCHED_PAIRS,
-        },
-        {"_id": 0, "start_group": 1},
-        sort=[("created_at", -1), ("batch_id", -1)],
-    )
-    latest_start = _optional_string((latest or {}).get("start_group"))
-    if latest_start in VALID_GROUP_TYPES:
-        return _opposite_group(latest_start)
-    return "experimental_1"
-
-
-def _rollback_assignment_batch(batch_id, student_ids):
-    if not student_ids:
-        return
-
-    db.users.update_many(
-        {
-            "student_id": {"$in": student_ids},
-            "assignment_batch_id": batch_id,
-        },
-        {
-            "$set": {
-                "group_type": None,
-                "assignment_status": "unassigned",
-                "assignment_method": None,
-                "updated_at": datetime.now(timezone.utc),
-            },
-            "$unset": {
-                "assignment_batch_id": "",
-                "rank_in_batch": "",
-                "pair_number": "",
-                "position_in_pair": "",
-                "assignment_score_percentage": "",
-                "assigned_at": "",
-            },
-        },
-    )
 
 def _exclude_test_data():
     parsed = _parse_bool(request.args.get("exclude_test_data"), default=True)
@@ -548,7 +438,7 @@ def _attempt_record_rows(include_student=True):
         rows.append(row)
     return headers, rows
 
-# 學習紀錄
+
 def _learning_log_rows(include_student=True):
     headers = [
         "event_at",
@@ -581,7 +471,7 @@ def _learning_log_rows(include_student=True):
         rows.append(row)
     return headers, rows
 
-# 影片重看紀錄
+
 def _video_rewatch_log_rows(include_student=True):
     headers = [
         "event_at",
@@ -661,306 +551,6 @@ def analytics_student_options():
     return jsonify(build_student_options(class_name, group_filter))
 
 
-
-@teacher_io_bp.post("/assignment-batches")
-def create_assignment_batch():
-    """
-    Create or preview a matched-pair assignment batch.
-
-    Request JSON:
-    {
-      "batch_name": "2026_07_batch_01",
-      "start_group": "experimental_1",
-      "dry_run": false,
-      "students": [
-        {"student_id": "S001", "score_percentage": 92},
-        {"student_id": "S002", "score_percentage": 88}
-      ]
-    }
-
-    dry_run defaults to true. Set dry_run=false to write to MongoDB.
-    """
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({
-            "ok": False,
-            "message": "json_body_required",
-        }), 400
-
-    raw_students = payload.get("students")
-    if not isinstance(raw_students, list) or len(raw_students) < 2:
-        return jsonify({
-            "ok": False,
-            "message": "at_least_two_students_required",
-        }), 400
-
-    dry_run = _parse_bool(payload.get("dry_run"), default=True)
-    if dry_run is None:
-        return jsonify({
-            "ok": False,
-            "message": "invalid_dry_run",
-        }), 400
-
-    start_group = _optional_string(payload.get("start_group"))
-    if start_group:
-        start_group = start_group.lower()
-        if start_group not in VALID_GROUP_TYPES:
-            return jsonify({
-                "ok": False,
-                "message": "invalid_start_group",
-                "allowed": sorted(VALID_GROUP_TYPES),
-            }), 400
-    else:
-        start_group = _next_assignment_start_group()
-
-    now = datetime.now(timezone.utc)
-    batch_name = _optional_string(payload.get("batch_name"))
-    if not batch_name:
-        batch_name = f"batch_{now.strftime('%Y%m%d_%H%M%S')}"
-    if len(batch_name) > 100:
-        return jsonify({
-            "ok": False,
-            "message": "batch_name_too_long",
-        }), 400
-
-    normalized_students = []
-    seen_student_ids = set()
-    invalid_rows = []
-
-    for row_number, item in enumerate(raw_students, start=1):
-        if not isinstance(item, dict):
-            invalid_rows.append({
-                "row": row_number,
-                "reason": "student_item_must_be_object",
-            })
-            continue
-
-        student_id = _optional_string(item.get("student_id"))
-        score_percentage = _normalize_score_percentage(
-            item.get("score_percentage")
-        )
-
-        if not student_id:
-            invalid_rows.append({
-                "row": row_number,
-                "reason": "missing_student_id",
-            })
-            continue
-        if student_id in seen_student_ids:
-            invalid_rows.append({
-                "row": row_number,
-                "student_id": student_id,
-                "reason": "duplicate_student_id",
-            })
-            continue
-        if score_percentage is None:
-            invalid_rows.append({
-                "row": row_number,
-                "student_id": student_id,
-                "reason": "invalid_score_percentage",
-            })
-            continue
-
-        seen_student_ids.add(student_id)
-        normalized_students.append({
-            "student_id": student_id,
-            "score_percentage": score_percentage,
-        })
-
-    if invalid_rows:
-        return jsonify({
-            "ok": False,
-            "message": "invalid_students",
-            "invalid_rows": invalid_rows,
-        }), 400
-
-    student_ids = [row["student_id"] for row in normalized_students]
-    user_rows = list(db.users.find(
-        {"student_id": {"$in": student_ids}},
-        {
-            "_id": 1,
-            "student_id": 1,
-            "role": 1,
-            "group_type": 1,
-            "assignment_status": 1,
-            "assignment_locked": 1,
-            "is_test_data": 1,
-        },
-    ))
-    users_by_id = {
-        str(user.get("student_id") or "").strip(): user
-        for user in user_rows
-    }
-
-    missing_student_ids = [
-        student_id
-        for student_id in student_ids
-        if student_id not in users_by_id
-    ]
-    if missing_student_ids:
-        return jsonify({
-            "ok": False,
-            "message": "students_not_found",
-            "student_ids": missing_student_ids,
-        }), 404
-
-    unavailable_students = []
-    for student_id in student_ids:
-        user = users_by_id[student_id]
-        role = _optional_string(user.get("role"))
-        group_type = _optional_string(user.get("group_type"))
-        assignment_status = _optional_string(user.get("assignment_status"))
-
-        if role != "student":
-            unavailable_students.append({
-                "student_id": student_id,
-                "reason": "not_student",
-            })
-        elif user.get("is_test_data") is True:
-            unavailable_students.append({
-                "student_id": student_id,
-                "reason": "test_data_not_assignable",
-            })
-        elif assignment_status in {"pending_pretest", "pending_randomization"} or user.get("assignment_locked") is True:
-            unavailable_students.append({
-                "student_id": student_id,
-                "reason": "variable_block_randomization_required",
-                "assignment_status": assignment_status,
-            })
-        elif group_type is not None or assignment_status == "assigned":
-            unavailable_students.append({
-                "student_id": student_id,
-                "reason": "already_assigned",
-                "group_type": group_type,
-                "assignment_status": assignment_status,
-            })
-
-    if unavailable_students:
-        return jsonify({
-            "ok": False,
-            "message": "students_not_assignable",
-            "students": unavailable_students,
-        }), 409
-
-    assignments = _build_matched_pair_assignments(
-        normalized_students,
-        start_group,
-    )
-    experimental_count = sum(
-        1 for row in assignments
-        if row["group_type"] == "experimental_1"
-    )
-    control_count = len(assignments) - experimental_count
-
-    batch_id = (
-        f"BATCH_{now.strftime('%Y%m%d%H%M%S')}_"
-        f"{uuid4().hex[:8].upper()}"
-    )
-
-    preview = {
-        "batch_id": batch_id,
-        "batch_name": batch_name,
-        "assignment_method": ASSIGNMENT_METHOD_MATCHED_PAIRS,
-        "start_group": start_group,
-        "student_count": len(assignments),
-        "experimental_count": experimental_count,
-        "control_count": control_count,
-        "assignments": assignments,
-    }
-
-    if dry_run:
-        return jsonify({
-            "ok": True,
-            "dry_run": True,
-            "message": "assignment_preview",
-            **preview,
-        })
-
-    if db.assignment_batches.find_one(
-        {"batch_name": batch_name},
-        {"_id": 1},
-    ):
-        return jsonify({
-            "ok": False,
-            "message": "batch_name_already_exists",
-        }), 409
-
-    updated_student_ids = []
-    try:
-        for assignment in assignments:
-            student_id = assignment["student_id"]
-            user = users_by_id[student_id]
-
-            result = db.users.update_one(
-                {
-                    "_id": user["_id"],
-                    "$and": [
-                        {
-                            "$or": [
-                                {"group_type": None},
-                                {"group_type": {"$exists": False}},
-                            ],
-                        },
-                        {
-                            "$or": [
-                                {"assignment_status": "unassigned"},
-                                {"assignment_status": None},
-                                {"assignment_status": {"$exists": False}},
-                            ],
-                        },
-                    ],
-                    "is_test_data": {"$ne": True},
-                    "role": "student",
-                },
-                {
-                    "$set": {
-                        "group_type": assignment["group_type"],
-                        "assignment_status": "assigned",
-                        "assignment_method": ASSIGNMENT_METHOD_MATCHED_PAIRS,
-                        "assignment_batch_id": batch_id,
-                        "rank_in_batch": assignment["rank_in_batch"],
-                        "pair_number": assignment["pair_number"],
-                        "position_in_pair": assignment["position_in_pair"],
-                        "assignment_score_percentage": assignment[
-                            "score_percentage"
-                        ],
-                        "assigned_at": now,
-                        "updated_at": now,
-                    },
-                },
-            )
-
-            if result.modified_count != 1:
-                raise RuntimeError(
-                    f"student_assignment_conflict:{student_id}"
-                )
-            updated_student_ids.append(student_id)
-
-        batch_doc = {
-            **preview,
-            "status": "completed",
-            "score_source": "request_payload_v1",
-            "created_at": now,
-            "completed_at": now,
-        }
-        db.assignment_batches.insert_one(batch_doc)
-
-    except Exception as exc:
-        _rollback_assignment_batch(batch_id, updated_student_ids)
-        return jsonify({
-            "ok": False,
-            "message": "assignment_batch_write_failed",
-            "detail": str(exc),
-            "rolled_back_student_count": len(updated_student_ids),
-        }), 500
-
-    return jsonify({
-        "ok": True,
-        "dry_run": False,
-        "message": "assignment_batch_created",
-        **preview,
-    }), 201
-
 @teacher_io_bp.post("/import/users-csv")
 def import_users_csv():
     if "file" not in request.files:
@@ -983,15 +573,6 @@ def import_users_csv():
     updated_count = 0
     skipped_count = 0
     invalid_rows = []
-    assignment_summary = {
-        "assigned": 0,
-        "already_assigned": 0,
-        "excluded_test_data": 0,
-        "control": 0,
-        "experimental_1": 0,
-        "experimental_2": 0,
-        "failed": [],
-    }
 
     for row_number, row in enumerate(reader, start=2):
         student_id = _optional_string(row.get("student_id"))
@@ -1052,13 +633,6 @@ def import_users_csv():
             existing = db.users.find_one({"student_id": student_id})
             now = datetime.now(timezone.utc)
             assignment_fields = _resolve_import_assignment(existing, role, group_type)
-            if role == "student" and is_test_data and not (existing or {}).get("assignment_locked"):
-                assignment_fields.update({
-                    "group_type": None,
-                    "assignment_status": "excluded_test_data",
-                    "assignment_method": None,
-                    "assignment_locked": False,
-                })
             update_doc = {
                 "student_id": student_id,
                 "name": _optional_string(row.get("name")),
@@ -1085,36 +659,6 @@ def import_users_csv():
                 update_doc["last_login_at"] = None
                 db.users.insert_one(update_doc)
                 inserted_count += 1
-
-            if role == "student" and not is_test_data:
-                try:
-                    assignment = assign_feedback_strategy_on_import(student_id)
-                    if assignment.get("assigned") and not assignment.get("recovered"):
-                        assignment_summary["assigned"] += 1
-                        assigned_group_type = _optional_string(assignment.get("group_type"))
-                        if assigned_group_type in {"control", "experimental_1", "experimental_2"}:
-                            assignment_summary[assigned_group_type] += 1
-                    else:
-                        assignment_summary["already_assigned"] += 1
-                except RandomizationSlotsExhausted:
-                    assignment_summary["failed"].append({
-                        "row": row_number,
-                        "student_id": student_id,
-                        "reason": "randomization_slots_exhausted",
-                    })
-                except Exception as exc:
-                    current_app.logger.exception(
-                        "Automatic randomization failed during user import: %s",
-                        student_id,
-                    )
-                    assignment_summary["failed"].append({
-                        "row": row_number,
-                        "student_id": student_id,
-                        "reason": "randomization_assignment_failed",
-                        "detail": str(exc),
-                    })
-            elif role == "student":
-                assignment_summary["excluded_test_data"] += 1
         except Exception:
             skipped_count += 1
             invalid_rows.append({
@@ -1123,19 +667,13 @@ def import_users_csv():
                 "reason": "row_write_failed",
             })
 
-    message = "學生已匯入，並已依全研究共用序列完成自動分派。"
-    if assignment_summary["failed"]:
-        message = "學生已匯入，但研究分派名額不足；請先新增 slots 後重新匯入同一份 CSV。"
-    response = {
-        "ok": not bool(assignment_summary["failed"]),
+    return jsonify({
+        "ok": True,
         "inserted_count": inserted_count,
         "updated_count": updated_count,
         "skipped_count": skipped_count,
         "invalid_rows": invalid_rows,
-        "assignment": assignment_summary,
-        "message": message,
-    }
-    return jsonify(response), (409 if assignment_summary["failed"] else 200)
+    })
 
 
 @teacher_io_bp.get("/export/student-summary.csv")

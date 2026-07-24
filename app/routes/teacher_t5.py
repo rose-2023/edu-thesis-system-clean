@@ -168,6 +168,39 @@ def _block_id(block, fallback):
     return raw or str(fallback)
 
 
+_SEMANTIC_ZH_KEYS = ("meaning_zh", "semantic_zh", "semantic", "zh")
+
+
+def _canonical_meaning_zh(block) -> str:
+    """Return the canonical Chinese meaning with legacy-field fallback."""
+    if not isinstance(block, dict):
+        return ""
+    for key in _SEMANTIC_ZH_KEYS:
+        if key in block and block.get(key) is not None:
+            return _clean_text(block.get(key), max_len=2000, strip=True)
+    return ""
+
+
+def _normalize_block_semantics(blocks):
+    """Synchronize legacy aliases while treating meaning_zh as canonical."""
+    if not isinstance(blocks, list):
+        return blocks
+
+    normalized = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            normalized.append(block)
+            continue
+        item = dict(block)
+        meaning = _canonical_meaning_zh(item)
+        item["meaning_zh"] = meaning
+        item["semantic_zh"] = meaning
+        item["semantic"] = meaning
+        item["zh"] = meaning
+        normalized.append(item)
+    return normalized
+
+
 def _merge_block_edits(existing_blocks, incoming_blocks):
     if not isinstance(incoming_blocks, list):
         return None
@@ -203,6 +236,8 @@ def _merge_block_edits(existing_blocks, incoming_blocks):
             )
             block["meaning_zh"] = meaning
             block["semantic_zh"] = meaning
+            block["semantic"] = meaning
+            block["zh"] = meaning
 
         if "indent" in raw:
             try:
@@ -285,8 +320,24 @@ def _test_control_doc_id(test_role, test_cycle_id):
     return "post", "post_open", f"post_open:{test_cycle_id}"
 
 
+_DEFAULT_TEST_CYCLE_ID = "2026_07_batch_01"
+
+
+def _normalize_test_cycle_id(value):
+    test_cycle_id = str(value or "").strip()
+    return _DEFAULT_TEST_CYCLE_ID if not test_cycle_id or test_cycle_id == "default" else test_cycle_id
+
+
+def _read_test_control(test_role, test_cycle_id):
+    role, field, doc_id = _test_control_doc_id(test_role, test_cycle_id)
+    doc = db.test_control.find_one({"_id": doc_id}) or {}
+    if doc or test_cycle_id != _DEFAULT_TEST_CYCLE_ID:
+        return doc
+    return db.test_control.find_one({"_id": f"{field}:default"}) or {}
+
+
 def _set_test_control(test_cycle_id, test_role, is_open):
-    test_cycle_id = str(test_cycle_id or "default").strip() or "default"
+    test_cycle_id = _normalize_test_cycle_id(test_cycle_id)
     role, field, doc_id = _test_control_doc_id(test_role, test_cycle_id)
     doc = db.test_control.find_one({"_id": doc_id}) or {}
     now = _utc_now()
@@ -308,9 +359,9 @@ def _set_test_control(test_cycle_id, test_role, is_open):
 
 @teacher_t5_bp.get("/test_control")
 def get_test_control():
-    test_cycle_id = (request.args.get("test_cycle_id") or "default").strip() or "default"
-    pre_doc = db.test_control.find_one({"_id": f"pre_open:{test_cycle_id}"}) or {}
-    post_doc = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+    test_cycle_id = _normalize_test_cycle_id(request.args.get("test_cycle_id"))
+    pre_doc = _read_test_control("pre", test_cycle_id)
+    post_doc = _read_test_control("post", test_cycle_id)
     return jsonify({
         "ok": True,
         "test_cycle_id": test_cycle_id,
@@ -324,7 +375,7 @@ def get_test_control():
 @teacher_t5_bp.post("/test_control")
 def update_test_control():
     body = request.get_json(silent=True) or {}
-    test_cycle_id = (body.get("test_cycle_id") or "default").strip() or "default"
+    test_cycle_id = _normalize_test_cycle_id(body.get("test_cycle_id"))
     role = (body.get("test_role") or body.get("role") or "").strip().lower()
 
     if "pre_open" in body:
@@ -559,8 +610,12 @@ def get_question():
     prompt = (question.get("prompt") or t.get("prompt") or t.get("question_text") or "")  # [新增] 支援 DB 的 question_text
 
     # solution_blocks / distractor_blocks / solution_order
-    solution_blocks = t.get("solution_blocks", []) or t.get("blocks", []) or []
-    distractor_blocks = t.get("distractor_blocks", []) or t.get("distractors", []) or []
+    solution_blocks = _normalize_block_semantics(
+        t.get("solution_blocks", []) or t.get("blocks", []) or []
+    )
+    distractor_blocks = _normalize_block_semantics(
+        t.get("distractor_blocks", []) or t.get("distractors", []) or []
+    )
     solution_order = t.get("solution_order", []) or t.get("solution_ids", []) or []
 
     solution_order = t.get("solution_order", []) or t.get("solution_ids", []) or []
@@ -646,7 +701,11 @@ def get_question():
                 bid = str(b.get("id") or b.get("_id") or "")
                 if bid and bid in slot_map:
                     if not (b.get("semantic_zh") or b.get("semantic") or b.get("zh") or b.get("meaning_zh")):
-                        b["semantic_zh"] = slot_map[bid]
+                        meaning = _clean_text(slot_map[bid], max_len=2000, strip=True)
+                        b["meaning_zh"] = meaning
+                        b["semantic_zh"] = meaning
+                        b["semantic"] = meaning
+                        b["zh"] = meaning
                 _new.append(b)
             solution_blocks = _new
     except Exception:
@@ -771,6 +830,7 @@ def review_save():
         body.get("solution_blocks"),
     )
     if solution_blocks is not None:
+        solution_blocks = _normalize_block_semantics(solution_blocks)
         update_doc["solution_blocks"] = solution_blocks
         update_doc["blocks"] = solution_blocks
 
@@ -787,6 +847,7 @@ def review_save():
     )
     if dblocks is None:
         dblocks = t.get("distractor_blocks", []) or []
+    dblocks = _normalize_block_semantics(dblocks)
     if isinstance(dblocks, list) and dblocks:
         for b in dblocks:
             bid = str(b.get("id") or b.get("_id") or "")

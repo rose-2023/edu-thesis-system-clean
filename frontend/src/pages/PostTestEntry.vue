@@ -8,25 +8,28 @@
 </template>
 
 <script setup>
-// ✅ 後測入口頁（B）：只負責「檢查是否開放」→ 導到 /posttest/parsons
+// ✅ 後測入口頁（B）：只負責「檢查是否開放」→ 導到 /test/taking
 import { onMounted, ref } from "vue";
-import { useRouter, useRoute } from "vue-router";
+import { useRouter } from "vue-router";
 import { api } from "../api.js"; // ✅ 一律用 named export，避免 default 匯入錯誤
 
 const router = useRouter();
-const route = useRoute();
 
 const err = ref("");
 
 async function boot() {
   try {
-    const test_cycle_id = String(route.query.test_cycle_id || "default");
     // 1) 先讀後測開放狀態（統一讀 test_control）
     const r = await api.get("/api/parsons/test/status", {
-      params: { test_cycle_id, test_role: "post" },
+      params: { test_role: "post" },
     });
     if (!r?.data?.ok) {
       err.value = "後測狀態讀取失敗";
+      return;
+    }
+    const test_cycle_id = String(r.data.test_cycle_id || "").trim();
+    if (!test_cycle_id) {
+      err.value = "尚未分配測驗批次，請聯絡教師。";
       return;
     }
     if (!r.data.post_open) {
@@ -36,7 +39,7 @@ async function boot() {
 
     // 2) 開放 → 導到 後測 Parsons 專用路由(B)
     router.replace({
-      path: "/posttest/parsons",
+      path: "/test/taking",
       query: { mode: "test", test_role: "post", test_cycle_id },
     });
   } catch (e) {

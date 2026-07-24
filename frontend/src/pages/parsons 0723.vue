@@ -10,7 +10,34 @@
       </div>
     </div>
 
-    <div class="board">
+    <div v-if="isChoiceTestQuestion" class="choice-board">
+      <div class="choice-panel">
+        <div class="choice-topline">
+          <span>前測選擇題</span>
+          <span>第 {{ testMeta.current_index }} / {{ testMeta.total }} 題</span>
+        </div>
+
+        <div v-if="state.noTask" class="emptyBox">
+          {{ state.err || "目前沒有可作答的前測題目" }}
+        </div>
+
+        <div v-else class="choice-options" role="radiogroup" aria-label="選擇答案">
+          <button
+            v-for="option in choiceOptions"
+            :key="option.key"
+            type="button"
+            class="choice-option"
+            :class="{ selected: selectedChoiceKey === option.key }"
+            @click="selectChoice(option)"
+          >
+            <span class="choice-key">{{ option.key }}</span>
+            <span class="choice-text">{{ option.text }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-else class="board">
       <!-- 左：挖空作答區 -->
       <div class="panel">
         <div class="panel-title">題目作答程式區：</div>
@@ -114,16 +141,20 @@
     <!-- 按鈕 -->
     <div class="actions">
       <button class="btn ghost back-page-btn" type="button" @click="goPreviousPage">
-        返回上一頁
+        返回影片觀看
       </button>
-      <button class="btn submit" @click="submit" :disabled="state.submitting || state.noTask">
-        {{ state.submitting ? "送出中..." : "送出" }}
+      <button
+        class="btn submit"
+        @click="submit"
+        :disabled="state.submitting || state.noTask || (isChoiceTestQuestion && !selectedChoiceKey)"
+      >
+        {{ state.submitting ? "送出中..." : (isChoiceTestQuestion ? "送出答案" : "送出") }}
       </button>
 
     </div>
 
     <!-- 回饋（測驗模式不顯示） -->
-    <template v-if="!isTestMode || state.errType === 'incomplete_answer'">
+    <template v-if="!isTestMode || state.errType === 'incomplete_answer' || isChoiceTestQuestion">
       <div v-if="state.err && !state.noTask" class="result">
         {{ state.err }}
       </div>
@@ -313,9 +344,6 @@
               <button class="btn submit" @click="onToggleHintOpen" :disabled="feedbackModal.hintLoading || (!feedbackModal.hintOpen && feedbackModal.hintLimitReached)">
                 {{ feedbackModal.hintLoading ? "提示中..." : (feedbackModal.hintOpen ? "收起提示" : (feedbackModal.hintLimitReached ? "提示已達上限" : "查看提示")) }}
               </button>
-              <button v-if="showReviewVideoFeature" class="btn submit" @click="onToggleReviewOpen">
-                {{ feedbackModal.reviewOpen ? "收起影片" : "查看影片" }}
-              </button>
             </div>
           </div>
 
@@ -331,21 +359,8 @@
                 {{ hintRemaining <= 0 ? "已使用提示" : (isRegeneratingHint ? "提示中..." : `再次提示(${hintRemaining})`) }}
               </button>
             </div>
-            <div v-if="showReviewVideoFeature" class="fb-actions pick">
-              <button class="btn submit" @click="openReviewFromHint">回看影片</button>
-            </div>
           </div>
 
-          <div class="fb-section fb-review" v-if="showReviewVideoFeature && feedbackModal.reviewOpen">
-            <div class="fb-label">🎬 建議回看片段</div>
-            <div class="fb-focus" v-if="feedbackModal.reviewMode === 'chapter_recommendation'">模式：章節推薦</div>
-            <div class="fb-focus" v-else>模式：秒級字幕對齊</div>
-            <div class="fb-time">{{ feedbackModal.reviewRange }}</div>
-            <div v-if="feedbackModal.debugText" class="fb-debug">{{ feedbackModal.debugText }}</div>
-            <div class="fb-actions">
-              <button class="btn submit" @click="goReviewFromModal">前往影片</button>
-            </div>
-          </div>
         </template>
       </div>
     </div>
@@ -386,7 +401,6 @@ import { ref, reactive, computed, onMounted, watch, nextTick, onBeforeUnmount } 
 import { useRoute, useRouter, onBeforeRouteLeave } from "vue-router";
 import { formatTaipeiDateTime } from "../utils/dateTime.js";
 const API_BASE = import.meta.env.VITE_API_BASE || "";
-const showReviewVideoFeature = false;
 
 const route = useRoute();
 const router = useRouter();
@@ -405,7 +419,7 @@ onMounted(() => {
 // ==============================
 const isTestMode = computed(() => String(route.query.mode || "") === "test");
 const testRole = computed(() => String(route.query.test_role || "pre").toLowerCase());
-const testCycleId = computed(() => String(route.query.test_cycle_id || "default"));
+const testCycleId = computed(() => String(route.query.test_cycle_id || localStorage.getItem("test_cycle_id") || ""));
 const studentId = computed(() => String(localStorage.getItem("student_id") || localStorage.getItem("studentId") || "").trim());
 const participantId = computed(() => String(localStorage.getItem("participant_id") || "").trim());
 
@@ -578,16 +592,14 @@ const videoId = computed(() => {
   return String(route.params.videoId || route.params.id || route.params.video_id || "");
 });
 
-const review_attempt_id = computed(() => {
-  const a = route.query.review_attempt_id ? String(route.query.review_attempt_id) : "";
-  const b = route.query.attempt_id ? String(route.query.attempt_id) : "";
-  return a || b;
-});
 
 // ====== 後端載入的題目資料 ======
 const task = ref(null);
 const poolBlocks = ref([]);
 const templateSlots = ref([]);
+const testQuestionType = ref("parsons");
+const choiceOptions = ref([]);
+const selectedChoiceKey = ref("");
 const previousCompletedAt = ref("");
 const currentCompletedAt = ref("");
 const answerTimeRaw = computed(() => previousCompletedAt.value || currentCompletedAt.value || "");
@@ -597,6 +609,79 @@ const completionTimeText = computed(() => {
 });
 const teacherForcedHideSemantic = ref(false);
 const effectiveShowSemanticZh = computed(() => !teacherForcedHideSemantic.value);
+const isChoiceTestQuestion = computed(() => (
+  isTestMode.value &&
+  String(testQuestionType.value || "").toLowerCase() === "choice"
+));
+
+function normalizeChoiceOptions(rawOptions = []) {
+  const list = Array.isArray(rawOptions) ? rawOptions : [];
+  const labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  return list
+    .map((option, index) => {
+      const fallbackKey = labels[index] || String(index + 1);
+      if (option && typeof option === "object") {
+        return {
+          key: String(option.key || option.label || option.value || fallbackKey).trim().toUpperCase(),
+          text: String(option.text || option.label_text || option.content || option.value || "").trim(),
+        };
+      }
+      const rawText = String(option || "").trim();
+      const match = rawText.match(/^\s*([A-Za-z])[\.\)、)]\s*(.+)$/);
+      return {
+        key: match ? match[1].toUpperCase() : fallbackKey,
+        text: match ? match[2].trim() : rawText,
+      };
+    })
+    .filter((option) => option.key && option.text);
+}
+
+function normalizeTestQuestionType(payload = {}) {
+  const raw = String(payload?.question_type || payload?.type || "").trim().toLowerCase();
+  if (["choice", "choices", "mcq", "multiple_choice", "single_choice"].includes(raw)) return "choice";
+  if (Array.isArray(payload?.options) && payload.options.length) return "choice";
+  return "parsons";
+}
+
+async function applyTestTaskPayload(payload, { bindBlanks = true } = {}) {
+  testQuestionType.value = normalizeTestQuestionType(payload);
+  selectedChoiceKey.value = "";
+
+  if (testQuestionType.value === "choice") {
+    task.value = {
+      ...(payload || {}),
+      task_id: String(payload?.task_id || payload?.question_id || ""),
+      question_type: "choice",
+      question_text: String(payload?.question_text || payload?.stem || payload?.question || ""),
+    };
+    choiceOptions.value = normalizeChoiceOptions(payload?.options || []);
+    poolBlocks.value = [];
+    templateSlots.value = [];
+    wrongIndices.value = [];
+    primaryWrongIndex.value = null;
+    wrongSlotIssueMap.value = {};
+    result.value = null;
+    state.err = "";
+    state.errType = "";
+    return;
+  }
+
+  choiceOptions.value = [];
+  const norm = normalizeTaskPayload(payload);
+  task.value = norm.taskObj;
+  poolBlocks.value = norm.pool;
+  teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
+  templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
+  if (bindBlanks) {
+    await bindBlankFocusHandlers();
+  }
+}
+
+function selectChoice(option) {
+  selectedChoiceKey.value = String(option?.key || "").trim().toUpperCase();
+  state.err = "";
+  state.errType = "";
+}
 
 // 回饋策略：舊資料沒有欄位時預設 B，避免影響原本功能
 const feedbackStrategy = computed(() => {
@@ -751,32 +836,17 @@ const feedbackModal = reactive({
   conceptHint: "",
   reflectionQuestions: [],
   impactHint: "",
-  reviewRange: "（未提供）",
-  reviewMode: "subtitle_alignment",
-  subtitleHealth: null,
-  chapterRecommendation: null,
-  chapterLabel: "",
-  reviewFocus: "",
   hintOpen: false,
   hintLoading: false,
   hintLoaded: false,
   hintError: "",
   hintLimitReached: false,
-  reviewOpen: false,
-  start: null,
-  end: null,
-  chapterStart: null,
-  chapterEnd: null,
-  jumpVideoId: "",
   attemptId: "",
   attemptV2Id: "",
   attemptNo: null,
-  reviewAttemptId: "",
-  reviewOpenLogId: "",
+  hintViewLogId: "",
   taskId: "",
   targetConcept: "",
-  hintClicked: false,
-  videoClicked: false,
   source: "default",
   aiDiagnosisSummary: "",
   hintRecord: null,
@@ -796,7 +866,6 @@ const feedbackModal = reactive({
   possibleCauses: [],
   actualText: "",
   expectedText: "",
-  debugText: "",
 });
 
 const firstHintPanel = reactive({
@@ -1134,6 +1203,10 @@ function resetFilled() {
   wrongSlotIssueMap.value = {};
   result.value = null;
   state.err = "";
+  state.errType = "";
+  selectedChoiceKey.value = "";
+  choiceOptions.value = [];
+  testQuestionType.value = "parsons";
   fixedSemanticFeedbackActive.value = false;
   cStrategyWrongSubmitCount.value = 0;
   previousCompletedAt.value = "";
@@ -1670,9 +1743,9 @@ async function advanceTestAfterSubmit() {
     if (total <= 1 || cur >= total) {
       const role = String(testRole.value || "");
       if (role === "pre") {
-        alert("前測已完成！系統將帶您回首頁。");
+        alert("測驗已完成，感謝您的作答!將進入首頁可以開始觀看影片進行練習。");
       } else if (role === "post") {
-        alert("後測已完成！感謝您的作答。");
+        alert("測驗已完成！感謝您的作答。");
       }
       router.replace("/home");
       return;
@@ -1686,18 +1759,14 @@ async function advanceTestAfterSubmit() {
         testMeta.total = j?.total || total;
         testMeta.current_index = j?.current_index || (cur + 1);
 
-        const norm = normalizeTaskPayload(j);
-        task.value = norm.taskObj;
-        poolBlocks.value = norm.pool;
-        templateSlots.value = norm.slots;
-
         resetFilled();
+        await applyTestTaskPayload(j);
         wrongIndices.value = [];
         primaryWrongIndex.value = null;
         wrongSlotIssueMap.value = {};
         result.value = null;
         state.err = "";
-        await bindBlankFocusHandlers();
+        state.errType = "";
         await recordTaskOpen();
         return;
       }
@@ -1721,13 +1790,6 @@ async function advanceTestAfterSubmit() {
       router.push("/home");
     }
   }
-}
-
-function fmtTime(sec) {
-  const s = Math.max(0, Math.floor(Number(sec) || 0));
-  const mm = String(Math.floor(s / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
 }
 
 function debugFeedback(payload) {
@@ -1770,16 +1832,6 @@ function buildWrongFeedbackParts(r) {
     reflectionQuestions.push(aiGuidingQuestion);
   }
   const hasUsableAi = Boolean(aiDiagnosisSummary || aiConceptHint || aiFirstHint || aiSecondHint || reflectionQuestions.length || possibleCauses.length || aiImpactHint);
-
-  const startSec = Number.isFinite(Number(r?.jump?.start)) ? Number(r.jump.start) : 0;
-  const endSec = Number.isFinite(Number(r?.jump?.end)) ? Number(r.jump.end) : 0;
-  const subtitleHealth = (r?.subtitle_health && typeof r.subtitle_health === "object") ? r.subtitle_health : null;
-  const chapterRecommendation = (r?.chapter_recommendation && typeof r.chapter_recommendation === "object") ? r.chapter_recommendation : null;
-  const reviewMode = String(r?.review_mode || subtitleHealth?.mode || (chapterRecommendation ? "chapter_recommendation" : "subtitle_alignment") || "subtitle_alignment").trim() || "subtitle_alignment";
-  const chapterLabel = buildChapterLabel(chapterRecommendation);
-  const reviewRange = (reviewMode === "chapter_recommendation")
-    ? (chapterLabel || "（章節推薦）")
-    : ((endSec > startSec) ? `${fmtTime(startSec)} - ${fmtTime(endSec)}` : "（未提供）");
 
   const hasIfElseStructure = (poolBlocks.value || []).some((b) => String(b?.text || "").trim() === "else:")
     && (poolBlocks.value || []).some((b) => /^\s*if\s+.+:\s*$/.test(String(b?.text || "")));
@@ -1903,9 +1955,6 @@ function buildWrongFeedbackParts(r) {
     conceptHint,
     reflectionQuestions: resolvedReflections,
     impactHint: aiImpactHint || impactHint,
-    reviewRange,
-    startSec,
-    endSec,
     hasIndentError,
     indentErrorCount: indentErrors.length,
     source: hasUsableAi ? "ai" : "default",
@@ -1916,18 +1965,11 @@ function buildWrongFeedbackParts(r) {
     expectedText,
     wrongType,
     conceptTag,
-    reviewMode,
-    subtitleHealth,
-    chapterRecommendation,
-    chapterLabel,
   };
 }
 
 function buildWrongFeedback(r) {
   const parts = buildWrongFeedbackParts(r);
-  const reviewLabel = String(parts.reviewMode || "").trim() === "chapter_recommendation"
-    ? "建議回看章節"
-    : "建議回看影片";
 
   return [
     `❌ 你錯在：${parts.slotLabel}`,
@@ -1941,9 +1983,6 @@ function buildWrongFeedback(r) {
     "引導思考",
     `1 ${parts.reflectionQuestions[0] || "請重新檢查此格在流程中的執行條件。"}`,
     `2 ${parts.reflectionQuestions[1] || "這行程式若放在目前位置，執行時機是否正確？"}`,
-    "",
-    reviewLabel,
-    parts.reviewRange,
   ].join("\n");
 }
 
@@ -1970,22 +2009,6 @@ function buildFeedbackLocation(parts) {
   return `${numText}（程式區塊）`;
 }
 
-function buildFeedbackReviewFocus(parts) {
-  if (String(parts?.reviewMode || "").trim() === "chapter_recommendation") {
-    return String(parts?.chapterLabel || parts?.conceptTag || "章節推薦");
-  }
-  if (String(parts?.slotLabel || "").includes("條件") && String(parts?.slotLabel || "").includes("縮排")) {
-    return "if 與縮排";
-  }
-  if (String(parts?.slotLabel || "").includes("縮排")) {
-    return "縮排層級與執行範圍";
-  }
-  if (String(parts?.slotLabel || "").includes("條件")) {
-    return "條件判斷流程";
-  }
-  return "程式區塊流程";
-}
-
 function buildHintQuestion(parts) {
   const firstHint = String(parts?.firstHint || "").trim();
   if (firstHint) return firstHint;
@@ -2001,81 +2024,6 @@ function buildHintQuestion(parts) {
     return "這一行是否需要再往右縮排一層？";
   }
   return "這一行在目前流程中的位置正確嗎？";
-}
-
-const CONCEPT_TAG_ZH = {
-  loop_count_control: "迴圈次數控制",
-  loop_reverse_range: "反向 range 迴圈",
-  nested_loop_structure: "巢狀迴圈結構",
-  if_condition_logic: "條件判斷邏輯",
-  if_branch_order: "分支順序",
-  edge_case_condition: "邊界條件",
-  star_formula_2i_minus_1: "星號公式 2i-1",
-  space_formula_n_minus_i: "空白公式 n-i",
-  input_int_cast: "輸入轉整數",
-  print_separator: "輸出分隔格式",
-  python_syntax: "Python 語法",
-};
-
-function toConceptZh(tag) {
-  const key = String(tag || "").trim().toLowerCase();
-  if (!key) return "";
-  return CONCEPT_TAG_ZH[key] || String(tag || "").trim();
-}
-
-function buildChapterLabel(ch) {
-  const title = String(ch?.chapter_title || ch?.chapter_name || ch?.title || "").trim();
-  const conceptLabel = String(ch?.concept_label || ch?.chapter_label || "").trim();
-  const family = String(ch?.family || "").trim();
-  const conceptTags = Array.isArray(ch?.concept_tags)
-    ? ch.concept_tags.map((x) => String(x || "").trim()).filter(Boolean)
-    : [];
-  const conceptTagsZh = conceptTags.map((tag) => toConceptZh(tag)).filter(Boolean);
-  const _num = (v) => {
-    if (v === null || v === undefined) return null;
-    const t = String(v).trim();
-    if (!t) return null;
-    const n = Number(t);
-    return Number.isFinite(n) ? n : null;
-  };
-  // 章節模式應優先使用秒數欄位，不應把 slot_start/slot_end（格位索引）當時間。
-  const chapterStartSec = _num(ch?.start_sec) ?? _num(ch?.start);
-  const chapterEndSec = _num(ch?.end_sec) ?? _num(ch?.end);
-  const rangeText = (chapterStartSec != null && chapterEndSec != null && chapterEndSec > chapterStartSec)
-    ? `${fmtTime(chapterStartSec)} - ${fmtTime(chapterEndSec)}`
-    : "";
-  const head = title || conceptLabel || family || conceptTagsZh[0] || "章節推薦";
-  let tail = "";
-  if (conceptLabel && conceptLabel !== head) {
-    tail = `・${conceptLabel}`;
-  } else if (!conceptLabel && conceptTagsZh.length) {
-    const tagsText = conceptTagsZh.slice(0, 2).join("／");
-    if (tagsText && tagsText !== head) {
-      tail = `・${tagsText}`;
-    }
-  }
-  return `${head}${tail}${rangeText ? `（${rangeText}）` : ""}`;
-}
-
-function getChapterBoundary(ch, keys) {
-  for (const key of keys) {
-    const raw = ch?.[key];
-    if (raw === null || raw === undefined) continue;
-    const text = String(raw).trim();
-    if (!text) continue;
-    const n = Number(text);
-    if (Number.isFinite(n)) {
-      return n;
-    }
-  }
-  return null;
-}
-
-function buildReviewRangeText(parts) {
-  if (String(parts?.reviewMode || "").trim() === "chapter_recommendation") {
-    return String(parts?.chapterLabel || "").trim() || "（章節推薦）";
-  }
-  return String(parts?.reviewRange || "").trim() || "（未提供）";
 }
 
 function buildRetryHintQuestion(parts, usedCount = 1) {
@@ -2140,33 +2088,13 @@ async function handleRetryHint() {
       hint_loaded: true,
       hint_retry_count: nextUsed,
     })));
-    feedbackModal.reviewOpenLogId = String(openEvent?.log_id || "");
-    await updateReviewOpenHintLog({
+    feedbackModal.hintViewLogId = String(openEvent?.log_id || "");
+    await updateHintViewLog({
       trigger_method: "click_hint_retry",
       button_name: "再次提示",
       hint_loaded: true,
       hint_retry_count: nextUsed,
     });
-    if (feedbackModal.attemptId) {
-      await sendChoice(feedbackModal.attemptId, "no", {
-        click_type: "hint_retry",
-        hint_retry_count: nextUsed,
-        trigger_method: "click_hint_retry",
-        button_name: "再次提示",
-        hint_no: currentHintNo(),
-        hint_click_no: currentHintNo(),
-        max_hint_count: maxHintCount,
-        hint_text: feedbackModal.hintQuestion,
-        hint_content: feedbackModal.hintQuestion,
-        hint_source: feedbackModal.source || "frontend",
-        hint_loaded: true,
-        error_type: feedbackModal.errorClass || null,
-        wrong_slots: Array.isArray(wrongIndices.value)
-          ? wrongIndices.value.map((v) => Number(v)).filter((v) => Number.isFinite(v))
-          : [],
-        ai_diagnosis_summary: feedbackModal.aiDiagnosisSummary || feedbackModal.diagnosis || "",
-      });
-    }
   } catch (err) {
     console.error("handleRetryHint error:", err);
   } finally {
@@ -2222,22 +2150,36 @@ function dismissSuccessModal() {
   successModal.open = false;
 }
 
+function buildVideoReturnRoute() {
+  const targetVideoId = String(
+    route.query.from_video_id
+    || videoId.value
+    || task.value?.video_id
+    || ""
+  ).trim();
+
+  if (!targetVideoId) return null;
+
+  return {
+    path: `/learn/video/${encodeURIComponent(targetVideoId)}`,
+    query: {
+      unit_id: currentUnitId() || "",
+      from_video_id: targetVideoId,
+    },
+  };
+}
+
 function goPreviousPage() {
   successModal.open = false;
   feedbackModal.open = false;
   saveCurrentPracticeBeforeLeave();
 
-  try {
-    if (window?.history?.length > 1) {
-      router.back();
-      return;
-    }
-  } catch (_) {}
-
-  if (videoId.value) {
-    router.push(`/learn/video/${encodeURIComponent(String(videoId.value))}`);
+  const returnRoute = buildVideoReturnRoute();
+  if (returnRoute) {
+    router.replace(returnRoute);
     return;
   }
+
   router.push("/home");
 }
 
@@ -2317,55 +2259,21 @@ function openFeedbackModal(r, taskId) {
   feedbackModal.possibleCauses = Array.isArray(parts.possibleCauses) ? parts.possibleCauses : [];
   feedbackModal.actualText = String(parts.actualText || "");
   feedbackModal.expectedText = String(parts.expectedText || "");
-  feedbackModal.reviewMode = String(parts.reviewMode || "subtitle_alignment");
-  feedbackModal.subtitleHealth = parts.subtitleHealth || null;
-  feedbackModal.chapterRecommendation = parts.chapterRecommendation || null;
-  feedbackModal.chapterLabel = buildChapterLabel(parts.chapterRecommendation);
-  feedbackModal.reviewRange = buildReviewRangeText({ ...parts, chapterLabel: feedbackModal.chapterLabel });
-  feedbackModal.reviewFocus = buildFeedbackReviewFocus(parts);
   feedbackModal.hintOpen = false;
   feedbackModal.hintLoading = false;
   feedbackModal.hintLoaded = false;
   feedbackModal.hintError = "";
   feedbackModal.hintLimitReached = false;
-  feedbackModal.reviewOpen = false;
   feedbackModal.aiDiagnosisSummary = "";
-  feedbackModal.start = parts.startSec;
-  feedbackModal.end = parts.endSec;
-  feedbackModal.chapterStart = getChapterBoundary(parts.chapterRecommendation, ["start", "start_sec"]);
-  feedbackModal.chapterEnd = getChapterBoundary(parts.chapterRecommendation, ["end", "end_sec"]);
-  feedbackModal.jumpVideoId = String(r?.jump?.video_id || "");
   feedbackModal.attemptId = String(r?.attempt_id || "");
   feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
   feedbackModal.attemptNo = Number.isFinite(Number(r?.attempt_no)) ? Number(r.attempt_no) : null;
-  feedbackModal.reviewAttemptId = String(r?.review_attempt_id || r?.attempt_id || "");
-  feedbackModal.reviewOpenLogId = "";
+  feedbackModal.hintViewLogId = "";
   feedbackModal.taskId = String(taskId || "");
   feedbackModal.targetConcept = String(r?.target_concept || currentTargetConcept() || "");
-  feedbackModal.hintClicked = false;
-  feedbackModal.videoClicked = false;
-  feedbackModal.debugText = "";
   hintRetryUsed.value = 0;
   isRegeneratingHint.value = false;
 
-  // if (import.meta.env.DEV) {
-  //   const src = String(r?.segment_source || "");
-  //   const concept = String(r?.segment_concept || "");
-  //   const wrongType = String(r?.wrong_type || "");
-  //   const conceptTag = String(r?.concept_tag || "");
-  //   const wrongIdx = Number.isFinite(Number(r?.wrong_index)) ? Number(r.wrong_index) : null;
-  //   const traceArr = Array.isArray(r?.alignment_trace) ? r.alignment_trace : [];
-  //   const traceText = traceArr.map((x) => {
-  //     const step = String(x?.step || "?");
-  //     const fbSrc = String(x?.fallback_source || "").trim();
-  //     const reason = String(x?.reason || x?.segment_source || "");
-  //     if (fbSrc) {
-  //       return `${step}:${reason || "n/a"}(${fbSrc})`;
-  //     }
-  //     return reason ? `${step}:${reason}` : step;
-  //   }).join(" | ");
-  //   feedbackModal.debugText = `debug src=${src || "n/a"}, concept=${concept || "n/a"}, wrong_type=${wrongType || "n/a"}, concept_tag=${conceptTag || "n/a"}, wrong_index=${wrongIdx != null ? wrongIdx : "n/a"}${traceText ? `\ntrace ${traceText}` : ""}`;
-  // }
 
   debugFeedback({
     modalOpen: true,
@@ -3094,7 +3002,7 @@ async function loadAiHintForModal() {
       slotLabel: feedbackModal.slotLabel,
     });
     feedbackModal.hintLoaded = true;
-    await updateReviewOpenHintLog({ hint_loaded: true });
+    await updateHintViewLog({ hint_loaded: true });
     return;
   }
 
@@ -3119,11 +3027,11 @@ async function loadAiHintForModal() {
     }
     applyAiHintToFeedbackModal(data);
     feedbackModal.hintLoaded = true;
-    await updateReviewOpenHintLog({ hint_loaded: true });
+    await updateHintViewLog({ hint_loaded: true });
   } catch (err) {
     feedbackModal.hintError = err?.message || "提示產生失敗";
     feedbackModal.hintQuestion = "AI 提示暫時無法產生，請稍後再試。";
-    await updateReviewOpenHintLog({
+    await updateHintViewLog({
       hint_loaded: false,
       hint_error: feedbackModal.hintError,
     });
@@ -3261,8 +3169,8 @@ async function logSecondHintReminderIgnored(returnMethod = "return_to_fix") {
   });
 }
 
-async function updateReviewOpenHintLog(extra = {}) {
-  const logId = String(feedbackModal.reviewOpenLogId || "").trim();
+async function updateHintViewLog(extra = {}) {
+  const logId = String(feedbackModal.hintViewLogId || "").trim();
   if (!logId) return null;
   try {
     const token = String(localStorage.getItem("token") || "").trim();
@@ -3299,9 +3207,6 @@ async function closeHintAndReturnToTask(closeMethod) {
   }));
   const closed = await closeHintReview(closeMethod);
   if (!closed) return;
-  if (feedbackModal.attemptId) {
-    await sendChoice(feedbackModal.attemptId, "no");
-  }
   feedbackModal.open = false;
   await logLearningEvent("return_to_task", learningContext);
 }
@@ -3325,9 +3230,6 @@ async function dismissFeedbackModal() {
     feedbackModal.hintOpen = false;
     await logLearningEvent("hide_hint", learningContext);
   }
-  if (feedbackModal.attemptId) {
-    await sendChoice(feedbackModal.attemptId, "no");
-  }
   feedbackModal.open = false;
   feedbackModal.mode = "legacy";
   feedbackModal.stage = "choice";
@@ -3336,14 +3238,10 @@ async function dismissFeedbackModal() {
   feedbackModal.hintLoaded = false;
   feedbackModal.hintError = "";
   feedbackModal.hintLimitReached = false;
-  feedbackModal.reviewOpen = false;
   feedbackModal.attemptV2Id = "";
   feedbackModal.attemptNo = null;
-  feedbackModal.reviewOpenLogId = "";
+  feedbackModal.hintViewLogId = "";
   feedbackModal.targetConcept = "";
-  feedbackModal.hintClicked = false;
-  feedbackModal.videoClicked = false;
-  feedbackModal.debugText = "";
   feedbackModal.source = "default";
   feedbackModal.aiDiagnosisSummary = "";
   feedbackModal.hintRecord = null;
@@ -3358,12 +3256,6 @@ async function dismissFeedbackModal() {
   feedbackModal.secondHintReminderShownLogged = false;
   feedbackModal.secondHintReminderResolved = false;
   feedbackModal.errorClass = "";
-  feedbackModal.reviewMode = "subtitle_alignment";
-  feedbackModal.subtitleHealth = null;
-  feedbackModal.chapterRecommendation = null;
-  feedbackModal.chapterLabel = "";
-  feedbackModal.chapterStart = null;
-  feedbackModal.chapterEnd = null;
   feedbackModal.firstHint = "";
   feedbackModal.secondHint = "";
   feedbackModal.possibleCauses = [];
@@ -3379,43 +3271,6 @@ async function dismissFeedbackModal() {
   }
 }
 
-async function goReviewFromModal() {
-  if (!feedbackModal.jumpVideoId) {
-    feedbackModal.open = false;
-    return;
-  }
-
-  await sendChoice(feedbackModal.attemptId, "yes");
-  savePracticeState({ attempt_id: feedbackModal.attemptId || "" });
-
-  const useChapterMode = String(feedbackModal.reviewMode || "").trim() === "chapter_recommendation";
-  const start = useChapterMode && Number.isFinite(Number(feedbackModal.chapterStart))
-    ? Number(feedbackModal.chapterStart)
-    : (feedbackModal.start ?? 0);
-  const end = useChapterMode && Number.isFinite(Number(feedbackModal.chapterEnd))
-    ? Number(feedbackModal.chapterEnd)
-    : (feedbackModal.end ?? 0);
-  const jumpVideoId = feedbackModal.jumpVideoId;
-  const attemptId = feedbackModal.reviewAttemptId;
-  const taskId = feedbackModal.taskId;
-
-  feedbackModal.open = false;
-  feedbackModal.hintClicked = false;
-  feedbackModal.videoClicked = false;
-
-  router.push({
-    path: `/learn/video/${jumpVideoId}`,
-    query: {
-      start,
-      end,
-      review_mode: useChapterMode ? "chapter_recommendation" : "subtitle_alignment",
-      attempt_id: String(attemptId || ""),
-      task_id: String(taskId || ""),
-      level: route.query.level ? String(route.query.level) : "L1",
-    },
-  });
-}
-
 async function onToggleHintOpen() {
   if (feedbackModal.hintOpen) {
     await closeHintAndReturnToTask("click_ai_hint_again");
@@ -3428,7 +3283,7 @@ async function onToggleHintOpen() {
     trigger_method: "click_ai_hint",
     button_name: "AI提示",
   })));
-  feedbackModal.reviewOpenLogId = String(openEvent?.log_id || "");
+  feedbackModal.hintViewLogId = String(openEvent?.log_id || "");
   const hintMetadata = openEvent?.metadata || {};
   if (hintMetadata.hint_limit_reached === true) {
     feedbackModal.hintOpen = false;
@@ -3437,65 +3292,12 @@ async function onToggleHintOpen() {
   }
   feedbackModal.hintOpen = true;
   feedbackModal.hintLimitReached = Number(hintMetadata.hint_no) >= Number(hintMetadata.max_hint_count || 2);
-  if (!feedbackModal.hintClicked && feedbackModal.attemptId) {
-    feedbackModal.hintClicked = true;
-    sendChoice(feedbackModal.attemptId, "no", { click_type: "hint" }).catch(() => {});
-  }
   await loadAiHintForModal();
-  await updateReviewOpenHintLog({
+  await updateHintViewLog({
     trigger_method: "click_ai_hint",
     button_name: "AI提示",
     hint_loaded: feedbackModal.hintLoaded,
   });
-}
-
-async function onToggleReviewOpen() {
-  const nextOpen = !feedbackModal.reviewOpen;
-  feedbackModal.reviewOpen = nextOpen;
-  if (nextOpen && !feedbackModal.videoClicked && feedbackModal.attemptId) {
-    feedbackModal.videoClicked = true;
-    await sendChoice(feedbackModal.attemptId, "no", { click_type: "video" });
-  }
-}
-
-async function openReviewFromHint() {
-  if (!feedbackModal.reviewOpen) {
-    feedbackModal.reviewOpen = true;
-  }
-  if (!feedbackModal.videoClicked && feedbackModal.attemptId) {
-    feedbackModal.videoClicked = true;
-    await sendChoice(feedbackModal.attemptId, "no", { click_type: "video" });
-  }
-}
-
-async function sendChoice(attempt_id, choice, extra = {}) {
-  if (!attempt_id) return;
-  try {
-    const token = String(localStorage.getItem("token") || "").trim();
-    const headers = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
-    await fetch(`${API_BASE}/api/parsons/review_choice`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        attempt_id,
-        student_id: (localStorage.getItem("student_id") || ""),
-        student_choice: choice,
-        session_id: learningSessionId,
-        page: "parsons",
-        activity_type: isTestMode.value ? "test" : "practice",
-        test_role: isTestMode.value ? String(testRole.value || "") : null,
-        task_id: feedbackModal.taskId || currentTaskId(),
-        attempt_v2_id: feedbackModal.attemptV2Id || null,
-        attempt_no: feedbackModal.attemptNo,
-        target_concept: feedbackModal.targetConcept || currentTargetConcept(),
-        question_id: feedbackModal.taskId || currentTaskId(),
-        unit_id: currentUnitId(),
-        question_type: "parsons",
-        ...extra,
-      }),
-    });
-  } catch (_) {}
 }
 
 // 每題作答狀態保存
@@ -3885,32 +3687,17 @@ function resetFeedbackModalState() {
     conceptHint: "",
     reflectionQuestions: [],
     impactHint: "",
-    reviewRange: "（未提供）",
-    reviewMode: "subtitle_alignment",
-    subtitleHealth: null,
-    chapterRecommendation: null,
-    chapterLabel: "",
-    reviewFocus: "",
     hintOpen: false,
     hintLoading: false,
     hintLoaded: false,
     hintError: "",
     hintLimitReached: false,
-    reviewOpen: false,
-    start: null,
-    end: null,
-    chapterStart: null,
-    chapterEnd: null,
-    jumpVideoId: "",
     attemptId: "",
     attemptV2Id: "",
     attemptNo: null,
-    reviewAttemptId: "",
-    reviewOpenLogId: "",
+    hintViewLogId: "",
     taskId: "",
     targetConcept: "",
-    hintClicked: false,
-    videoClicked: false,
     source: "default",
     aiDiagnosisSummary: "",
     hintRecord: null,
@@ -3930,7 +3717,6 @@ function resetFeedbackModalState() {
     possibleCauses: [],
     actualText: "",
     expectedText: "",
-    debugText: "",
   });
   hintRetryUsed.value = 0;
   isRegeneratingHint.value = false;
@@ -4015,10 +3801,12 @@ async function submit() {
   clearSubmitFeedbackState();
 
   try {
-    const completeness = answerCompletenessStatus();
-    if (!completeness.complete) {
-      showIncompleteAnswerMessage(completeness);
-      return;
+    if (!isChoiceTestQuestion.value) {
+      const completeness = answerCompletenessStatus();
+      if (!completeness.complete) {
+        showIncompleteAnswerMessage(completeness);
+        return;
+      }
     }
 
     // ==============================
@@ -4042,9 +3830,18 @@ async function submit() {
       const startedAtIso = testMeta.started_at_ms
         ? new Date(Number(testMeta.started_at_ms)).toISOString()
         : null;
-      const duration_sec = testMeta.started_at_ms
+      const durationSeconds = testMeta.started_at_ms
         ? Math.max(0, Math.round((submittedAt.getTime() - Number(testMeta.started_at_ms)) / 1000))
         : 0;
+
+      if (isChoiceTestQuestion.value && !selectedChoiceKey.value) {
+        showIncompleteAnswerMessage({
+          message: "請先選擇一個答案後再送出。",
+          missingCount: 1,
+          allBlank: true,
+        });
+        return;
+      }
 
       const body = {
         session_id: learningSessionId,
@@ -4054,13 +3851,15 @@ async function submit() {
         test_cycle_id: String(testCycleId.value || ""),
         test_role: String(testRole.value || ""),
         task_id: String(currentTaskId() || ""),
-        answer_lines: buildAnswerLines(),
-        answer_ids: Array.isArray(answer_ids.value)
-          ? answer_ids.value
-          : [],
+        question_type: testQuestionType.value,
+        answer_lines: isChoiceTestQuestion.value ? [] : buildAnswerLines(),
+        answer_ids: isChoiceTestQuestion.value
+          ? []
+          : (Array.isArray(answer_ids.value) ? answer_ids.value : []),
+        selected_answer: isChoiceTestQuestion.value ? selectedChoiceKey.value : null,
         started_at: startedAtIso,
         submitted_at: submittedAt.toISOString(),
-        duration_sec,
+        duration_seconds: durationSeconds,
       };
 
       console.log("poolBlocks sample =", poolBlocks.value?.slice?.(0, 3));
@@ -4152,7 +3951,6 @@ async function submit() {
       answer_lines: buildAnswerLines(),
       video_id: String(videoId.value || ""),
       level: route.query.level ? String(route.query.level) : "L1",
-      review_attempt_id: review_attempt_id.value,
       student_id: String(studentId.value || ""),
       participant_id: String(participantId.value || ""),
       started_at: startedAtIso,
@@ -4382,6 +4180,12 @@ async function submit() {
 // ==============================
 // V1.5：相容後端回傳格式
 // ==============================
+function canonicalMeaningZh(block) {
+  if (!block || typeof block !== "object") return "";
+  const meaning = block.meaning_zh ?? block.semantic_zh ?? block.semantic ?? block.zh ?? "";
+  return String(meaning).trim();
+}
+
 function normalizeTaskPayload(apiJson) {
   if (!apiJson) return { taskObj: null, pool: [], slots: [] };
 
@@ -4429,13 +4233,19 @@ function normalizeTaskPayload(apiJson) {
     pool = (core.length || dist.length) ? [...core, ...dist] : blocks;
   }
 
-  pool = (pool || []).map((b, i) => ({
-    id: b?.id != null ? String(b.id) : `b${i + 1}`,
-    text: b?.text != null ? String(b.text) : "",
-    type: b?.type ? String(b.type) : (b?.is_distractor ? "distractor" : "core"),
-    meaning_zh: hideSemanticZh ? "" : (b?.meaning_zh != null ? String(b.meaning_zh) : (b?.semantic_zh != null ? String(b.semantic_zh) : "")),
-    ...b,
-  }));
+  pool = (pool || []).map((b, i) => {
+    const meaning = hideSemanticZh ? "" : canonicalMeaningZh(b);
+    return {
+      ...(b || {}),
+      id: b?.id != null ? String(b.id) : `b${i + 1}`,
+      text: b?.text != null ? String(b.text) : "",
+      type: b?.type ? String(b.type) : (b?.is_distractor ? "distractor" : "core"),
+      meaning_zh: meaning,
+      semantic_zh: meaning,
+      semantic: meaning,
+      zh: meaning,
+    };
+  });
 
   if (hiddenDistractorIds.size) {
     pool = pool.filter((b) => !hiddenDistractorIds.has(String(b?.id ?? "")));
@@ -4465,11 +4275,7 @@ function normalizeTaskPayload(apiJson) {
         if (!eid) return "";
         const fromSol = _solMap.get(eid) || {};
         const fromPool = _poolMap.get(eid) || {};
-        return String(
-          fromSol.meaning_zh || fromSol.semantic_zh || fromSol.zh ||
-          fromPool.meaning_zh || fromPool.semantic_zh || fromPool.zh ||
-          ""
-        );
+        return canonicalMeaningZh(fromSol) || canonicalMeaningZh(fromPool);
       })(),
     }));
   }
@@ -4562,14 +4368,7 @@ async function loadTask() {
 
       testMeta.total = Number(r?.total || 1);
       testMeta.current_index = Number(r?.current_index || testMeta.request_index || 1);
-      const norm = normalizeTaskPayload(r);
-      task.value = norm.taskObj;
-      poolBlocks.value = norm.pool;
-      teacherForcedHideSemantic.value = !!norm.taskObj?.hide_semantic_zh;
-      // 前後測不顯示中文提示：清空 label
-      templateSlots.value = (norm.slots || []).map((s) => ({ ...s, label: "" }));
-
-      await bindBlankFocusHandlers();
+      await applyTestTaskPayload(r);
       await recordEnterParsonsTaskFromVideo();
       await recordTaskOpen();
       return;
@@ -4824,6 +4623,91 @@ watch(
   grid-template-columns: 1.25fr 1fr;
   gap: 16px;
   margin-top: 16px;
+}
+
+.choice-board{
+  margin-top: 16px;
+}
+
+.choice-panel{
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 18px;
+  min-height: 360px;
+  background: var(--paper);
+  box-shadow: var(--shadow-soft);
+  animation: rise-in .32s ease both;
+}
+
+.choice-topline{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  color: #475569;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.choice-options{
+  display: grid;
+  gap: 12px;
+}
+
+.choice-option{
+  width: 100%;
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 10px 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: var(--radius-md);
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-weight: 900;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease, background .18s ease;
+}
+
+.choice-option:hover{
+  transform: translateY(-1px);
+  border-color: #0f5c84;
+  box-shadow: 0 12px 24px rgba(15, 92, 132, 0.12);
+}
+
+.choice-option.selected{
+  border-color: #0f5c84;
+  background: #eef9ff;
+  box-shadow: 0 0 0 3px rgba(15, 92, 132, 0.14);
+}
+
+.choice-key{
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.choice-option.selected .choice-key{
+  background: #0f5c84;
+  color: #ffffff;
+}
+
+.choice-text{
+  min-width: 0;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 .panel{
@@ -5413,25 +5297,6 @@ watch(
   font-weight: 800;
 }
 
-.fb-review{
-  background: #f0f9ff;
-  border-color: #bae6fd;
-}
-
-.fb-time{
-  font-size: 18px;
-  font-weight: 900;
-  color: #0c4a6e;
-  letter-spacing: 0.4px;
-}
-
-.fb-focus{
-  margin-top: 8px;
-  font-size: 16px;
-  font-weight: 800;
-  color: #1e3a8a;
-}
-
 .fb-more{
   margin-top: 10px;
   font-size: 14px;
@@ -5459,6 +5324,16 @@ watch(
 @media (max-width: 900px) {
   .page { padding: 14px; }
   .qtext { font-size: 20px; }
+  .choice-panel { min-height: 0; padding: 14px; }
+  .choice-topline { align-items: flex-start; flex-direction: column; }
+  .choice-option {
+    grid-template-columns: 36px 1fr;
+    padding: 10px 12px;
+  }
+  .choice-key {
+    width: 30px;
+    height: 30px;
+  }
   .panel { min-height: 0; }
   .board{ grid-template-columns: 1fr; }
   .floating-ai-hint{

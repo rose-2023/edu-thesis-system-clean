@@ -11,6 +11,28 @@ CORE_INDEXES = {
         ([("is_test_data", ASCENDING)], "is_test_data_1", False),
         ([("active_session_id", ASCENDING)], "active_session_id_1", False),
     ],
+    "randomization_slots": [
+        (
+            [("study_id", ASCENDING), ("position", ASCENDING)],
+            "uniq_randomization_slots_study_position",
+            True,
+        ),
+        (
+            [("study_id", ASCENDING), ("student_id", ASCENDING)],
+            "uniq_randomization_slots_study_student",
+            True,
+        ),
+        (
+            [
+                ("study_id", ASCENDING),
+                ("sequence_version", ASCENDING),
+                ("status", ASCENDING),
+                ("position", ASCENDING),
+            ],
+            "randomization_slots_claim_order",
+            False,
+        ),
+    ],
     "parsons_attempts_v2": [
         ([("student_id", ASCENDING)], "student_id_1", False),
         ([("class_name", ASCENDING)], "class_name_1", False),
@@ -31,6 +53,14 @@ CORE_INDEXES = {
             "student_task_activity_role_attempt_1",
             False,
         ),
+    ],
+    "parsons_ai_hint_state": [
+        (
+            [("student_id", ASCENDING), ("task_id", ASCENDING)],
+            "student_task_ai_hint_unique",
+            True,
+        ),
+        ([("group_type", ASCENDING), ("feedback_policy_version", ASCENDING)], "group_policy_1", False),
     ],
     "learning_logs": [
         ([("student_id", ASCENDING)], "student_id_1", False),
@@ -85,6 +115,13 @@ def ensure_core_indexes(logger=None):
             try:
                 options = {"name": name, "unique": unique}
                 if collection_name == "users" and name == "uniq_users_student_id":
+                    options["partialFilterExpression"] = {
+                        "student_id": {"$type": "string"},
+                    }
+                if (
+                    collection_name == "randomization_slots"
+                    and name == "uniq_randomization_slots_study_student"
+                ):
                     options["partialFilterExpression"] = {
                         "student_id": {"$type": "string"},
                     }

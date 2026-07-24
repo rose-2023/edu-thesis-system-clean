@@ -40,7 +40,7 @@
     <div v-else class="board">
       <!-- 左：挖空作答區 -->
       <div class="panel">
-        <div class="panel-title">題目作答程式區：</div>
+        <div class="panel-title">題目作答程式區(可拖拉)：</div>
 
         <div v-if="state.noTask" class="emptyBox">
           {{ state.err || "此影片尚未發布題目" }}
@@ -52,9 +52,9 @@
             :key="slot.slot"
             class="cloze-row"
             :class="{
-              wrong: isPrimaryWrong(idx),
-              affected: isAffectedWrong(idx),
-              'c-wrong': isCStrategy && isWrongSlot(idx),
+              wrong: showStructuredFeedback && isPrimaryWrong(idx),
+              affected: showStructuredFeedback && isAffectedWrong(idx),
+              'c-wrong': showStructuredFeedback && isCStrategy && isWrongSlot(idx),
             }"
           >
 
@@ -70,7 +70,7 @@
           </div>
 
           <div
-            v-if="hasSlotAdjustmentTags(idx)"
+            v-if="showStructuredFeedback && hasSlotAdjustmentTags(idx)"
             class="slot-error-tags"
           >
             <span
@@ -160,14 +160,13 @@
       </div>
     </template>
 
-    <div v-if="firstHintPanel.visible" class="first-hint-panel">
+    <div v-if="showStructuredFeedback && firstHintPanel.visible" class="first-hint-panel">
       <div class="first-hint-title">❌ {{ firstHintPanel.headline }}</div>
       <div class="first-hint-meta">
         <span>需調整區塊：{{ firstHintPanel.wrongCount }} 個</span>
         <span>順序問題：{{ firstHintPanel.sequenceCount }} 個</span>
         <span>縮排問題：{{ firstHintPanel.indentationCount }} 個</span>
       </div>
-      <div class="first-hint-text">{{ firstHintPanel.text }}</div>
     </div>
 
     <button
@@ -178,7 +177,6 @@
     >
       <span v-if="showSecondHintFloatingBadge" class="floating-ai-hint-badge">1</span>
       <span class="floating-ai-hint-label">{{ floatingAiHintLabel }}</span>
-      查看 AI 提示
     </button>
 
     <!-- 錯誤回饋 Modal（練習模式） -->
@@ -215,7 +213,7 @@
               {{ activeAiHintText || feedbackModal.hintError || "AI 提示載入中..." }}
             </div>
             <div class="fb-note">
-              提示次數：{{ activeAiHintDisplayNo }} / 2
+              本題僅提供一則聚焦型 AI 提示，可重複查看。
             </div>
             <div v-if="feedbackModal.hintError" class="ai-hint-error">
               {{ feedbackModal.hintError }}
@@ -248,7 +246,7 @@
               {{ firstHintPanel.text }}
             </div>
             <div class="fb-note first-error-note">
-              返回題目後，紅框旁會標示「順序需要調整」或「縮排需要調整」。
+              返回題目後，紅框旁會標示「順序需要調整」或「縮排需要調整」；本題固定提示可重複查看。
             </div>
           </div>
 
@@ -419,7 +417,7 @@ onMounted(() => {
 // ==============================
 const isTestMode = computed(() => String(route.query.mode || "") === "test");
 const testRole = computed(() => String(route.query.test_role || "pre").toLowerCase());
-const testCycleId = computed(() => String(route.query.test_cycle_id || "default"));
+const testCycleId = computed(() => String(route.query.test_cycle_id || localStorage.getItem("test_cycle_id") || ""));
 const studentId = computed(() => String(localStorage.getItem("student_id") || localStorage.getItem("studentId") || "").trim());
 const participantId = computed(() => String(localStorage.getItem("participant_id") || "").trim());
 
@@ -699,6 +697,17 @@ const isCStrategy = computed(() => {
   return feedbackStrategy.value === "C";
 });
 
+const feedbackMode = computed(() => {
+  const mode = String(task.value?.feedback_mode || "").trim();
+  if (["result_only", "structured_ai_once", "structured_only"].includes(mode)) return mode;
+  return feedbackStrategy.value === "A"
+    ? "result_only"
+    : (feedbackStrategy.value === "C" ? "structured_only" : "structured_ai_once");
+});
+
+const isResultOnlyFeedback = computed(() => feedbackMode.value === "result_only");
+const showStructuredFeedback = computed(() => !isResultOnlyFeedback.value && !isTestMode.value);
+
 // ====== 拖曳狀態 ======
 const dragging = ref(null);
 const overSlot = ref(null);
@@ -880,72 +889,53 @@ const firstHintPanel = reactive({
   hintRecord: null,
 });
 
+// 方案 A：C 組只保存第二次錯誤時建立的一則固定提示快照。
+const fixedHintSnapshot = reactive({
+  available: false,
+  headline: "",
+  text: "",
+  wrongCount: 0,
+  sequenceCount: 0,
+  indentationCount: 0,
+  wrongPositionText: "紅色標記的位置",
+  errorTypeText: "待檢查",
+  attemptId: "",
+  attemptV2Id: "",
+  attemptNo: null,
+  taskId: "",
+  targetConcept: "",
+});
+const fixedHintWrongIndices = ref([]);
+
 const showFloatingAiHintButton = computed(() => {
-  return Boolean(
-    !isCStrategy.value &&
-    !feedbackModal.open &&
-    feedbackModal.hintRecord &&
-    feedbackModal.aiHint1Text
-  );
+  if (feedbackModal.open) return false;
+  return feedbackMode.value === "structured_ai_once"
+    && Boolean(feedbackModal.hintRecord && feedbackModal.aiHint1Text);
 });
 
-const hasSavedSecondAiHint = computed(() => Boolean(
-  feedbackModal.hintRecord &&
-  feedbackModal.aiHint1Text &&
-  feedbackModal.aiHint2Text
-));
+// 方案 A：不再提供第二則 AI 提示。保留這些 computed 名稱，避免改動版面結構。
+const hasSavedSecondAiHint = computed(() => false);
+const hasPendingSecondAiHint = computed(() => false);
+const showSecondHintModalPrompt = computed(() => false);
+const showSecondHintFloatingBadge = computed(() => false);
 
-const hasPendingSecondAiHint = computed(() => Boolean(
-  !isCStrategy.value &&
-  feedbackModal.hintRecord &&
-  feedbackModal.aiHint1Text &&
-  !feedbackModal.aiHint2Text &&
-  (
-    feedbackModal.secondHintNoticeVisible ||
-    (
-      result.value &&
-      result.value.is_correct === false &&
-      Number(feedbackModal.attemptNo || result.value?.attempt_no || 0) >= 2
-    )
-  )
-));
-
-const showSecondHintModalPrompt = computed(() => Boolean(
-  feedbackModal.open &&
-  feedbackModal.mode === "system_recheck" &&
-  hasPendingSecondAiHint.value
-));
-
-const showSecondHintFloatingBadge = computed(() => Boolean(
-  showFloatingAiHintButton.value &&
-  hasPendingSecondAiHint.value
-));
-
-const secondHintReminderTitle = "\u4f60\u9084\u6709 1 \u6b21 AI \u63d0\u793a\u67e5\u770b\u6a5f\u6703\u3002";
-const secondHintReminderText = "\u76ee\u524d\u932f\u8aa4\u4f4d\u7f6e\u5df2\u6a19\u793a\u5b8c\u6210\uff0c\u53ef\u4ee5\u67e5\u770b\u66f4\u805a\u7126\u7684\u7b2c\u4e8c\u6b21\u63d0\u793a\u5f8c\u518d\u4fee\u6b63\u3002";
-const secondHintReminderButtonLabel = "\u67e5\u770b\u7b2c\u4e8c\u6b21 AI \u63d0\u793a";
-const secondHintReminderLoadingLabel = "\u7b2c\u4e8c\u6b21 AI \u63d0\u793a\u8f09\u5165\u4e2d...";
+const secondHintReminderTitle = "";
+const secondHintReminderText = "";
+const secondHintReminderButtonLabel = "";
+const secondHintReminderLoadingLabel = "";
 
 const floatingAiHintLabel = computed(() => {
-  if (hasSavedSecondAiHint.value) return "\u67e5\u770b\u5df2\u4fdd\u5b58\u63d0\u793a";
-  if (hasPendingSecondAiHint.value) return "\u7b2c 2 \u6b21\u63d0\u793a\u53ef\u67e5\u770b";
-  return "\u67e5\u770b AI \u63d0\u793a";
+  return isCStrategy.value
+    ? "查看已保存固定提示"
+    : "查看已保存 AI 提示";
 });
 
 const generatedAiHintCount = computed(() => {
-  const stored = Number(
-    feedbackModal.hintRecord?.hint_generation_count
-    ?? feedbackModal.hintRecord?.ai_hint_generation_count
-    ?? 0
-  );
-  const inferred = (feedbackModal.aiHint1Text ? 1 : 0) + (feedbackModal.aiHint2Text ? 1 : 0);
-  return Math.min(2, inferred || stored);
+  return feedbackModal.aiHint1Text ? 1 : 0;
 });
 
 const activeAiHintText = computed(() => {
-  return feedbackModal.activeAiHintNo === 2
-    ? feedbackModal.aiHint2Text
-    : feedbackModal.aiHint1Text;
+  return feedbackModal.aiHint1Text;
 });
 
 const topLevelRemovedAiHintMetaKeys = new Set([
@@ -994,15 +984,10 @@ function firstNonEmptyHintMeta(...candidates) {
 }
 
 const activeAiHintMeta = computed(() => {
-  return feedbackModal.activeAiHintNo === 2
-    ? firstNonEmptyHintMeta(
-        feedbackModal.aiHint2Meta,
-        feedbackModal.hintRecord?.ai_hint_2_meta
-      )
-    : firstNonEmptyHintMeta(
-        feedbackModal.aiHint1Meta,
-        feedbackModal.hintRecord?.ai_hint_1_meta
-      );
+  return firstNonEmptyHintMeta(
+    feedbackModal.aiHint1Meta,
+    feedbackModal.hintRecord?.ai_hint_1_meta
+  );
 });
 
 const activeAiHintConceptScope = computed(() => {
@@ -1026,20 +1011,14 @@ const activeAiHintScopeLabel = computed(() => {
   return "廣泛概念提示";
 });
 
-const activeAiHintDisplayNo = computed(() => {
-  return feedbackModal.activeAiHintNo === 2 ? 2 : 1;
-});
+const activeAiHintDisplayNo = computed(() => 1);
 
 const aiHintActionLabel = computed(() => {
-  if (feedbackModal.secondHintLoading) return "提示產生中...";
-  if (generatedAiHintCount.value < 2 || !feedbackModal.aiHint2Text) return "產生第二次 AI 提示";
-  return feedbackModal.activeAiHintNo === 2
-    ? "查看第一次 AI 提示"
-    : "查看第二次 AI 提示";
+  return "回看第一次錯誤提示";
 });
 
-const maxHintRetry = 1;
-const maxHintCount = 2;
+const maxHintRetry = 0;
+const maxHintCount = 1;
 const hintRetryUsed = ref(0);
 const isRegeneratingHint = ref(false);
 const hintRemaining = computed(() =>
@@ -1050,10 +1029,7 @@ const hintRemaining = computed(() =>
 );
 
 function currentHintNo() {
-  if (feedbackModal.mode === "ai_hint_flow") {
-    return feedbackModal.activeAiHintNo === 2 ? 2 : 1;
-  }
-  return Math.min(maxHintCount, Math.max(1, Number(hintRetryUsed.value || 0) + 1));
+  return 1;
 }
 
 const successModal = reactive({
@@ -1208,6 +1184,22 @@ function resetFilled() {
   choiceOptions.value = [];
   testQuestionType.value = "parsons";
   fixedSemanticFeedbackActive.value = false;
+  fixedHintWrongIndices.value = [];
+  Object.assign(fixedHintSnapshot, {
+    available: false,
+    headline: "",
+    text: "",
+    wrongCount: 0,
+    sequenceCount: 0,
+    indentationCount: 0,
+    wrongPositionText: "紅色標記的位置",
+    errorTypeText: "待檢查",
+    attemptId: "",
+    attemptV2Id: "",
+    attemptNo: null,
+    taskId: "",
+    targetConcept: "",
+  });
   cStrategyWrongSubmitCount.value = 0;
   previousCompletedAt.value = "";
   currentCompletedAt.value = "";
@@ -1541,6 +1533,9 @@ function slotSemanticDisplayText(slot, idx) {
 
 // 中文語意顯示條件
 function shouldShowSlotSemantic(slot, idx) {
+  // The study no longer exposes semantic "what belongs in this slot" prompts.
+  return false;
+
   if (!effectiveShowSemanticZh.value) {
     return false;
   }
@@ -1555,7 +1550,12 @@ function shouldShowSlotSemantic(slot, idx) {
   // 第二次錯誤觸發固定回饋後，才在錯誤格顯示預生成語意。
   // 修正成功的格子會從 wrongIndices 消失，因此提示同步消失。
   if (isCStrategy.value) {
-    return fixedSemanticFeedbackActive.value && isWrongSlot(idx);
+    const slotIndex = Number(idx);
+    return Boolean(
+      fixedSemanticFeedbackActive.value
+      && fixedHintWrongIndices.value.includes(slotIndex)
+      && isWrongSlot(slotIndex)
+    );
   }
 
   // B：完全維持原本「有中文語意就顯示」的行為。
@@ -1743,9 +1743,9 @@ async function advanceTestAfterSubmit() {
     if (total <= 1 || cur >= total) {
       const role = String(testRole.value || "");
       if (role === "pre") {
-        alert("前測已完成！系統將帶您回首頁。");
+        alert("測驗已完成，感謝您的作答!將進入首頁可以開始觀看影片進行練習。");
       } else if (role === "post") {
-        alert("後測已完成！感謝您的作答。");
+        alert("測驗已完成！感謝您的作答。");
       }
       router.replace("/home");
       return;
@@ -2244,8 +2244,8 @@ function openFeedbackModal(r, taskId) {
   feedbackModal.source = String(parts.source || "default");
   feedbackModal.firstHint = String(parts.firstHint || "");
   feedbackModal.secondHint = String(parts.secondHint || "");
-  feedbackModal.hintRecord = null;
-  feedbackModal.hintId = "";
+  feedbackModal.hintRecord = record;
+  feedbackModal.hintId = String(record.hint_id || "");
   feedbackModal.firstSystemHintText = "";
   // 第一次、第二次提示切換
   feedbackModal.aiHint1Text = "";  // 第一次提示文字
@@ -2287,7 +2287,6 @@ function openFeedbackModal(r, taskId) {
 
 function applyHintRecordToFeedbackModal(record = {}, extra = {}) {
   const hintRecord = (record && typeof record === "object") ? record : {};
-  const requestedHintNo = Number(extra.requested_hint_no || 1) === 2 ? 2 : 1;
   feedbackModal.hintRecord = hintRecord;
   feedbackModal.hintId = String(hintRecord.hint_id || "");
   feedbackModal.attemptId = String(hintRecord.last_attempt_id || feedbackModal.attemptId || "");
@@ -2300,47 +2299,29 @@ function applyHintRecordToFeedbackModal(record = {}, extra = {}) {
   feedbackModal.aiHint1Text = String(
     hintRecord.ai_hint_1_text
     || extra.ai_hint_1_text
-    || (requestedHintNo === 1 ? extra.hint : "")
+    || extra.hint
     || ""
   );
-  feedbackModal.aiHint2Text = String(
-    hintRecord.ai_hint_2_text
-    || extra.ai_hint_2_text
-    || (requestedHintNo === 2 ? extra.hint : "")
-    || ""
-  );
+  feedbackModal.aiHint2Text = "";
   const nextHint1Meta = firstNonEmptyHintMeta(
-    hintRecord.ai_hint_1_meta
-    , extra.ai_hint_1_meta
-    , requestedHintNo === 1 ? extra.hint_meta : null
-  );
-  const nextHint2Meta = firstNonEmptyHintMeta(
-    hintRecord.ai_hint_2_meta
-    , extra.ai_hint_2_meta
-    , requestedHintNo === 2 ? extra.hint_meta : null
+    hintRecord.ai_hint_1_meta,
+    extra.ai_hint_1_meta,
+    extra.hint_meta
   );
   feedbackModal.aiHint1Meta = Object.keys(nextHint1Meta).length
     ? nextHint1Meta
     : sanitizeHintMeta(feedbackModal.aiHint1Meta);
-  feedbackModal.aiHint2Meta = Object.keys(nextHint2Meta).length
-    ? nextHint2Meta
-    : sanitizeHintMeta(feedbackModal.aiHint2Meta);
+  feedbackModal.aiHint2Meta = {};
+  feedbackModal.activeAiHintNo = 1;
   feedbackModal.source = String(extra.source || feedbackModal.source || "default");
-  feedbackModal.hintQuestion = activeAiHintText.value || feedbackModal.aiHint1Text || String(extra.hint || "");
+  feedbackModal.hintQuestion = feedbackModal.aiHint1Text || String(extra.hint || "");
   feedbackModal.hintLoaded = Boolean(feedbackModal.aiHint1Text);
   feedbackModal.hintLoading = false;
   feedbackModal.hintError = "";
 }
 
-function hasUnviewedSecondAiHintOpportunity(record = {}) {
-  const hintRecord = (record && typeof record === "object") ? record : {};
-  const hasFirstHint = Boolean(
-    String(hintRecord.ai_hint_1_text || feedbackModal.aiHint1Text || "").trim()
-  );
-  const hasSecondHint = Boolean(
-    String(hintRecord.ai_hint_2_text || feedbackModal.aiHint2Text || "").trim()
-  );
-  return hasFirstHint && !hasSecondHint;
+function hasUnviewedSecondAiHintOpportunity() {
+  return false;
 }
 
 function normalizeWrongPositions(list) {
@@ -2443,6 +2424,44 @@ function formatErrorTypeText(types = [], fallback = "") {
     .filter(Boolean);
   if (mapped.length) return Array.from(new Set(mapped)).join("、");
   return fallback || "待檢查";
+}
+
+function showStructuredFeedbackPanel(r, taskId) {
+  const flow = (r?.hint_flow && typeof r.hint_flow === "object") ? r.hint_flow : {};
+  const positions = firstNonEmptyWrongPositions(
+    flow.current_error_positions,
+    r?.incorrect_slots,
+    r?.wrong_slots,
+    flow.sequence_slots,
+    flow.indentation_slots,
+  );
+  wrongIndices.value = positions;
+  primaryWrongIndex.value = positions.length ? positions[0] : null;
+  const summary = applyWrongSlotIssuesFromResult(r || {}, flow, {});
+  applyFirstHintPanelAdjustmentSummary(
+    summary,
+    Number(flow.current_error_count ?? r?.error_count ?? positions.length) || positions.length,
+  );
+  firstHintPanel.visible = true;
+  firstHintPanel.hintRecord = null;
+  feedbackModal.open = false;
+  feedbackModal.mode = "";
+  feedbackModal.taskId = String(taskId || currentTaskId() || "");
+  feedbackModal.attemptId = String(r?.attempt_id || "");
+  feedbackModal.attemptV2Id = String(r?.attempt_v2_id || "");
+  feedbackModal.attemptNo = Number(r?.attempt_no || 0) || null;
+}
+
+function clearResultOnlyFeedback() {
+  wrongIndices.value = [];
+  primaryWrongIndex.value = null;
+  wrongSlotIssueMap.value = {};
+  firstHintPanel.visible = false;
+  fixedSemanticFeedbackActive.value = false;
+  feedbackModal.open = false;
+  feedbackModal.hintRecord = null;
+  feedbackModal.aiHint1Text = "";
+  feedbackModal.aiHint1Meta = {};
 }
 
 function showFirstSystemHint(r, taskId) {
@@ -2559,25 +2578,26 @@ function showSystemRecheck(r, taskId) {
 
   applyHintRecordToFeedbackModal(record, {});
   feedbackModal.secondHintReminderShownLogged = false;
-  feedbackModal.secondHintReminderResolved = false;
-  feedbackModal.secondHintNoticeVisible = hasUnviewedSecondAiHintOpportunity(record);
+  feedbackModal.secondHintReminderResolved = true;
+  feedbackModal.secondHintNoticeVisible = false;
   feedbackModal.mode = "system_recheck";
   feedbackModal.open = true;
   feedbackModal.hintOpen = false;
-  if (feedbackModal.secondHintNoticeVisible) {
-    void logSecondHintReminderShown("system_recheck_modal");
-  }
 }
-// c策略頁面每次答錯都呼叫這個函式
+// C 策略僅在第二次錯誤時呼叫此函式，建立唯一固定提示快照
 function showFixedSemanticFeedbackModal(r, taskId) {
   fixedSemanticFeedbackActive.value = true;
   const flow =
     r?.hint_flow && typeof r.hint_flow === "object"
       ? r.hint_flow
       : {};
+  const record =
+    flow.hint_record && typeof flow.hint_record === "object"
+      ? flow.hint_record
+      : {};
 
-  // C 策略每次答錯都只呈現固定中文回饋。
-  // 這裡不呼叫 AI、不讀 AI hint record，也不進入 B 策略的 ai_hint_flow。
+  // 方案 A：C 組只在第二次錯誤建立一則固定中文提示快照。
+  // 後續只能回看，不會依第三次以上的新錯誤重新產生固定提示。
   const positions = firstNonEmptyWrongPositions(
     flow.current_error_positions,
     r?.incorrect_slots,
@@ -2620,14 +2640,31 @@ function showFixedSemanticFeedbackModal(r, taskId) {
   applyFirstHintPanelAdjustmentSummary(issueSummary, displayWrongCount);
   firstHintPanel.wrongPositionText = positionText;
   firstHintPanel.errorTypeText = errorTypeText;
-  firstHintPanel.hintRecord = null;
+  firstHintPanel.hintRecord = record;
+
+  fixedHintWrongIndices.value = [...positions];
+  Object.assign(fixedHintSnapshot, {
+    available: true,
+    headline: firstHintPanel.headline,
+    text: firstHintPanel.text,
+    wrongCount: firstHintPanel.wrongCount,
+    sequenceCount: firstHintPanel.sequenceCount,
+    indentationCount: firstHintPanel.indentationCount,
+    wrongPositionText: positionText,
+    errorTypeText,
+    attemptId: String(r?.attempt_id || ""),
+    attemptV2Id: String(r?.attempt_v2_id || ""),
+    attemptNo: Number.isFinite(attemptNo) ? attemptNo : null,
+    taskId: String(taskId || ""),
+    targetConcept: String(r?.target_concept || currentTargetConcept() || ""),
+  });
 
   feedbackModal.mode = "fixed_semantic_feedback";
   feedbackModal.open = true;
   feedbackModal.stage = "detail";
   feedbackModal.hintOpen = false;
-  feedbackModal.hintRecord = null;
-  feedbackModal.hintId = "";
+  feedbackModal.hintRecord = record;
+  feedbackModal.hintId = String(record.hint_id || "");
   feedbackModal.aiHint1Text = "";
   feedbackModal.aiHint2Text = "";
   feedbackModal.taskId = String(taskId || "");
@@ -2655,6 +2692,10 @@ function openAiHintModalFromFlow(r, taskId) {
     flow.hint_record && typeof flow.hint_record === "object"
       ? flow.hint_record
       : {};
+  const hintState =
+    flow.ai_hint_state && typeof flow.ai_hint_state === "object"
+      ? flow.ai_hint_state
+      : {};
 
   // 第二次 AI 提示只使用第二次作答的錯誤位置，
   // 不可以再合併第一次錯誤位置。
@@ -2676,6 +2717,7 @@ function openAiHintModalFromFlow(r, taskId) {
   feedbackModal.stage = "detail";
   feedbackModal.hintOpen = true;
   feedbackModal.hintLoaded = true;
+  feedbackModal.hintRecord = hintState && Object.keys(hintState).length ? hintState : record;
   feedbackModal.source = String(
     flow.source || "parsons_hint_records"
   );
@@ -2714,7 +2756,8 @@ function openAiHintModalFromFlow(r, taskId) {
     });
   }
 
-  firstHintPanel.visible = false;
+  // Keep the current structural summary visible again after the AI modal closes.
+  firstHintPanel.visible = true;
   // 目前顯示哪一組，由activeAiHintNo控制
   feedbackModal.activeAiHintNo = 1;
 
@@ -2724,7 +2767,7 @@ function openAiHintModalFromFlow(r, taskId) {
 
     fetchHintRecord(1, {
       trigger_method: "auto_second_wrong",
-      button_name: "AI 提示",
+      button_name: "聚焦型 AI 提示",
     })
       .catch((err) => {
         feedbackModal.hintError =
@@ -2738,7 +2781,10 @@ function openAiHintModalFromFlow(r, taskId) {
 
 async function fetchHintRecord(requestedHintNo, extra = {}) {
   if (!feedbackModal.attemptId) return null;
-  const normalizedHintNo = Number(requestedHintNo) === 2 ? 2 : 1;
+  if (Number(requestedHintNo) === 2) {
+    throw new Error("本題僅提供一則聚焦型 AI 提示，不可重新生成。");
+  }
+  const normalizedHintNo = 1;
   const res = await fetch(`${API_BASE}/api/parsons/hint`, {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
@@ -2770,60 +2816,18 @@ async function fetchHintRecord(requestedHintNo, extra = {}) {
     ai_diagnosis_summary: data.ai_diagnosis_summary,
     source: data.source,
   });
-  if (normalizedHintNo === 2 && !feedbackModal.aiHint2Text) {
-    throw new Error("第二次 AI 提示產生失敗，請稍後再試。");
-  }
-  if (normalizedHintNo === 2) {
-    feedbackModal.secondHintNoticeVisible = false;
-    feedbackModal.secondHintReminderResolved = true;
-  }
   return data;
 }
 
 // 「產生第二次 AI 提示」與已保存提示切換
-async function openSecondHintFromReminder(triggerMethod = "click_second_hint_reminder") {
-  if (feedbackModal.hintLoading || feedbackModal.secondHintLoading) return;
-  feedbackModal.mode = "ai_hint_flow";
-  feedbackModal.open = true;
-  feedbackModal.stage = "detail";
-  feedbackModal.hintOpen = true;
-  feedbackModal.activeAiHintNo = 2;
-  feedbackModal.hintError = "";
-  firstHintPanel.visible = false;
-
-  try {
-    await logSecondHintReminderClicked(triggerMethod);
-    feedbackModal.secondHintLoading = true;
-    await fetchHintRecord(2, {
-      trigger_method: triggerMethod,
-      button_name: "查看第二次 AI 提示",
-    });
-    feedbackModal.secondHintNoticeVisible = false;
-  } catch (err) {
-    feedbackModal.hintError = err?.message || "第二次 AI 提示載入失敗";
-  } finally {
-    feedbackModal.secondHintLoading = false;
-  }
+async function openSecondHintFromReminder() {
+  await reopenAiHintFromFloating();
 }
 
 async function handleAiHintAction() {
-  if (feedbackModal.hintLoading || feedbackModal.secondHintLoading) return;
-  if (generatedAiHintCount.value < 2 || !feedbackModal.aiHint2Text) {
-    try {
-      feedbackModal.secondHintLoading = true;
-      await fetchHintRecord(2, {
-        trigger_method: "generate_second_ai_hint",
-        button_name: "產生第二次 AI 提示",
-      });
-      feedbackModal.activeAiHintNo = 2;
-    } catch (err) {
-      feedbackModal.hintError = err?.message || "第二次 AI 提示產生失敗";
-    } finally {
-      feedbackModal.secondHintLoading = false;
-    }
-    return;
-  }
-  feedbackModal.activeAiHintNo = feedbackModal.activeAiHintNo === 2 ? 1 : 2;
+  if (feedbackModal.hintLoading) return;
+  await reviewFirstHintFromModal();
+  feedbackModal.open = false;
 }
 
 async function reviewFirstHintFromModal() {
@@ -2915,17 +2919,52 @@ async function returnToFixFromFixedFeedback() {
   feedbackModal.mode = "legacy";
 }
 
+function restoreFixedHintSnapshotToPanel() {
+  if (!fixedHintSnapshot.available) return false;
+  firstHintPanel.headline = fixedHintSnapshot.headline;
+  firstHintPanel.text = fixedHintSnapshot.text;
+  firstHintPanel.wrongCount = fixedHintSnapshot.wrongCount;
+  firstHintPanel.sequenceCount = fixedHintSnapshot.sequenceCount;
+  firstHintPanel.indentationCount = fixedHintSnapshot.indentationCount;
+  firstHintPanel.wrongPositionText = fixedHintSnapshot.wrongPositionText;
+  firstHintPanel.errorTypeText = fixedHintSnapshot.errorTypeText;
+  return true;
+}
+
 async function reopenAiHintFromFloating() {
-  if (hasPendingSecondAiHint.value) {
-    await openSecondHintFromReminder("click_floating_second_hint");
+  if (feedbackMode.value !== "structured_ai_once") return;
+  if (isCStrategy.value) {
+    if (!restoreFixedHintSnapshotToPanel()) return;
+    fixedSemanticFeedbackActive.value = true;
+    feedbackModal.mode = "fixed_semantic_feedback";
+    feedbackModal.open = true;
+    feedbackModal.stage = "detail";
+    feedbackModal.hintOpen = false;
+    feedbackModal.attemptId = fixedHintSnapshot.attemptId;
+    feedbackModal.attemptV2Id = fixedHintSnapshot.attemptV2Id;
+    feedbackModal.attemptNo = fixedHintSnapshot.attemptNo;
+    feedbackModal.taskId = fixedHintSnapshot.taskId || currentTaskId();
+    feedbackModal.targetConcept = fixedHintSnapshot.targetConcept || currentTargetConcept();
+    await logLearningEvent("fixed_semantic_feedback_view", {
+      task_id: feedbackModal.taskId || currentTaskId(),
+      attempt_id: feedbackModal.attemptV2Id || null,
+      attempt_no: feedbackModal.attemptNo,
+      target_concept: feedbackModal.targetConcept || currentTargetConcept(),
+      metadata: {
+        feedback_strategy: "C",
+        feedback_type: "fixed_semantic_feedback",
+        trigger_method: "click_floating_saved_hint",
+        fixed_hint_positions: [...fixedHintWrongIndices.value],
+      },
+    });
     return;
   }
+
   if (feedbackModal.attemptId) {
     try {
-      // 提示 API 會自動判斷要回傳第一次或第二次提示，這裡不需要指定 requested_hint_no
       await fetchHintRecord(1, {
-        trigger_method: "click_floating_ai_hint",
-        button_name: "查看 AI 提示",
+        trigger_method: "click_floating_saved_ai_hint",
+        button_name: "查看已保存 AI 提示",
       });
     } catch (err) {
       feedbackModal.hintError = err?.message || "AI 提示載入失敗";
@@ -3115,58 +3154,30 @@ function currentHintMetadata(extra = {}) {
   };
 }
 
+// 方案 A 不提供第二則 AI 提示；保留函式名稱避免改動既有呼叫點，但不再寫入第二提示事件。
 function secondHintReminderMetadata(extra = {}) {
   return currentHintMetadata({
-    requested_hint_no: 2,
-    hint_no: 2,
-    hint_click_no: 2,
-    reminder_type: "second_ai_hint",
-    reminder_visible: Boolean(feedbackModal.secondHintNoticeVisible),
-    reminder_shown_logged: Boolean(feedbackModal.secondHintReminderShownLogged),
-    reminder_resolved: Boolean(feedbackModal.secondHintReminderResolved),
+    reminder_type: "disabled_by_scheme_A",
+    reminder_visible: false,
+    reminder_resolved: true,
     ...extra,
   });
 }
 
-async function logSecondHintReminderEvent(action, extra = {}) {
-  const cleanAction = String(action || "").trim();
-  if (!cleanAction) return null;
-  return logLearningEvent(
-    `second_hint_reminder_${cleanAction}`,
-    feedbackLearningContext(secondHintReminderMetadata({
-      reminder_action: cleanAction,
-      ...extra,
-    }))
-  );
+async function logSecondHintReminderEvent() {
+  return null;
 }
 
-async function logSecondHintReminderShown(triggerMethod = "system_recheck_modal") {
-  if (!feedbackModal.secondHintNoticeVisible) return null;
-  if (feedbackModal.secondHintReminderShownLogged) return null;
-  if (feedbackModal.aiHint2Text) return null;
-  feedbackModal.secondHintReminderShownLogged = true;
-  return logSecondHintReminderEvent("shown", {
-    trigger_method: triggerMethod,
-  });
+async function logSecondHintReminderShown() {
+  return null;
 }
 
-async function logSecondHintReminderClicked(triggerMethod = "click_result_second_hint") {
-  if (feedbackModal.secondHintReminderResolved) return null;
-  feedbackModal.secondHintReminderResolved = true;
-  return logSecondHintReminderEvent("clicked", {
-    trigger_method: triggerMethod,
-    button_name: secondHintReminderButtonLabel,
-  });
+async function logSecondHintReminderClicked() {
+  return null;
 }
 
-async function logSecondHintReminderIgnored(returnMethod = "return_to_fix") {
-  if (!feedbackModal.secondHintNoticeVisible) return null;
-  if (feedbackModal.secondHintReminderResolved) return null;
-  if (feedbackModal.aiHint2Text) return null;
-  feedbackModal.secondHintReminderResolved = true;
-  return logSecondHintReminderEvent("ignored", {
-    return_method: returnMethod,
-  });
+async function logSecondHintReminderIgnored() {
+  return null;
 }
 
 async function updateHintViewLog(extra = {}) {
@@ -3830,7 +3841,7 @@ async function submit() {
       const startedAtIso = testMeta.started_at_ms
         ? new Date(Number(testMeta.started_at_ms)).toISOString()
         : null;
-      const duration_sec = testMeta.started_at_ms
+      const durationSeconds = testMeta.started_at_ms
         ? Math.max(0, Math.round((submittedAt.getTime() - Number(testMeta.started_at_ms)) / 1000))
         : 0;
 
@@ -3859,7 +3870,7 @@ async function submit() {
         selected_answer: isChoiceTestQuestion.value ? selectedChoiceKey.value : null,
         started_at: startedAtIso,
         submitted_at: submittedAt.toISOString(),
-        duration_sec,
+        duration_seconds: durationSeconds,
       };
 
       console.log("poolBlocks sample =", poolBlocks.value?.slice?.(0, 3));
@@ -3995,7 +4006,7 @@ async function submit() {
     aiImpact.value = r?.ai_feedback_detail?.impact || "";
     aiGuidingQuestion.value = r?.ai_feedback_detail?.guiding_question || "";
 
-    if (r?.ok && r?.is_correct === false) {
+    if (r?.ok && r?.is_correct === false && r?.feedback_mode !== "result_only") {
       // 統一使用前端模板，避免後端舊訊息混入「診斷結果」等舊格式
       r.feedback = buildWrongFeedback(r);
     }
@@ -4056,25 +4067,46 @@ async function submit() {
   );
   const isSubmitCStrategy = submitFeedbackStrategy === "C" || isCStrategy.value;
 
-  if (r?.ok && r?.is_correct === false && isSubmitCStrategy) {
-    cStrategyWrongSubmitCount.value += 1;
+  const submitFeedbackMode = String(
+    r?.feedback_mode || (submitFeedbackStrategy === "A"
+      ? "result_only"
+      : (submitFeedbackStrategy === "C" ? "structured_only" : "structured_ai_once"))
+  );
 
-    if (cStrategyWrongSubmitCount.value <= 1) {
+  if (r?.ok && r?.is_correct === false && submitFeedbackMode === "result_only") {
+    clearResultOnlyFeedback();
+    state.err = String(r?.feedback || "作答尚未正確，請重新調整後再次送出。");
+    state.errType = "incorrect_answer";
+    return;
+  }
+
+  if (r?.ok && r?.is_correct === false && submitFeedbackMode !== "result_only") {
+    state.err = "";
+    state.errType = "";
+    showStructuredFeedbackPanel(r, task_id);
+    if (submitFeedbackMode === "structured_ai_once" && flow?.type === "ai_hint") {
+      openAiHintModalFromFlow(r, task_id);
+    }
+    return;
+  }
+
+  if (r?.ok && r?.is_correct === false && isSubmitCStrategy) {
+    if (
+      flow?.type === "first_system_hint"
+      || (!flow?.type && wrongAttemptCount <= 1)
+      || (!flow?.type && !wrongAttemptCount && attemptNo === 1)
+    ) {
       fixedSemanticFeedbackActive.value = false;
       showFirstSystemHint(r, task_id);
       return;
     }
 
-    showFixedSemanticFeedbackModal(r, task_id);
-    return;
-  }
+    if (flow?.type === "fixed_semantic_feedback") {
+      showFixedSemanticFeedbackModal(r, task_id);
+      return;
+    }
 
-  if (
-    r?.ok &&
-    r?.is_correct === false &&
-    flow?.type === "fixed_semantic_feedback"
-  ) {
-    showFixedSemanticFeedbackModal(r, task_id);
+    showSystemRecheck(r, task_id);
     return;
   }
 
@@ -4114,7 +4146,7 @@ async function submit() {
     return;
   }
 
-  // B 策略：維持既有「第二次錯誤後 AI 提示」流程。
+  // 方案 A／B 策略：第二次錯誤後只產生一則聚焦型 AI 提示；之後只能回看。
   if (
     r?.ok &&
     r?.is_correct === false &&
@@ -4180,6 +4212,12 @@ async function submit() {
 // ==============================
 // V1.5：相容後端回傳格式
 // ==============================
+function canonicalMeaningZh(block) {
+  if (!block || typeof block !== "object") return "";
+  const meaning = block.meaning_zh ?? block.semantic_zh ?? block.semantic ?? block.zh ?? "";
+  return String(meaning).trim();
+}
+
 function normalizeTaskPayload(apiJson) {
   if (!apiJson) return { taskObj: null, pool: [], slots: [] };
 
@@ -4227,13 +4265,19 @@ function normalizeTaskPayload(apiJson) {
     pool = (core.length || dist.length) ? [...core, ...dist] : blocks;
   }
 
-  pool = (pool || []).map((b, i) => ({
-    id: b?.id != null ? String(b.id) : `b${i + 1}`,
-    text: b?.text != null ? String(b.text) : "",
-    type: b?.type ? String(b.type) : (b?.is_distractor ? "distractor" : "core"),
-    meaning_zh: hideSemanticZh ? "" : (b?.meaning_zh != null ? String(b.meaning_zh) : (b?.semantic_zh != null ? String(b.semantic_zh) : "")),
-    ...b,
-  }));
+  pool = (pool || []).map((b, i) => {
+    const meaning = hideSemanticZh ? "" : canonicalMeaningZh(b);
+    return {
+      ...(b || {}),
+      id: b?.id != null ? String(b.id) : `b${i + 1}`,
+      text: b?.text != null ? String(b.text) : "",
+      type: b?.type ? String(b.type) : (b?.is_distractor ? "distractor" : "core"),
+      meaning_zh: meaning,
+      semantic_zh: meaning,
+      semantic: meaning,
+      zh: meaning,
+    };
+  });
 
   if (hiddenDistractorIds.size) {
     pool = pool.filter((b) => !hiddenDistractorIds.has(String(b?.id ?? "")));
@@ -4263,11 +4307,7 @@ function normalizeTaskPayload(apiJson) {
         if (!eid) return "";
         const fromSol = _solMap.get(eid) || {};
         const fromPool = _poolMap.get(eid) || {};
-        return String(
-          fromSol.meaning_zh || fromSol.semantic_zh || fromSol.zh ||
-          fromPool.meaning_zh || fromPool.semantic_zh || fromPool.zh ||
-          ""
-        );
+        return canonicalMeaningZh(fromSol) || canonicalMeaningZh(fromPool);
       })(),
     }));
   }
@@ -4279,31 +4319,77 @@ function normalizeTaskPayload(apiJson) {
 
 async function loadPersistedHintState() {
   const taskId = currentTaskId();
+  if (!taskId || isTestMode.value) return;
 
-  // C 策略不使用 AI 提示，也不應載入過去 B 策略留下的 hint record。
-  if (
-    !taskId ||
-    isTestMode.value ||
-    isCStrategy.value
-  ) {
-    return;
-  }
   try {
     const res = await fetch(`${API_BASE}/api/parsons/hint_state?task_id=${encodeURIComponent(taskId)}`, {
       headers: authHeaders(),
     });
     const data = await res.json().catch(() => ({}));
+    const hintState = data?.hint_state;
+    if (!res.ok) return;
+    if (hintState && feedbackMode.value === "structured_ai_once") {
+      feedbackModal.hintRecord = hintState;
+      feedbackModal.hintId = String(hintState.hint_state_id || "");
+      feedbackModal.attemptId = String(hintState.source_attempt_id || feedbackModal.attemptId || "");
+      feedbackModal.taskId = String(hintState.task_id || taskId || "");
+      feedbackModal.aiHint1Text = String(hintState.hint || "");
+      feedbackModal.aiHint1Meta = sanitizeHintMeta(hintState.hint_meta);
+      feedbackModal.activeAiHintNo = 1;
+      return;
+    }
     const record = data?.hint_record;
-    if (!res.ok || !record) return;
+    if (!record || feedbackMode.value !== "structured_ai_once") return;
+
     feedbackModal.hintRecord = record;
     feedbackModal.hintId = String(record.hint_id || "");
     feedbackModal.attemptId = String(record.last_attempt_id || feedbackModal.attemptId || "");
     feedbackModal.taskId = String(record.task_id || taskId || "");
     feedbackModal.firstSystemHintText = String(record.first_system_hint_text || "");
+
+    if (feedbackMode.value !== "structured_ai_once") {
+      const positions = normalizeWrongPositions(record.fixed_hint_positions || record.second_error_positions || []);
+      if (record.fixed_hint_available && positions.length) {
+        const errorTypes = Array.isArray(record.fixed_hint_error_types)
+          ? record.fixed_hint_error_types
+          : [];
+        const count = Number(record.fixed_hint_error_count || positions.length);
+        const hasSequence = errorTypes.includes("sequence_error");
+        const hasIndentation = errorTypes.includes("indentation_error");
+        const summary = {
+          total: count,
+          sequenceCount: hasSequence ? count : 0,
+          indentationCount: hasIndentation ? count : 0,
+        };
+        fixedHintWrongIndices.value = positions;
+        fixedSemanticFeedbackActive.value = true;
+        Object.assign(fixedHintSnapshot, {
+          available: true,
+          headline: buildAdjustmentHeadline(count),
+          text: buildAdjustmentFeedbackText(summary, count),
+          wrongCount: count,
+          sequenceCount: summary.sequenceCount,
+          indentationCount: summary.indentationCount,
+          wrongPositionText: formatWrongPositionText(positions),
+          errorTypeText: formatErrorTypeText(errorTypes, "結構順序錯誤"),
+          attemptId: String(record.last_attempt_id || ""),
+          attemptV2Id: String(record.latest_attempt_v2_id || ""),
+          attemptNo: null,
+          taskId: String(record.task_id || taskId || ""),
+          targetConcept: currentTargetConcept(),
+        });
+      }
+      feedbackModal.aiHint1Text = "";
+      feedbackModal.aiHint1Meta = {};
+      feedbackModal.aiHint2Text = "";
+      feedbackModal.aiHint2Meta = {};
+      return;
+    }
+
     feedbackModal.aiHint1Text = String(record.ai_hint_1_text || "");
     feedbackModal.aiHint1Meta = sanitizeHintMeta(record.ai_hint_1_meta);
-    feedbackModal.aiHint2Text = String(record.ai_hint_2_text || "");
-    feedbackModal.aiHint2Meta = sanitizeHintMeta(record.ai_hint_2_meta);
+    feedbackModal.aiHint2Text = "";
+    feedbackModal.aiHint2Meta = {};
     feedbackModal.activeAiHintNo = 1;
   } catch (_) {}
 }

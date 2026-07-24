@@ -22,7 +22,12 @@ MONGO_DATABASE = os.environ.get("MONGO_DATABASE", "thesis_system")
 
 INDEX_SPECS = {
     "users": [
-        {"keys": [("student_id", ASCENDING)], "name": "users_student_id_unique", "unique": True},
+        {
+            "keys": [("student_id", ASCENDING)],
+            "name": "uniq_users_student_id",
+            "unique": True,
+            "partialFilterExpression": {"student_id": {"$type": "string"}},
+        },
         {"keys": [("role", ASCENDING)], "name": "role_1"},
         {"keys": [("class_name", ASCENDING)], "name": "class_name_1"},
         {"keys": [("group_type", ASCENDING)], "name": "group_type_1"},
@@ -31,6 +36,28 @@ INDEX_SPECS = {
         {
             "keys": [("class_name", ASCENDING), ("group_type", ASCENDING), ("is_test_data", ASCENDING)],
             "name": "class_group_test_1",
+        },
+    ],
+    "randomization_slots": [
+        {
+            "keys": [("study_id", ASCENDING), ("position", ASCENDING)],
+            "name": "uniq_randomization_slots_study_position",
+            "unique": True,
+        },
+        {
+            "keys": [("study_id", ASCENDING), ("student_id", ASCENDING)],
+            "name": "uniq_randomization_slots_study_student",
+            "unique": True,
+            "partialFilterExpression": {"student_id": {"$type": "string"}},
+        },
+        {
+            "keys": [
+                ("study_id", ASCENDING),
+                ("sequence_version", ASCENDING),
+                ("status", ASCENDING),
+                ("position", ASCENDING),
+            ],
+            "name": "randomization_slots_claim_order",
         },
     ],
     "parsons_attempts_v2": [
@@ -95,6 +122,17 @@ INDEX_SPECS = {
         {"keys": [("task_id", ASCENDING)], "name": "task_id_1"},
         {"keys": [("hint_id", ASCENDING)], "name": "hint_id_1"},
         {"keys": [("updated_at", DESCENDING)], "name": "updated_at_-1"},
+    ],
+    "parsons_ai_hint_state": [
+        {
+            "keys": [("student_id", ASCENDING), ("task_id", ASCENDING)],
+            "name": "student_task_ai_hint_unique",
+            "unique": True,
+        },
+        {
+            "keys": [("group_type", ASCENDING), ("feedback_policy_version", ASCENDING)],
+            "name": "group_policy_1",
+        },
     ],
     "learning_logs": [
         {"keys": [("student_id", ASCENDING)], "name": "student_id_1"},
@@ -164,15 +202,20 @@ def _find_compatible_index(collection, spec):
             continue
         if expected_unique and index.get("unique") is not True:
             continue
-        if expected_unique and index.get("partialFilterExpression"):
+        if index.get("sparse", False) != bool(spec.get("sparse", False)):
+            continue
+        if index.get("partialFilterExpression") != spec.get("partialFilterExpression"):
             continue
         return index.get("name")
     return None
 
 
-def _duplicate_keys(collection, keys):
+def _duplicate_keys(collection, keys, match=None):
     group_id = {field: f"${field}" for field, _direction in keys}
-    pipeline = [
+    pipeline = []
+    if match:
+        pipeline.append({"$match": match})
+    pipeline.extend([
         {
             "$group": {
                 "_id": group_id,
@@ -182,7 +225,7 @@ def _duplicate_keys(collection, keys):
         },
         {"$match": {"count": {"$gt": 1}}},
         {"$sort": {"_id": 1}},
-    ]
+    ])
     return list(collection.aggregate(pipeline))
 
 
@@ -205,9 +248,18 @@ def _drop_incompatible_same_key_index(collection, spec):
         name = index.get("name")
         if name == "_id_":
             continue
-        if name == spec["name"] and _keys_as_list(index) != expected_keys:
+        named_index_incompatible = (
+            name == spec["name"]
+            and (
+                _keys_as_list(index) != expected_keys
+                or (spec.get("unique") and index.get("unique") is not True)
+                or index.get("sparse", False) != bool(spec.get("sparse", False))
+                or index.get("partialFilterExpression") != spec.get("partialFilterExpression")
+            )
+        )
+        if named_index_incompatible:
             collection.drop_index(name)
-            print(f"[dropped old incompatible index] {collection.name}.{name}")
+            print(f"[replaced incompatible index] {collection.name}.{name}")
             return
         if _keys_as_list(index) == expected_keys and index.get("unique") is not True:
             collection.drop_index(name)
@@ -225,7 +277,11 @@ def _create_collection_indexes(db, collection_name, specs):
             continue
 
         if spec.get("unique"):
-            duplicates = _duplicate_keys(collection, spec["keys"])
+            duplicates = _duplicate_keys(
+                collection,
+                spec["keys"],
+                spec.get("partialFilterExpression"),
+            )
             if duplicates:
                 _print_duplicate_keys(collection_name, spec, duplicates)
                 failures.append(spec["name"])
@@ -235,12 +291,20 @@ def _create_collection_indexes(db, collection_name, specs):
         options = {"name": spec["name"]}
         if spec.get("unique"):
             options["unique"] = True
+        if spec.get("sparse"):
+            options["sparse"] = True
+        if spec.get("partialFilterExpression"):
+            options["partialFilterExpression"] = spec["partialFilterExpression"]
         try:
             created_name = collection.create_index(spec["keys"], **options)
             print(f"[created] {collection_name}.{created_name}")
         except (DuplicateKeyError, OperationFailure) as exc:
             if spec.get("unique"):
-                duplicates = _duplicate_keys(collection, spec["keys"])
+                duplicates = _duplicate_keys(
+                    collection,
+                    spec["keys"],
+                    spec.get("partialFilterExpression"),
+                )
                 if duplicates:
                     _print_duplicate_keys(collection_name, spec, duplicates)
                 else:

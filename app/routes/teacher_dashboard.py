@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover - older Python fallback
 
 
 teacher_dashboard_bp = Blueprint("teacher_dashboard", __name__)
-FORMAL_GROUP_TYPES = ("control", "experimental")
+FORMAL_GROUP_TYPES = ("control", "experimental_1", "experimental_2")
 
 
 def _taipei_timezone():
@@ -76,7 +76,10 @@ def _date_range_from_request(range_param):
 def _formal_data_query():
     return {
         "is_test_data": {"$ne": True},
-        "group_type": {"$in": list(FORMAL_GROUP_TYPES)},
+        "$or": [
+            {"group_type": {"$in": list(FORMAL_GROUP_TYPES)}},
+            {"analysis_group_type": {"$in": list(FORMAL_GROUP_TYPES)}},
+        ],
     }
 
 

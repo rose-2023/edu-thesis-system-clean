@@ -325,13 +325,10 @@ def ensure_test_indexes():
 # Parsons attempts v2 standardized write helpers
 _PARSONS_ATTEMPTS_V2_INDEX_READY = False
 _PARSONS_HINT_RECORD_INDEX_READY = False
-_PARSONS_AI_HINT_STATE_INDEX_READY = False
 _PARSONS_HINT_LIBRARY_INDEX_READY = False
 _PARSONS_ATTEMPTS_V2_TIMEZONE = "Asia/Taipei"
 _PARSONS_TEST_STUDENT_ID = "11461127"
-_PARSONS_HINT_PROMPT_VERSION = "structured_error_single_focused_v1"
-FEEDBACK_POLICY_VERSION = "feedback_v2_three_arm"
-RESULT_ONLY_FEEDBACK = "作答尚未正確，請重新調整後再次送出。"
+_PARSONS_HINT_PROMPT_VERSION = "structured_error_relation_library_v2"
 
 
 # relation-aware hint library schema.  The six categories are intentionally
@@ -711,26 +708,6 @@ def ensure_parsons_hint_record_indexes():
     except Exception as e:
         print(f"[parsons_hint_records] index ensure failed: {e}")
 
-
-def ensure_parsons_ai_hint_state_indexes():
-    """Create the one-AI-hint-per-student-per-task concurrency guard."""
-    global _PARSONS_AI_HINT_STATE_INDEX_READY
-    if _PARSONS_AI_HINT_STATE_INDEX_READY:
-        return
-    try:
-        db.parsons_ai_hint_state.create_index(
-            [("student_id", 1), ("task_id", 1)],
-            name="student_task_ai_hint_unique",
-            unique=True,
-        )
-        db.parsons_ai_hint_state.create_index(
-            [("group_type", 1), ("feedback_policy_version", 1)],
-            name="group_policy_1",
-        )
-        _PARSONS_AI_HINT_STATE_INDEX_READY = True
-    except Exception as exc:
-        print(f"[parsons_ai_hint_state] index ensure failed: {exc}")
-
 # ========================
 # 保存可重用的 hint_library
 
@@ -825,53 +802,24 @@ def _feedback_strategy_from_user(user):
     if explicit:
         return explicit
     group_type = str(data.get("group_type") or "").strip().lower()
-    if group_type in {"experimental", "experimental_1"}:
+    if group_type == "experimental":
         return "B"
-    if group_type == "experimental_2":
-        return "C"
     if group_type == "control":
-        return "A"
+        return "C"
     return "B"
-
-
-def _feedback_policy_for_strategy(strategy):
-    normalized = _normalize_feedback_strategy(strategy) or "B"
-    return {
-        "A": "result_only",
-        "B": "structured_ai_once",
-        "C": "structured_only",
-    }[normalized]
-
-
-def _analysis_group_type(strategy):
-    return {
-        "A": "control",
-        "B": "experimental_1",
-        "C": "experimental_2",
-    }[_normalize_feedback_strategy(strategy) or "B"]
 
 
 def _student_feedback_profile(student_id):
     sid = str(student_id or "").strip()
     if not sid:
-        return {
-            "feedback_strategy": "B",
-            "group_type": None,
-            "analysis_group_type": "experimental_1",
-            "feedback_mode": "structured_ai_once",
-            "feedback_policy_version": FEEDBACK_POLICY_VERSION,
-        }
+        return {"feedback_strategy": "B", "group_type": None}
     user = db.users.find_one(
         {"student_id": sid},
-        {"group_type": 1, "analysis_group_type": 1, "feedback_strategy": 1},
+        {"group_type": 1, "feedback_strategy": 1},
     ) or {}
-    strategy = _feedback_strategy_from_user(user)
     return {
         "group_type": _clean_string(user.get("group_type")),
-        "feedback_strategy": strategy,
-        "analysis_group_type": _clean_string(user.get("analysis_group_type")) or _analysis_group_type(strategy),
-        "feedback_mode": _feedback_policy_for_strategy(strategy),
-        "feedback_policy_version": FEEDBACK_POLICY_VERSION,
+        "feedback_strategy": _feedback_strategy_from_user(user),
     }
 
 
@@ -973,12 +921,6 @@ def _empty_hint_record(student_id, task_id, group_type=None, task_attempt_sessio
         "ai_hint_1_meta": {},
         "ai_hint_2_text": None,
         "ai_hint_2_meta": {},
-        # 方案 A：正式流程只產生一則 AI 提示；ai_hint_2_* 僅保留舊資料相容。
-        "fixed_hint_available": False,
-        "fixed_hint_positions": [],
-        "fixed_hint_error_types": [],
-        "fixed_hint_error_count": 0,
-        "fixed_hint_view_count": 0,
         "hint_generation_count": 0,
         "hint_view_count": 0,
         "ai_hint_generation_count": 0,
@@ -1135,11 +1077,6 @@ def _hint_record_public(record):
         "ai_hint_1_meta": record.get("ai_hint_1_meta") if isinstance(record.get("ai_hint_1_meta"), dict) else {},
         "ai_hint_2_text": record.get("ai_hint_2_text"),
         "ai_hint_2_meta": record.get("ai_hint_2_meta") if isinstance(record.get("ai_hint_2_meta"), dict) else {},
-        "fixed_hint_available": bool(record.get("fixed_hint_available")),
-        "fixed_hint_positions": record.get("fixed_hint_positions") or [],
-        "fixed_hint_error_types": record.get("fixed_hint_error_types") or [],
-        "fixed_hint_error_count": int(record.get("fixed_hint_error_count") or 0),
-        "fixed_hint_view_count": int(record.get("fixed_hint_view_count") or 0),
         "hint_generation_count": int(record.get("hint_generation_count") or record.get("ai_hint_generation_count") or 0),
         "hint_view_count": int(record.get("hint_view_count") or record.get("ai_hint_view_count") or 0),
         "ai_hint_generation_count": int(record.get("ai_hint_generation_count") or record.get("hint_generation_count") or 0),
@@ -1150,134 +1087,6 @@ def _hint_record_public(record):
         "created_at_taiwan": record.get("created_at_taiwan"),
         "updated_at_taiwan": record.get("updated_at_taiwan"),
     }
-
-
-def _ai_hint_state_public(record):
-    if not isinstance(record, dict):
-        return None
-    return {
-        "hint_state_id": str(record.get("_id") or ""),
-        "student_id": record.get("student_id"),
-        "task_id": record.get("task_id"),
-        "group_type": record.get("group_type"),
-        "analysis_group_type": record.get("analysis_group_type"),
-        "feedback_policy_version": record.get("feedback_policy_version"),
-        "source_attempt_id": record.get("source_attempt_id"),
-        "source_attempt_v2_id": record.get("source_attempt_v2_id"),
-        "second_error_positions": record.get("second_error_positions") or [],
-        "second_error_types": record.get("second_error_types") or [],
-        "second_error_count": int(record.get("second_error_count") or 0),
-        "hint": str(record.get("hint") or ""),
-        "hint_meta": record.get("hint_meta") if isinstance(record.get("hint_meta"), dict) else {},
-        "ai_feedback_detail": record.get("ai_feedback_detail") if isinstance(record.get("ai_feedback_detail"), dict) else {},
-        "ai_diagnosis_summary": str(record.get("ai_diagnosis_summary") or ""),
-        "source": record.get("source") or "system_fallback",
-        "generation_status": record.get("generation_status") or "generated",
-        "view_count": int(record.get("view_count") or 0),
-        "created_at_taiwan": record.get("created_at_taiwan"),
-        "updated_at_taiwan": record.get("updated_at_taiwan"),
-    }
-
-
-def _get_ai_hint_state(student_id, task_id):
-    if not student_id or not task_id:
-        return None
-    ensure_parsons_ai_hint_state_indexes()
-    return db.parsons_ai_hint_state.find_one({
-        "student_id": str(student_id),
-        "task_id": str(task_id),
-    })
-
-
-def _create_second_wrong_ai_hint_state(att, task, *, v2_doc, group_type, analysis_group_type):
-    """Atomically reserve and persist B's single task-level AI hint.
-
-    The reservation is created before calling the model.  Concurrent second
-    submissions can therefore never create a second persisted hint.
-    """
-    student_id = str(att.get("student_id") or "").strip()
-    task_id = str(att.get("task_id") or "").strip()
-    if not student_id or not task_id:
-        return None
-
-    ensure_parsons_ai_hint_state_indexes()
-    now = now_utc()
-    positions = _int_list(v2_doc.get("wrong_slots"))
-    error_types = _hint_error_types(v2_doc=v2_doc, attempt_doc=att)
-    base = {
-        "student_id": student_id,
-        "task_id": task_id,
-        "feedback_strategy": "B",
-        "group_type": group_type,
-        "analysis_group_type": analysis_group_type,
-        "feedback_policy_version": FEEDBACK_POLICY_VERSION,
-        "source_attempt_id": str(att.get("_id") or ""),
-        "source_attempt_v2_id": str(v2_doc.get("_id") or att.get("attempt_v2_id") or ""),
-        "second_error_positions": positions,
-        "second_error_types": error_types,
-        "second_error_count": int(v2_doc.get("error_count") or len(positions)),
-        "generation_status": "generating",
-        "view_count": 0,
-        "created_at": now,
-        "created_at_utc": now,
-        "created_at_taiwan": _taiwan_time_string(now),
-        "timezone": "Asia/Taipei",
-    }
-    try:
-        result = db.parsons_ai_hint_state.update_one(
-            {"student_id": student_id, "task_id": task_id},
-            {"$setOnInsert": base},
-            upsert=True,
-        )
-    except DuplicateKeyError:
-        result = None
-
-    existing = _get_ai_hint_state(student_id, task_id)
-    if not existing:
-        return None
-    if not result or not result.upserted_id:
-        return existing
-
-    try:
-        payload = _generate_ai_hint_payload(att, task, 1)
-        hint = str(payload.get("hint") or "").strip()
-        if not hint:
-            raise RuntimeError("empty AI hint")
-        status = "generated"
-    except Exception as exc:
-        detail = _build_aggregated_hint_detail(att, task, 1)
-        payload = {
-            "hint": _aggregated_hint_fallback(detail, hint_level=1),
-            "hint_meta": _build_ai_hint_meta_for_attempt(att, task, 1, detail=detail),
-            "ai_feedback_detail": {
-                **detail,
-                "hint_source": "system_fallback",
-                "hint_quality_status": "generation_exception_fallback",
-            },
-            "ai_diagnosis_summary": "系統已保存一則聚焦提示，請重新檢查程式區塊的順序與縮排。",
-            "source": "system_fallback",
-        }
-        hint = str(payload["hint"])
-        status = "fallback"
-        print("[parsons] B single AI hint fallback:", repr(exc))
-
-    updated_at = now_utc()
-    db.parsons_ai_hint_state.update_one(
-        {"_id": existing["_id"]},
-        {"$set": {
-            "hint": hint,
-            "hint_meta": payload.get("hint_meta") or {},
-            "ai_feedback_detail": payload.get("ai_feedback_detail") or {},
-            "ai_diagnosis_summary": payload.get("ai_diagnosis_summary") or "",
-            "source": payload.get("source") or "system_fallback",
-            "generation_status": status,
-            "generated_at": updated_at,
-            "updated_at": updated_at,
-            "updated_at_utc": updated_at,
-            "updated_at_taiwan": _taiwan_time_string(updated_at),
-        }},
-    )
-    return _get_ai_hint_state(student_id, task_id)
 
 # 提示紀錄的 metadata 組裝
 def _hint_log_metadata(record, *, requested_hint_no=None, error_types=None, wrong_slots=None, repeated_error=None, extra=None):
@@ -1312,7 +1121,7 @@ def _hint_log_metadata(record, *, requested_hint_no=None, error_types=None, wron
         "requested_hint_no": hint_no,
         "hint_no": hint_no,
         "hint_click_no": hint_no,
-        "max_hint_count": 1,
+        "max_hint_count": 2,
         "hint_generation_count": public.get("hint_generation_count", 0),
         "hint_view_count": public.get("hint_view_count", 0),
         "ai_hint_generation_count": public.get("ai_hint_generation_count", public.get("hint_generation_count", 0)),
@@ -1446,9 +1255,8 @@ def _hint_library_level(value=None, hint_key=None):
 
 def _hint_library_context_from_detail(aggregate_detail, level):
     detail = aggregate_detail if isinstance(aggregate_detail, dict) else {}
-    # 方案 A：提示庫只檢索單一聚焦提示。
-    hint_level = 1
-    scope = "narrow"
+    hint_level = _hint_library_level(level)
+    scope = "narrow" if hint_level == 2 else "broad"
 
     task_context = detail.get("task_context") if isinstance(detail.get("task_context"), dict) else {}
     unit_category = _normalize_unit_category(
@@ -2311,9 +2119,8 @@ def _build_aggregated_hint_detail(att, task, requested_hint_no=1):
     The legacy function name is retained because multiple hint-state paths call it.
     No subtitle/SRT retrieval is performed here.
     """
-    # 方案 A：同一題只提供一則聚焦型 AI 提示。
-    level = 1
-    scope_name = "narrow"
+    level = 2 if int(requested_hint_no or 1) == 2 else 1
+    scope_name = "narrow" if level == 2 else "broad"
     slot_contexts = _collect_all_wrong_slot_contexts(att, task)
     public_details = _public_wrong_slot_details(slot_contexts)
     aggregate = _aggregate_wrong_slot_contexts(slot_contexts)
@@ -2397,15 +2204,17 @@ def _aggregated_hint_fallback(detail, hint_level=1):
         if str(item or "").strip()
     ]
     scope_text = "、".join(scopes[:4]) if scopes else "程式流程與區塊順序"
-    return f"請聚焦檢查{scope_text}之間的先後關係、作用範圍與資料流，想一想哪些步驟必須先成立，哪些步驟才適合接著執行。"
+    level = 2 if int(hint_level or 1) == 2 else 1
+    if level == 2:
+        return f"再聚焦檢查{scope_text}之間的先後關係、作用範圍與資料流，想一想哪些步驟必須先成立，哪些步驟才適合接著執行。"
+    return f"目前需要同時檢查{scope_text}。請先思考各程式區塊在整體流程中扮演的角色，以及彼此之間的先後依賴。"
 
 
 def _build_ai_hint_meta_from_detail(detail, ctx, *, wrong_slots=None, requested_hint_no=1):
     detail = detail if isinstance(detail, dict) else {}
     ctx = ctx if isinstance(ctx, dict) else {}
-    # 方案 A：唯一一則 AI 提示即為聚焦型提示。
-    level = 1
-    scope_name = "narrow"
+    level = 2 if int(requested_hint_no or 1) == 2 else 1
+    scope_name = "narrow" if level == 2 else "broad"
 
     broad_range = _hint_range_payload(detail.get("subtitle_broad_range"))
     narrow_range = _hint_range_payload(detail.get("subtitle_narrow_range"))
@@ -2875,8 +2684,6 @@ def _lookup_attempt_v2_user_profile(student_id: str, participant_id: str = "") -
         "class_name": user.get("class_name") or None,
         "group_type": user.get("group_type") or None,
         "feedback_strategy": _feedback_strategy_from_user(user),
-        "analysis_group_type": _clean_string(user.get("analysis_group_type")) or _analysis_group_type(_feedback_strategy_from_user(user)),
-        "feedback_policy_version": FEEDBACK_POLICY_VERSION,
         "is_test_data": bool(
             profile_student_id == _PARSONS_TEST_STUDENT_ID
             or user.get("is_test_data") is True
@@ -3838,8 +3645,6 @@ def _build_parsons_attempt_v2_doc(
         "class_name": profile.get("class_name"),
         "group_type": profile.get("group_type"),
         "feedback_strategy": profile.get("feedback_strategy") or "B",
-        "analysis_group_type": profile.get("analysis_group_type"),
-        "feedback_policy_version": profile.get("feedback_policy_version") or FEEDBACK_POLICY_VERSION,
         "is_test_data": is_test_data,
         "activity_type": activity,
         "test_role": v2_test_role,
@@ -4461,9 +4266,6 @@ def get_task():
         "level": task.get("level"),
         "feedback_strategy": feedback_profile.get("feedback_strategy") or "B",
         "group_type": feedback_profile.get("group_type"),
-        "analysis_group_type": feedback_profile.get("analysis_group_type"),
-        "feedback_mode": feedback_profile.get("feedback_mode"),
-        "feedback_policy_version": feedback_profile.get("feedback_policy_version"),
         "question_text": parsed.get("question_text", ""),
         "hide_semantic_zh": bool(parsed.get("hide_semantic_zh", False)),
         "pool": parsed.get("pool", []),
@@ -5280,7 +5082,6 @@ def _submit_choice_test_answer(
             break
 
     # parsons_test_attempts 前、後側作答紀錄
-    feedback_profile = _student_feedback_profile(student_id)
     attempt_doc = {
         "student_id": student_id,
         "participant_id": participant_id or None,
@@ -6282,10 +6083,7 @@ def submit_answer():
         "unit": task.get("unit"),
         "student_id": student_id or None,
         "participant_id": participant_id or None,
-        "group_type": feedback_profile.get("group_type"),
-        "feedback_strategy": feedback_profile.get("feedback_strategy") or "B",
-        "analysis_group_type": feedback_profile.get("analysis_group_type"),
-        "feedback_policy_version": feedback_profile.get("feedback_policy_version") or FEEDBACK_POLICY_VERSION,
+        "feedback_strategy": _student_feedback_profile(student_id).get("feedback_strategy") or "B",
         "answer_ids": answer_ids,
         "answer_lines": answer_lines,
         "answer_block_ids": answer_ids,
@@ -6326,9 +6124,6 @@ def submit_answer():
         return jsonify({"ok": False, "message": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "message": "parsons_attempts_v2 prepare failed", "detail": str(e)}), 500
-
-    v2_doc["analysis_group_type"] = feedback_profile.get("analysis_group_type")
-    v2_doc["feedback_policy_version"] = feedback_profile.get("feedback_policy_version") or FEEDBACK_POLICY_VERSION
 
     # Keep the legacy attempt collection auditable too, while parsons_attempts_v2
     # remains the primary analysis source.
@@ -6396,9 +6191,6 @@ def submit_answer():
         "target_concept": v2_doc.get("target_concept"),
         "event_at": v2_doc.get("submitted_at"),
         "metadata": {
-            "feedback_strategy": feedback_profile.get("feedback_strategy"),
-            "analysis_group_type": feedback_profile.get("analysis_group_type"),
-            "feedback_policy_version": feedback_profile.get("feedback_policy_version") or FEEDBACK_POLICY_VERSION,
             "task_attempt_session": v2_doc.get("task_attempt_session"),
             "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
             "is_correct": v2_doc.get("is_correct"),
@@ -6546,7 +6338,7 @@ def submit_answer():
         "feedback_strategy": feedback_strategy,
     }
 
-    if not is_correct and feedback_strategy == "B":
+    if not is_correct:
         first_record = _ensure_first_hint_record(
             student_id,
             task_id,
@@ -6563,9 +6355,6 @@ def submit_answer():
         activity_for_count = v2_doc.get("activity_type") or "practice"
         if activity_for_count:
             wrong_attempt_query["activity_type"] = activity_for_count
-        # 提示次數只計入同一次作答場次。
-        if v2_doc.get("task_attempt_session") is not None:
-            wrong_attempt_query["task_attempt_session"] = v2_doc.get("task_attempt_session")
         if activity_for_count == "test":
             wrong_attempt_query["test_role"] = v2_doc.get("test_role")
         wrong_attempt_count = db.parsons_attempts_v2.count_documents(wrong_attempt_query)
@@ -6632,7 +6421,7 @@ def submit_answer():
                 ),
             })
 
-        elif is_second_wrong_for_hint_flow and feedback_strategy == "C":
+        elif feedback_strategy == "C":
             current_positions = _int_list(v2_wrong_slots)
             current_error_count = int(v2_doc.get("error_count") or len(current_positions))
             try:
@@ -6649,12 +6438,7 @@ def submit_answer():
                         "latest_error_count": current_error_count,
                         "last_attempt_id": str(legacy_attempt_oid),
                         "latest_attempt_v2_id": v2_attempt_id,
-                        "fixed_hint_available": True,
-                        "fixed_hint_positions": current_positions,
-                        "fixed_hint_error_types": v2_error_types,
-                        "fixed_hint_error_count": current_error_count,
                     },
-                    inc_fields={"fixed_hint_view_count": 1},
                 ) or current_record
             except Exception as hint_state_error:
                 print("[parsons submit] C fixed feedback state update failed:", repr(hint_state_error))
@@ -6673,10 +6457,6 @@ def submit_answer():
                 "second_error_types": v2_error_types,
                 "hint_record": _hint_record_public(c_record),
                 "source": "pre_generated_task_semantic",
-                "fixed_hint_available": True,
-                "fixed_hint_positions": current_positions,
-                "fixed_hint_error_types": v2_error_types,
-                "fixed_hint_error_count": current_error_count,
             }
             write_learning_log_safely({
                 "session_id": data.get("session_id"),
@@ -6805,7 +6585,7 @@ def submit_answer():
                     ),
                 },
             })
-    elif is_correct:
+    else:
         existing_hint_record = _get_hint_record(
             student_id,
             task_id,
@@ -6833,134 +6613,9 @@ def submit_answer():
                     extra={"is_correct": True, "score": v2_doc.get("score")},
                 ),
             })
-    feedback_mode = _feedback_policy_for_strategy(feedback_strategy)
-    resp["feedback_mode"] = feedback_mode
-    resp["feedback_policy_version"] = FEEDBACK_POLICY_VERSION
-    resp["analysis_group_type"] = feedback_profile.get("analysis_group_type")
-
     if not is_correct:
-        wrong_attempt_count = db.parsons_attempts_v2.count_documents({
-            "student_id": student_id,
-            "task_id": task_id,
-            "activity_type": "practice",
-            "task_attempt_session": v2_doc.get("task_attempt_session"),
-            "is_correct": False,
-        })
-        positions = _int_list(v2_doc.get("incorrect_slots") or v2_doc.get("wrong_slots"))
-        error_count = int(v2_doc.get("error_count") or len(positions))
-        structural_feedback = {
-            "current_error_positions": positions,
-            "current_error_count": error_count,
-            "current_error_types": v2_error_types,
-            "sequence_slots": _int_list(v2_doc.get("sequence_slots")),
-            "indentation_slots": _int_list(v2_doc.get("indentation_slots")),
-        }
-
-        if feedback_mode == "result_only":
-            # A students receive no diagnosable error data in the HTTP response.
-            resp = {
-                "ok": True,
-                "attempt_id": attempt_id,
-                "attempt_v2_id": v2_attempt_id,
-                "task_attempt_session": v2_doc.get("task_attempt_session"),
-                "attempt_no": v2_doc.get("attempt_no"),
-                "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
-                "feedback_strategy": "A",
-                "feedback_mode": "result_only",
-                "feedback_policy_version": FEEDBACK_POLICY_VERSION,
-                "analysis_group_type": feedback_profile.get("analysis_group_type"),
-                "is_correct": False,
-                "feedback": RESULT_ONLY_FEEDBACK,
-                "submitted_at": _utc_iso_string(v2_doc.get("submitted_at")),
-                "submitted_at_taiwan": _taiwan_time_string(v2_doc.get("submitted_at")),
-            }
-            hint_flow = {"type": "result_only", "feedback_strategy": "A"}
-        elif feedback_mode == "structured_ai_once":
-            ai_state = _get_ai_hint_state(student_id, task_id)
-            if int(wrong_attempt_count) == 2:
-                ai_state = _create_second_wrong_ai_hint_state(
-                    attempt_for_hint,
-                    task,
-                    v2_doc=v2_doc,
-                    group_type=feedback_profile.get("group_type"),
-                    analysis_group_type=feedback_profile.get("analysis_group_type"),
-                )
-                if ai_state:
-                    ai_state_id = str(ai_state.get("_id") or "")
-                    db.parsons_attempts_v2.update_one(
-                        {"_id": v2_doc.get("_id")},
-                        {"$set": {"ai_hint_state_id": ai_state_id, "ai_hint_generated_after_submit": True}},
-                    )
-                    db.parsons_attempts.update_one(
-                        {"_id": legacy_attempt_oid},
-                        {"$set": {"ai_hint_state_id": ai_state_id, "ai_hint_generated_after_submit": True}},
-                    )
-                hint_flow = {
-                    "type": "ai_hint",
-                    "feedback_strategy": "B",
-                    "auto_open_ai": True,
-                    "wrong_attempt_count": int(wrong_attempt_count),
-                    **structural_feedback,
-                    "ai_hint_state": _ai_hint_state_public(ai_state),
-                    "hint": str((ai_state or {}).get("hint") or ""),
-                    "hint_meta": (ai_state or {}).get("hint_meta") or {},
-                    "ai_feedback_detail": (ai_state or {}).get("ai_feedback_detail") or {},
-                    "ai_diagnosis_summary": str((ai_state or {}).get("ai_diagnosis_summary") or ""),
-                    "source": (ai_state or {}).get("source") or "system_fallback",
-                }
-            elif int(wrong_attempt_count) >= 3:
-                hint_flow = {
-                    "type": "structured_with_saved_ai",
-                    "feedback_strategy": "B",
-                    "auto_open_ai": False,
-                    "wrong_attempt_count": int(wrong_attempt_count),
-                    **structural_feedback,
-                    "existing_ai_hint_available": bool((ai_state or {}).get("hint")),
-                }
-            else:
-                hint_flow = {
-                    "type": "structured_error",
-                    "feedback_strategy": "B",
-                    "auto_open_ai": False,
-                    "wrong_attempt_count": int(wrong_attempt_count),
-                    **structural_feedback,
-                }
-        else:
-            hint_flow = {
-                "type": "structured_error",
-                "feedback_strategy": "C",
-                "auto_open_ai": False,
-                "wrong_attempt_count": int(wrong_attempt_count),
-                **structural_feedback,
-            }
-
-        if feedback_mode != "result_only":
-            # Do not expose legacy actual/expected text or semantic diagnosis.
-            resp = {
-                "ok": True,
-                "attempt_id": attempt_id,
-                "attempt_v2_id": v2_attempt_id,
-                "task_attempt_session": v2_doc.get("task_attempt_session"),
-                "attempt_no": v2_doc.get("attempt_no"),
-                "attempt_sequence_no": v2_doc.get("attempt_sequence_no"),
-                "feedback_strategy": feedback_strategy,
-                "feedback_mode": feedback_mode,
-                "feedback_policy_version": FEEDBACK_POLICY_VERSION,
-                "analysis_group_type": feedback_profile.get("analysis_group_type"),
-                "is_correct": False,
-                "feedback": "作答尚未正確，請重新調整後再次送出。",
-                "submitted_at": _utc_iso_string(v2_doc.get("submitted_at")),
-                "submitted_at_taiwan": _taiwan_time_string(v2_doc.get("submitted_at")),
-                "wrong_slots": positions,
-                "incorrect_slots": positions,
-                "error_count": error_count,
-                "error_types": v2_error_types,
-                "sequence_slots": _int_list(v2_doc.get("sequence_slots")),
-                "indentation_slots": _int_list(v2_doc.get("indentation_slots")),
-                "hint_flow": hint_flow,
-            }
-    else:
-        resp["hint_flow"] = None
+        resp["wrong_attempt_count"] = int(wrong_attempt_count or 0)
+    resp["hint_flow"] = hint_flow
 
     # 影片回看／跳轉功能已移除；僅保留系統錯誤診斷與提示流程。
     if not is_correct:
@@ -7179,12 +6834,24 @@ def _progressive_hint_has_leakage(hint: str, expected_text: str) -> bool:
 # 分成 broad / narrow
 
 # 保存第一次與第二次提示
-def _generate_ai_hint_payload(att, task, requested_hint_no=1):
-    """Generate the single focused AI hint used by Scheme A."""
-    level = 1
-    aggregate_detail = _build_aggregated_hint_detail(att, task, 1)
-    fallback_hint = _aggregated_hint_fallback(aggregate_detail, 1)
+def _generate_ai_hint_payload(att, task, requested_hint_no):
+    """Generate one progressive hint from deterministic structured errors."""
+    level = 2 if int(requested_hint_no or 1) == 2 else 1
+    aggregate_detail = _build_aggregated_hint_detail(att, task, level)
+    fallback_hint = _aggregated_hint_fallback(aggregate_detail, level)
+
     first_hint = ""
+    if level == 2:
+        try:
+            student_id = str(att.get("student_id") or current_student_id() or "").strip()
+            task_id = str(att.get("task_id") or "").strip()
+            record = (
+                _get_hint_record(student_id, task_id, att.get("task_attempt_session"))
+                if student_id and task_id else None
+            )
+            first_hint = str((record or {}).get("ai_hint_1_text") or "").strip()
+        except Exception:
+            first_hint = ""
 
     error_concepts = aggregate_detail.get("error_concepts") or []
     expected_for_leakage = "\n".join(
@@ -7250,11 +6917,11 @@ def _generate_ai_hint_payload(att, task, requested_hint_no=1):
             "question_text": aggregate_detail.get("question_text") or "",
             "task_context": aggregate_detail.get("task_context") or {},
             "hint_level": level,
-            "scope": "narrow",
+            "scope": "narrow" if level == 2 else "broad",
             "wrong_slot_count": aggregate_detail.get("wrong_slot_count") or 0,
             "error_concepts": error_concepts,
             "relation_types": aggregate_detail.get("relation_types") or [],
-            "first_hint": "",
+            "first_hint": first_hint if level == 2 else "",
         }
         prompt = f"""
 你是 Python Parsons 題的錯誤導向教學提示產生器。
@@ -7266,11 +6933,10 @@ def _generate_ai_hint_payload(att, task, requested_hint_no=1):
 【提示層級】
 level = {level}
 
-【單一聚焦提示規則】
-- 本題只產生一則提示，提示範圍固定為 narrow。
-- 請聚焦於後端已確認的主要錯誤概念、區塊角色或 relation_types。
-- 提供一到兩句繁體中文，40～90字；可使用一個引導問題，但不可直接提供修正答案。
-- 不得產生第二則提示，也不得因學生重新查看而改寫內容。
+【層級規則】
+- level 1：統整主要錯誤概念，提供較廣的流程、作用範圍或資料依賴檢查方向；一句繁體中文，30～70字。
+- level 2：根據第一次提示，縮小到更具體的概念關係或提出一個引導問題；一到兩句繁體中文，40～90字。
+- level 2 必須比 level 1 更聚焦，但仍不可直接提供修正答案。
 
 【禁止事項】
 1. 不可輸出完整或局部正確程式碼。
@@ -7289,7 +6955,7 @@ level = {level}
 {{
   "hint_text": "給學生的概念提示",
   "concept_scope": "本次提示涵蓋的概念範圍",
-  "guiding_question": "可選的聚焦引導問題；沒有則輸出空字串",
+  "guiding_question": "level 2 的引導問題；level 1 請輸出空字串",
   "evidence_summary": "簡述提示依據的錯誤類型與概念，不揭露正確排列"
 }}
 """.strip()
@@ -7299,7 +6965,7 @@ level = {level}
                 model=_model_for_feedback(),
                 system=(
                     "你是教學鷹架提示產生器，不是解題器。"
-                    "只能依據後端已確認的結構化錯誤資料產生單一聚焦提示。"
+                    "只能依據後端已確認的結構化錯誤資料產生由廣到窄的提示。"
                     "不得重新判分，不得揭露正確程式碼、區塊排列、格位、縮排值或直接修改步驟。"
                     "只輸出合法 JSON。"
                 ),
@@ -7416,9 +7082,6 @@ level = {level}
     }
 
 def _prepare_ai_hint_record(att, task, *, requested_hint_no=1, force=False, count_view=True, explicit_attempt_v2_id=None):
-    # 方案 A：重複查看只增加查看次數，不可重新生成或建立第二則提示。
-    requested_hint_no = 1
-    force = False
     attempt_v2_for_context = _resolve_attempt_v2_for_hint(att, explicit_attempt_v2_id)
     if attempt_v2_for_context:
         att = _merge_attempt_v2_hint_context(att, attempt_v2_for_context)
@@ -7558,7 +7221,7 @@ def _prepare_ai_hint_record(att, task, *, requested_hint_no=1, force=False, coun
 
     generated = False
     if force or not existing_hint:
-        if actual_generation_count < 1:
+        if actual_generation_count < 2:
             payload = _generate_ai_hint_payload(att, task, requested_hint_no)
             existing_hint = payload.get("hint") or existing_hint
             generated = bool(existing_hint)
@@ -7583,7 +7246,7 @@ def _prepare_ai_hint_record(att, task, *, requested_hint_no=1, force=False, coun
     payload["hint_meta"] = hint_meta
 
     final_generation_count = min(
-        1,
+        2,
         max(
             stored_generation_count,
             actual_generation_count + (1 if generated and existing_hint else 0),
@@ -7642,7 +7305,7 @@ def _prepare_ai_hint_record(att, task, *, requested_hint_no=1, force=False, coun
     payload["generated"] = bool(generated)
     return record, payload
 
-# 重新整理或重新進入題目時，還原已產生的單一聚焦提示與 metadata
+# 重新整理或重新進入題目時，還原已產生的兩次提示與 metadata
 @parsons_bp.route("/hint_state", methods=["GET", "OPTIONS"])
 def get_parsons_hint_state():
     if request.method == "OPTIONS":
@@ -7653,26 +7316,6 @@ def get_parsons_hint_state():
         return jsonify({"ok": False, "message": "missing student_id"}), 401
     if not task_id:
         return jsonify({"ok": False, "message": "missing task_id"}), 400
-
-    feedback_profile = _student_feedback_profile(student_id)
-    if feedback_profile.get("feedback_strategy") != "B":
-        return jsonify({
-            "ok": True,
-            "feedback_mode": feedback_profile.get("feedback_mode"),
-            "hint_record": None,
-            "hint_state": None,
-            "completed_previous_session": False,
-        })
-
-    ai_state = _get_ai_hint_state(student_id, task_id)
-    if ai_state:
-        return jsonify({
-            "ok": True,
-            "feedback_mode": "structured_ai_once",
-            "hint_record": None,
-            "hint_state": _ai_hint_state_public(ai_state),
-            "completed_previous_session": False,
-        })
 
     latest = _latest_attempt_v2_doc(student_id, task_id, "practice", None)
     if latest:
@@ -7767,13 +7410,11 @@ def generate_parsons_hint():
 
     data = request.get_json(silent=True) or {}
     attempt_id = str(data.get("attempt_id") or "").strip()
-    raw_force = bool(data.get("force"))
+    force = bool(data.get("force"))
     try:
-        raw_requested_hint_no = int(data.get("requested_hint_no") or 1)
+        requested_hint_no = 2 if int(data.get("requested_hint_no") or 1) == 2 else 1
     except Exception:
-        raw_requested_hint_no = 1
-    requested_hint_no = 1
-    force = False
+        requested_hint_no = 1
 
     if not attempt_id:
         return jsonify({"ok": False, "message": "missing attempt_id"}), 400
@@ -7802,60 +7443,6 @@ def generate_parsons_hint():
         task_for_record = None
     if not task_for_record:
         return jsonify({"ok": False, "message": "task not found"}), 404
-
-    feedback_profile = _student_feedback_profile(current_student_id())
-    if feedback_profile.get("feedback_strategy") != "B":
-        return jsonify({
-            "ok": False,
-            "error": "ai_hint_not_allowed",
-            "message": "C 組僅提供固定提示，不提供 AI 提示。",
-        }), 403
-
-    # The single B hint is created at the second incorrect submission.  This
-    # endpoint only returns that immutable record; it never generates one.
-    ai_state = _get_ai_hint_state(current_student_id(), task_id_for_record)
-    if not ai_state or not str(ai_state.get("hint") or "").strip():
-        return jsonify({
-            "ok": False,
-            "error": "ai_hint_not_available",
-            "message": "AI 提示尚未建立。",
-        }), 409
-    viewed_at = now_utc()
-    db.parsons_ai_hint_state.update_one(
-        {"_id": ai_state["_id"]},
-        {"$inc": {"view_count": 1}, "$set": {
-            "last_viewed_at": viewed_at,
-            "updated_at": viewed_at,
-            "updated_at_utc": viewed_at,
-            "updated_at_taiwan": _taiwan_time_string(viewed_at),
-        }},
-    )
-    ai_state = _get_ai_hint_state(current_student_id(), task_id_for_record)
-    return jsonify({
-        "ok": True,
-        "attempt_id": attempt_id,
-        "attempt_v2_id": data.get("attempt_v2_id") or att.get("attempt_v2_id"),
-        "requested_hint_no": 1,
-        "source": ai_state.get("source") or "system_fallback",
-        "hint": ai_state.get("hint") or "",
-        "hint_meta": ai_state.get("hint_meta") or {},
-        "ai_feedback_detail": ai_state.get("ai_feedback_detail") or {},
-        "ai_diagnosis_summary": ai_state.get("ai_diagnosis_summary") or "",
-        "hint_state": _ai_hint_state_public(ai_state),
-    })
-
-    if raw_force or raw_requested_hint_no == 2:
-        existing_record = _get_hint_record(
-            current_student_id(),
-            task_id_for_record,
-            att.get("task_attempt_session"),
-        )
-        return jsonify({
-            "ok": False,
-            "error": "single_hint_only",
-            "message": "本題僅提供一則聚焦型 AI 提示，可重複查看但不可重新生成。",
-            "hint_record": _hint_record_public(existing_record),
-        }), 409
 
     try:
         record, payload = _prepare_ai_hint_record(
@@ -7934,7 +7521,7 @@ def generate_parsons_hint():
             else 0
         )
         fallback_generation_count = min(
-            1,
+            2,
             max(
                 existing_hint_count,
                 requested_hint_no,
@@ -8001,8 +7588,8 @@ def generate_parsons_hint():
             hint_meta_override=payload.get("hint_meta") or {},
             event_type="ai_hint_api_view",
             generated=bool(payload.get("generated")),
-            trigger_method=data.get("trigger_method") or "view_saved_ai_hint",
-            button_name=data.get("button_name") or "查看已保存 AI 提示",
+            trigger_method=data.get("trigger_method") or ("generate_second_ai_hint" if requested_hint_no == 2 else "view_ai_hint"),
+            button_name=data.get("button_name") or ("產生第二次 AI 提示" if requested_hint_no == 2 else "查看 AI 提示"),
         )
     except Exception as hint_event_error:
         print("[parsons hint] attempt v2 hint event update failed:", repr(hint_event_error))
@@ -8028,8 +7615,8 @@ def generate_parsons_hint():
             extra={
                 "task_attempt_session": int((record or {}).get("task_attempt_session") or att.get("task_attempt_session") or 1),
                 "attempt_v2_id": updated_attempt_v2_id or data.get("attempt_v2_id"),
-                "trigger_method": data.get("trigger_method") or "view_saved_ai_hint",
-                "button_name": data.get("button_name") or "查看已保存 AI 提示",
+                "trigger_method": data.get("trigger_method") or ("generate_second_ai_hint" if requested_hint_no == 2 else "view_ai_hint"),
+                "button_name": data.get("button_name") or ("產生第二次 AI 提示" if requested_hint_no == 2 else "查看 AI 提示"),
             },
         ),
     })

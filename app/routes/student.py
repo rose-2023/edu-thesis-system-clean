@@ -4,13 +4,32 @@ from ..db import db
 from ..unit_labels import sort_units, unit_label_map, unit_label
 from ..avatar_utils import resolve_avatar_src
 from ..session_auth import current_participant_id, current_student_id
+from .learning_logs import write_learning_log_safely
+from ..questionnaire import (
+    QUESTIONNAIRE_COLLECTION,
+    QUESTIONNAIRE_DATA_SOURCE,
+    QUESTIONNAIRE_FORM_VERSION,
+    get_questionnaire_response,
+    questionnaire_form_payload,
+    utc_now,
+    validate_questionnaire_answers,
+)
 import os
 import re
 from openai import OpenAI
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 student_bp = Blueprint("student", __name__)
+_DEFAULT_TEST_CYCLE_ID = "2026_07_batch_01"
+
+
+def _student_test_cycle_id(student_id):
+    user = db.users.find_one({"student_id": str(student_id or "").strip()}, {"test_cycle_id": 1})
+    if not user:
+        return ""
+    return str(user.get("test_cycle_id") or "").strip() or _DEFAULT_TEST_CYCLE_ID
 
 
 @student_bp.get("/profile")
@@ -61,6 +80,146 @@ def student_profile():
             "avatar_license": user.get("avatar_license"),
             "avatar_updated_at": user.get("avatar_updated_at"),
         },
+    })
+
+
+@student_bp.get("/pretest-survey")
+def get_pretest_survey():
+    student_id = current_student_id()
+    if not student_id:
+        return jsonify({"ok": False, "message": "missing student_id"}), 400
+
+    test_cycle_id = _student_test_cycle_id(student_id)
+    if not test_cycle_id:
+        return jsonify({
+            "ok": False,
+            "error": "test_cycle_not_assigned",
+            "message": "test_cycle_id is not assigned for this student",
+        }), 403
+
+    response = get_questionnaire_response(db, student_id, test_cycle_id)
+    submitted_at = response.get("submitted_at") if response else None
+    if not response:
+        write_learning_log_safely({
+            "student_id": student_id,
+            "event_type": "questionnaire_opened",
+            "page": "pretest_survey",
+            "activity_type": "test",
+            "test_role": "pretest",
+            "task_id": QUESTIONNAIRE_FORM_VERSION,
+            "event_at": utc_now(),
+            "metadata": {
+                "form_version": QUESTIONNAIRE_FORM_VERSION,
+                "data_source": QUESTIONNAIRE_DATA_SOURCE,
+                "test_cycle_id": test_cycle_id,
+            },
+        })
+    return jsonify({
+        "ok": True,
+        "data_source": QUESTIONNAIRE_DATA_SOURCE,
+        "form": questionnaire_form_payload(),
+        "student_id": student_id,
+        "test_cycle_id": test_cycle_id,
+        "submitted": bool(response),
+        "submitted_at": submitted_at.isoformat() if hasattr(submitted_at, "isoformat") else submitted_at,
+        "next_path": "/test/taking",
+    })
+
+
+@student_bp.post("/pretest-survey/submit")
+def submit_pretest_survey():
+    student_id = current_student_id()
+    if not student_id:
+        return jsonify({"ok": False, "message": "missing student_id"}), 400
+
+    test_cycle_id = _student_test_cycle_id(student_id)
+    if not test_cycle_id:
+        return jsonify({
+            "ok": False,
+            "error": "test_cycle_not_assigned",
+            "message": "test_cycle_id is not assigned for this student",
+        }), 403
+
+    existing = get_questionnaire_response(db, student_id, test_cycle_id)
+    if existing:
+        submitted_at = existing.get("submitted_at")
+        return jsonify({
+            "ok": True,
+            "already_submitted": True,
+            "locked": True,
+            "data_source": QUESTIONNAIRE_DATA_SOURCE,
+            "test_cycle_id": test_cycle_id,
+            "submitted_at": submitted_at.isoformat() if hasattr(submitted_at, "isoformat") else submitted_at,
+            "next_path": "/test/taking",
+        })
+
+    data = request.get_json(silent=True) or {}
+    answers, errors = validate_questionnaire_answers(data.get("answers"))
+    if errors:
+        return jsonify({
+            "ok": False,
+            "error": "invalid_questionnaire_answers",
+            "message": "問卷尚有未完成或無效的答案。",
+            "validation_errors": errors,
+        }), 400
+
+    now = utc_now()
+    document = {
+        "student_id": student_id,
+        "test_cycle_id": test_cycle_id,
+        "form_version": QUESTIONNAIRE_FORM_VERSION,
+        "answers": answers,
+        "submitted_at": now,
+        "created_at": now,
+        "locked": True,
+        "data_source": QUESTIONNAIRE_DATA_SOURCE,
+    }
+    try:
+        insert_result = db[QUESTIONNAIRE_COLLECTION].insert_one(document)
+    except DuplicateKeyError:
+        existing = get_questionnaire_response(db, student_id, test_cycle_id)
+        submitted_at = (existing or {}).get("submitted_at")
+        return jsonify({
+            "ok": True,
+            "already_submitted": True,
+            "locked": True,
+            "data_source": QUESTIONNAIRE_DATA_SOURCE,
+            "test_cycle_id": test_cycle_id,
+            "submitted_at": submitted_at.isoformat() if hasattr(submitted_at, "isoformat") else submitted_at,
+            "next_path": "/test/taking",
+        })
+
+    write_learning_log_safely({
+        "student_id": student_id,
+        "event_type": "questionnaire_submitted",
+        "page": "pretest_survey",
+        "activity_type": "test",
+        "test_role": "pretest",
+        "task_id": QUESTIONNAIRE_FORM_VERSION,
+        "attempt_id": str(insert_result.inserted_id),
+        "attempt_no": 1,
+        "event_at": now,
+        "metadata": {
+            "form_version": QUESTIONNAIRE_FORM_VERSION,
+            "data_source": QUESTIONNAIRE_DATA_SOURCE,
+            "test_cycle_id": test_cycle_id,
+            "questionnaire_response_id": str(insert_result.inserted_id),
+            "question_count": sum(
+                len(page.get("questions") or [])
+                for page in questionnaire_form_payload().get("pages") or []
+            ),
+            "locked": True,
+        },
+    })
+
+    return jsonify({
+        "ok": True,
+        "already_submitted": False,
+        "locked": True,
+        "data_source": QUESTIONNAIRE_DATA_SOURCE,
+        "test_cycle_id": test_cycle_id,
+        "submitted_at": now.isoformat(),
+        "next_path": "/test/taking",
     })
 
 
@@ -117,10 +276,10 @@ def units_progress():
     """
     try:
         student_id = current_student_id()
-        test_cycle_id = (request.args.get("test_cycle_id") or "default").strip() or "default"
-
         if not student_id:
             return jsonify({"ok": False, "error": "missing student_id"}), 400
+
+        test_cycle_id = _student_test_cycle_id(student_id)
 
         # 1) 取得影片（老師端上傳）=> 用 unit 分組
         videos = list(
@@ -175,8 +334,9 @@ def units_progress():
             )
 
         # 3) 後測狀態（統一讀 test_control）
-        ctrl_id = f"post_open:{test_cycle_id}"
-        ctrl = db.test_control.find_one({"_id": ctrl_id}) or {}
+        ctrl = db.test_control.find_one({"_id": f"post_open:{test_cycle_id}"}) or {}
+        if not ctrl and test_cycle_id == "2026_07_batch_01":
+            ctrl = db.test_control.find_one({"_id": "post_open:default"}) or {}
         post_open = bool(ctrl.get("post_open", False))
 
         # 後測總題數：parsons_test_tasks
@@ -187,6 +347,14 @@ def units_progress():
                 "deleted": {"$ne": True},
             }
         )
+        if post_total == 0 and test_cycle_id == "2026_07_batch_01":
+            post_total = db.parsons_test_tasks.count_documents(
+                {
+                    "test_cycle_id": "default",
+                    "test_role": "post",
+                    "deleted": {"$ne": True},
+                }
+            )
         # 後測已作答題數：parsons_test_attempts（同 test_cycle_id + post）
         post_done = len(
             db.parsons_test_attempts.distinct(

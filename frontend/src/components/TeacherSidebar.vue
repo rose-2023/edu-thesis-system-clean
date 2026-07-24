@@ -10,6 +10,7 @@
       <div class="navitem" :class="{ active: active === 'upload' }" @click="go('/admin/upload')">📁 影片管理</div>
       <div class="navitem" :class="{ active: active === 'subtitle' }" @click="go('/admin/subtitle')">📝 字幕/逐字稿</div>
       <div class="navitem" :class="{ active: active === 'agentlog' }" @click="go('/admin/agentlog')">🧩 AI 管理生成紀錄檢視</div>
+      <div class="navitem" :class="{ active: active === 'pretest-surveys' }" @click="go('/admin/pretest-surveys')">📝 前測問卷</div>
       <div class="navitem" :class="{ active: active === 'analyze' }" @click="go('/admin/analyze')">📊 學生作答紀錄分析</div>
     </div>
 
@@ -46,7 +47,7 @@ async function logout() {
 .sidebar {
   background: #d4b34a;
   border-radius: 16px;
-  padding: 18px 16px;
+  padding: 15px 10px;
   display: flex;
   flex-direction: column;
   gap: 16px;

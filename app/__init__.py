@@ -6,7 +6,6 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
-from .routes import register_blueprints
 from .session_auth import active_session_guard
 
 
@@ -59,6 +58,11 @@ def configure_console_logging(app):
 
 
 def create_app():
+    # Route modules import optional integrations (for example OpenAI).  Keep
+    # them out of the package import path so maintenance scripts can import
+    # lightweight modules such as ``app.db`` without needing those settings.
+    from .routes import register_blueprints
+
     app = Flask(__name__)
     app.config.update(DEBUG=False, TESTING=False)
     configure_console_logging(app)
